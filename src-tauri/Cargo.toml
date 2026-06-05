@@ -1,0 +1,40 @@
+[package]
+name = "openman"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+openman-agents = { path = "../agents" }
+tauri = { version = "2.0", features = ["devtools"] }
+tauri-plugin-dialog = "2.0"
+tauri-plugin-fs = "2.0"
+tauri-plugin-shell = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+notify = "6.1"
+walkdir = "2.4"
+ignore = "0.4"
+hyperpolyglot = "0.1.7"
+tree-sitter = "0.22"
+tree-sitter-cli = "0.22"
+regex = "1.10"
+thiserror = "1.0"
+uuid = { version = "1.8", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", features = ["json"] }
+async-trait = "0.1"
+parking_lot = "0.12"
+directories = "5.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+dev-logs = []
+prod-logs = []
