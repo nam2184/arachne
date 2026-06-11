@@ -2,15 +2,41 @@ use std::path::{Path, PathBuf};
 
 use crate::{ToolCall, ToolResult};
 
-use super::{failure, string_arg, success, wildcard_match};
+use super::{failure, string_arg, success, wildcard_match, ToolContext};
 
 pub fn run(call: &ToolCall) -> ToolResult {
+    run_with_context(call, &ToolContext::default())
+}
+
+pub fn run_with_context(call: &ToolCall, ctx: &ToolContext) -> ToolResult {
     let root = string_arg(call, "path");
     let root_path = if root.is_empty() {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        if ctx.project_root.as_os_str().is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        } else {
+            ctx.project_root.clone()
+        }
     } else {
         PathBuf::from(&root)
     };
+    tracing::info!(
+        tool = "glob",
+        requested_path = %root,
+        resolved_root = %root_path.display(),
+        project_root = %ctx.project_root.display(),
+        project_root_empty = ctx.project_root.as_os_str().is_empty(),
+        cwd = %std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string()),
+        pattern = %string_arg(call, "pattern"),
+        "glob dispatch"
+    );
+    tracing::debug!(
+        tool = "glob",
+        context_project_root = %ctx.project_root.display(),
+        context_mode = ?ctx.mode,
+        "glob ToolContext"
+    );
     run_with_root(call, &root_path)
 }
 

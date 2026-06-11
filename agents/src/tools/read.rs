@@ -2,10 +2,20 @@ use std::path::{Path, PathBuf};
 
 use crate::{ToolCall, ToolResult};
 
-use super::{failure, string_arg, success, usize_arg};
+use super::{failure, string_arg, success, usize_arg, ToolContext};
 
 pub fn run(call: &ToolCall) -> ToolResult {
+    run_with_context(call, &ToolContext::default())
+}
+
+pub fn run_with_context(call: &ToolCall, ctx: &ToolContext) -> ToolResult {
     let path = string_arg(call, "path");
+    tracing::info!(
+        tool = "read",
+        requested_path = %path,
+        project_root = %ctx.project_root.display(),
+        "read dispatch"
+    );
     run_with_path(call, Path::new(&path))
 }
 

@@ -36,16 +36,50 @@ pub struct ToolRuntime {
     pub session_service: Arc<crate::SessionService>,
     pub conversation_service: Arc<crate::ConversationService>,
     pub subagent_registry: Arc<SubagentRegistry>,
+    /// Project root for the caller's session. Propagated into the
+    /// `ToolContext` used for non-task tools so file-system tools
+    /// (read, glob, grep, …) resolve relative paths against the
+    /// correct directory even when dispatched through the async
+    /// path. Empty when unknown.
+    pub project_root: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ToolContext {
     pub mode: PermissionMode,
+    /// Project root for the active session. Tools that take a `path`
+    /// argument resolve relative paths against this root instead of
+    /// the process CWD. An empty path means "no project root known"
+    /// (falls back to the legacy behavior).
+    pub project_root: PathBuf,
+}
+
+impl std::fmt::Display for ToolContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ToolContext(mode={:?}, project_root={})",
+            self.mode,
+            if self.project_root.as_os_str().is_empty() {
+                "<unset>".to_string()
+            } else {
+                self.project_root.display().to_string()
+            }
+        )
+    }
 }
 
 impl ToolContext {
     pub fn new(mode: PermissionMode) -> Self {
-        Self { mode }
+        Self {
+            mode,
+            project_root: PathBuf::new(),
+        }
+    }
+
+    pub fn with_project_root(mut self, root: PathBuf) -> Self {
+        self.project_root = root;
+        self
     }
 }
 
@@ -125,11 +159,11 @@ pub fn run_tool_with_context(call: &ToolCall, context: &ToolContext) -> ToolResu
     }
 
     match call.name.as_str() {
-        "read" | "read_file" => read::run(call),
+        "read" | "read_file" => read::run_with_context(call, context),
         "write" | "write_file" => write::run(call),
         "edit" => edit::run(call),
         "apply_patch" => apply_patch::run(call),
-        "glob" | "search_files" => glob::run(call),
+        "glob" | "search_files" => glob::run_with_context(call, context),
         "grep" => grep::run(call),
         "shell" | "bash" => shell::run(call),
         "task" => task::run(call),
@@ -162,9 +196,13 @@ pub async fn run_tool_async(call: &ToolCall, runtime: &ToolRuntime) -> ToolResul
         "ask_peer" => ask_peer::run_async(call, runtime.clone()).await,
         // Everything else: defer to the sync path. The caller is already
         // running in an async context, but the underlying tool is sync.
+        // Thread the caller's project_root through so file-system
+        // tools resolve paths against the right directory.
         other => {
             let _ = other;
-            run_tool_with_context(call, &ToolContext::default())
+            let ctx = ToolContext::new(PermissionMode::Build)
+                .with_project_root(runtime.project_root.clone());
+            run_tool_with_context(call, &ctx)
         }
     }
 }

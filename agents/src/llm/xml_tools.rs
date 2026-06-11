@@ -994,7 +994,25 @@ mod tests {
         let known_set = known(&tools);
         let mut id = new_id_counter();
         let buffer = "Sure thing.\n<read>\n<path>x.rs</path>\n</read>\nDone.";
+        eprintln!("=== INPUT ===\n{buffer}\n=== END INPUT ===");
         let segments = drain_tool_blocks_preserving_text(buffer, &known_set, &mut id);
+
+        eprintln!("=== SEGMENTS ({}) ===", segments.len());
+        for (i, seg) in segments.iter().enumerate() {
+            match seg {
+                DrainedToolSegment::Text(t) => eprintln!("[{i}] Text: {:?}", t),
+                DrainedToolSegment::Tool(ParsedToolBlock::Valid { id, tool, input }) => {
+                    eprintln!("[{i}] Tool Valid: id={id} tool={tool} input={input}");
+                }
+                DrainedToolSegment::Tool(ParsedToolBlock::Invalid { tool, reason }) => {
+                    eprintln!("[{i}] Tool Invalid: tool={tool} reason={reason}");
+                }
+                DrainedToolSegment::Tool(ParsedToolBlock::Incomplete) => {
+                    eprintln!("[{i}] Tool Incomplete");
+                }
+            }
+        }
+        eprintln!("=== END SEGMENTS ===");
 
         assert_eq!(segments.len(), 3);
         assert_eq!(
