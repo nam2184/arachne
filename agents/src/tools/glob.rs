@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use crate::{ToolCall, ToolResult};
 
-use super::{failure, string_arg, success, wildcard_match, ToolContext};
+use super::{
+    failure, string_arg, success, usize_arg, wildcard_match, ToolContext, GLOB_DEFAULT_LIMIT,
+};
 
 pub fn run(call: &ToolCall) -> ToolResult {
     run_with_context(call, &ToolContext::default())
@@ -47,6 +49,7 @@ pub fn run_with_root(call: &ToolCall, root: &Path) -> ToolResult {
     } else {
         pattern
     };
+    let limit = usize_arg(call, "limit").unwrap_or(GLOB_DEFAULT_LIMIT);
 
     let mut matches = Vec::new();
     for entry in walkdir::WalkDir::new(root)
@@ -67,13 +70,22 @@ pub fn run_with_root(call: &ToolCall, root: &Path) -> ToolResult {
             || wildcard_match(&pattern, &entry.file_name().to_string_lossy())
         {
             matches.push(entry.path().to_string_lossy().to_string());
+            if matches.len() >= limit {
+                break;
+            }
         }
     }
 
     if matches.is_empty() {
         return failure("glob", "No files found".to_string());
     }
-    success("glob", matches.join("\n"))
+    let mut output = matches.join("\n");
+    if matches.len() >= limit {
+        output.push_str(&format!(
+            "\n\n(Results are truncated: showing first {limit} results. Consider using a more specific path or pattern.)"
+        ));
+    }
+    success("glob", output)
 }
 
 #[cfg(test)]

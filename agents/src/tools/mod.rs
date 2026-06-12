@@ -6,6 +6,7 @@ pub mod glob;
 pub mod grep;
 pub mod invalid;
 pub mod lsp;
+pub mod output_bounds;
 pub mod plan;
 pub mod question;
 pub mod read;
@@ -27,6 +28,11 @@ use crate::permission_v2::PermissionService as V2PermissionService;
 use crate::sandbox::{DoomLoopDetector, NetworkPolicy, SandboxPolicy, ShellExit, ShellPolicy};
 use crate::{Tool, ToolCall, ToolResult};
 
+pub use output_bounds::{
+    bound_tool_output, estimate_tokens, BoundedOutput, CHARS_PER_TOKEN, GLOB_DEFAULT_LIMIT,
+    GREP_DEFAULT_LIMIT, MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_OUTPUT_LINES, READ_DEFAULT_LIMIT,
+};
+
 /// Runtime context passed to every tool invocation that needs to spawn
 /// sub-sessions or write to the parent's conversation. Held behind an
 /// `Arc` so it's cheap to clone into `tokio::task::spawn`.
@@ -35,6 +41,7 @@ pub struct ToolRuntime {
     pub caller_session_id: String,
     pub session_service: Arc<crate::SessionService>,
     pub conversation_service: Arc<crate::ConversationService>,
+    pub providers: Arc<crate::llm::ProviderRegistry>,
     pub subagent_registry: Arc<SubagentRegistry>,
     /// Project root for the caller's session. Propagated into the
     /// `ToolContext` used for non-task tools so file-system tools
@@ -164,7 +171,7 @@ pub fn run_tool_with_context(call: &ToolCall, context: &ToolContext) -> ToolResu
         "edit" => edit::run(call),
         "apply_patch" => apply_patch::run(call),
         "glob" | "search_files" => glob::run_with_context(call, context),
-        "grep" => grep::run(call),
+        "grep" => grep::run_with_context(call, context),
         "shell" | "bash" => shell::run(call),
         "task" => task::run(call),
         "ask_peer" => {

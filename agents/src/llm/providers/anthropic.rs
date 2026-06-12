@@ -3,9 +3,9 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
-use super::{LlmError, LlmProvider, LlmStream, ToolResultInject};
+use super::{log_sse_event_body, LlmError, LlmProvider, LlmStream};
 use crate::llm::events::{FinishReason, LlmEvent, ToolDefinition, Usage};
 use crate::llm::request::{ContentPart, LlmRequest};
 
@@ -106,7 +106,7 @@ impl LlmProvider for AnthropicProvider {
                                         "input": input
                                     }));
                                 }
-                                ContentPart::ToolResult { id, name, result } => {
+                                ContentPart::ToolResult { id, result, .. } => {
                                     content_parts.push(serde_json::json!({
                                         "type": "tool_result",
                                         "tool_use_id": id,
@@ -131,7 +131,7 @@ impl LlmProvider for AnthropicProvider {
                         // content blocks (handled above).
                         let mut content_parts: Vec<serde_json::Value> = Vec::new();
                         for part in &msg.content {
-                            if let ContentPart::ToolResult { id, name, result } = part {
+                            if let ContentPart::ToolResult { id, result, .. } = part {
                                 content_parts.push(serde_json::json!({
                                     "type": "tool_result",
                                     "tool_use_id": id,
@@ -205,7 +205,6 @@ impl LlmProvider for AnthropicProvider {
 
         let (abort_tx, mut abort_rx) = oneshot::channel();
         let abort_tx = Arc::new(abort_tx);
-        let (tool_result_tx, tool_result_rx) = mpsc::channel::<ToolResultInject>(32);
 
         let response = self
             .http_client
@@ -222,6 +221,13 @@ impl LlmProvider for AnthropicProvider {
                     .model(&request.model)
             })?;
 
+        tracing::info!(
+            "llm response received: provider=anthropic url={} model={} status={}",
+            url,
+            request.model,
+            response.status().as_u16(),
+        );
+
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
@@ -230,56 +236,43 @@ impl LlmProvider for AnthropicProvider {
                 .model(&request.model));
         }
 
+        let stream_model = request.model.clone();
         let stream = async_stream::stream! {
             let mut event_stream = response.bytes_stream();
             let mut line_buffer = String::new();
-            let mut tool_result_rx = tool_result_rx;
 
             // Tracks tool_use blocks by content-block index. The
             // Anthropic protocol is index-driven: the model can
             // emit text + tool_use + thinking interleaved.
             let mut tool_state = AnthropicToolStreamState::default();
 
-            loop {
-                tokio::select! {
-                    biased;
+            // Tool results are produced by the runner after the model
+            // stream ends and are included in the next request via
+            // persisted conversation history.
+            while let Some(chunk) = event_stream.next().await {
+                if matches!(abort_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)) {
+                    break;
+                }
 
-                    chunk = event_stream.next() => {
-                        let Some(chunk) = chunk else { break };
-                        if matches!(abort_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)) {
-                            break;
+                let Ok(bytes) = chunk else { continue };
+                let text = String::from_utf8_lossy(&bytes);
+
+                for ch in text.chars() {
+                    if ch == '\n' {
+                        let line = line_buffer.trim();
+                        let line_owned = line.to_string();
+                        line_buffer.clear();
+
+                        if line_owned.is_empty() {
+                            continue;
                         }
+                        log_sse_event_body("anthropic", &stream_model, &line_owned);
 
-                        let Ok(bytes) = chunk else { continue };
-                        let text = String::from_utf8_lossy(&bytes);
-
-                        for ch in text.chars() {
-                            if ch == '\n' {
-                                let line = line_buffer.trim();
-                                let line_owned = line.to_string();
-                                line_buffer.clear();
-
-                                if line_owned.is_empty() {
-                                    continue;
-                                }
-
-                                for event in parse_anthropic_sse_line(&line_owned, &mut tool_state) {
-                                    yield event;
-                                }
-                            } else {
-                                line_buffer.push(ch);
-                            }
+                        for event in parse_anthropic_sse_line(&line_owned, &mut tool_state) {
+                            yield event;
                         }
-                    }
-
-                    inject = tool_result_rx.recv() => {
-                        let Some(inject) = inject else { break };
-                        yield LlmEvent::ToolResult {
-                            id: inject.id,
-                            name: inject.name,
-                            result: crate::llm::events::ToolResultValue::Json { value: inject.result },
-                            output: None,
-                        };
+                    } else {
+                        line_buffer.push(ch);
                     }
                 }
             }
@@ -288,13 +281,10 @@ impl LlmProvider for AnthropicProvider {
             for event in tool_state.flush_all() {
                 yield event;
             }
-
-            drop(tool_result_rx);
         };
 
         Ok(LlmStream {
             events: Box::pin(stream),
-            tool_result_tx,
             abort_tx: Some(abort_tx),
         })
     }
@@ -385,7 +375,10 @@ impl AnthropicToolStreamState {
     }
 }
 
-fn parse_anthropic_sse_line(line: &str, tool_state: &mut AnthropicToolStreamState) -> Vec<LlmEvent> {
+fn parse_anthropic_sse_line(
+    line: &str,
+    tool_state: &mut AnthropicToolStreamState,
+) -> Vec<LlmEvent> {
     let data = match super::parse_sse_line(line) {
         Some(d) => d,
         None => return Vec::new(),
@@ -407,12 +400,22 @@ fn parse_anthropic_sse_line(line: &str, tool_state: &mut AnthropicToolStreamStat
             events.push(LlmEvent::StepStart { index: 0 });
         }
         "content_block_start" => {
-            let block_type = json.get("content_block").and_then(|b| b.get("type")).and_then(|v| v.as_str()).unwrap_or("");
+            let block_type = json
+                .get("content_block")
+                .and_then(|b| b.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let index = json.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             match block_type {
                 "text" => {
-                    events.push(LlmEvent::TextStart { id: format!("text-{index}") });
-                    if let Some(text) = json.get("content_block").and_then(|b| b.get("text")).and_then(|v| v.as_str()) {
+                    events.push(LlmEvent::TextStart {
+                        id: format!("text-{index}"),
+                    });
+                    if let Some(text) = json
+                        .get("content_block")
+                        .and_then(|b| b.get("text"))
+                        .and_then(|v| v.as_str())
+                    {
                         if !text.is_empty() {
                             events.push(LlmEvent::TextDelta {
                                 id: format!("text-{index}"),
@@ -422,7 +425,9 @@ fn parse_anthropic_sse_line(line: &str, tool_state: &mut AnthropicToolStreamStat
                     }
                 }
                 "thinking" => {
-                    events.push(LlmEvent::ReasoningStart { id: format!("reasoning-{index}") });
+                    events.push(LlmEvent::ReasoningStart {
+                        id: format!("reasoning-{index}"),
+                    });
                     if let Some(thinking) = json
                         .get("content_block")
                         .and_then(|b| b.get("thinking"))
@@ -455,11 +460,19 @@ fn parse_anthropic_sse_line(line: &str, tool_state: &mut AnthropicToolStreamStat
             }
         }
         "content_block_delta" => {
-            let delta_type = json.get("delta").and_then(|d| d.get("type")).and_then(|v| v.as_str()).unwrap_or("");
+            let delta_type = json
+                .get("delta")
+                .and_then(|d| d.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let index = json.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             match delta_type {
                 "text_delta" => {
-                    if let Some(text) = json.get("delta").and_then(|d| d.get("text")).and_then(|v| v.as_str()) {
+                    if let Some(text) = json
+                        .get("delta")
+                        .and_then(|d| d.get("text"))
+                        .and_then(|v| v.as_str())
+                    {
                         if !text.is_empty() {
                             events.push(LlmEvent::TextDelta {
                                 id: format!("text-{index}"),
@@ -511,7 +524,9 @@ fn parse_anthropic_sse_line(line: &str, tool_state: &mut AnthropicToolStreamStat
             if !tool_events.is_empty() {
                 events.extend(tool_events);
             } else {
-                events.push(LlmEvent::TextEnd { id: format!("block-{index}") });
+                events.push(LlmEvent::TextEnd {
+                    id: format!("block-{index}"),
+                });
             }
         }
         "message_delta" => {
@@ -540,7 +555,11 @@ fn parse_anthropic_sse_line(line: &str, tool_state: &mut AnthropicToolStreamStat
             // Heartbeat; ignore.
         }
         "error" => {
-            if let Some(message) = json.get("error").and_then(|e| e.get("message")).and_then(|v| v.as_str()) {
+            if let Some(message) = json
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+            {
                 events.push(LlmEvent::ProviderError {
                     message: message.to_string(),
                 });
@@ -645,7 +664,9 @@ mod tests {
         // Second delta: one ToolInputDelta.
         assert!(matches!(e2[0], LlmEvent::ToolInputDelta { .. }));
         // Stop: ToolInputEnd + ToolCall with parsed input.
-        assert!(matches!(stop_events[0], LlmEvent::ToolInputEnd { ref name, .. } if name == "read"));
+        assert!(
+            matches!(stop_events[0], LlmEvent::ToolInputEnd { ref name, .. } if name == "read")
+        );
         let LlmEvent::ToolCall { name, input, .. } = &stop_events[1] else {
             panic!("expected ToolCall, got: {stop_events:?}");
         };
@@ -665,7 +686,9 @@ mod tests {
         let _ = parse_anthropic_sse_line(stop, &mut state);
 
         assert!(matches!(start_events[0], LlmEvent::ReasoningStart { .. }));
-        assert!(matches!(d_events[0], LlmEvent::ReasoningDelta { ref text, .. } if text == "Let me think."));
+        assert!(
+            matches!(d_events[0], LlmEvent::ReasoningDelta { ref text, .. } if text == "Let me think.")
+        );
     }
 
     #[test]
@@ -674,9 +697,13 @@ mod tests {
         let line = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}";
         let events = parse_anthropic_sse_line(line, &mut state);
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, LlmEvent::Finish { reason: FinishReason::ToolCalls, .. })),
+            events.iter().any(|e| matches!(
+                e,
+                LlmEvent::Finish {
+                    reason: FinishReason::ToolCalls,
+                    ..
+                }
+            )),
             "expected Finish ToolCalls, got: {events:?}"
         );
     }

@@ -2,12 +2,22 @@ use std::path::{Path, PathBuf};
 
 use crate::{ToolCall, ToolResult};
 
-use super::{failure, string_arg, success, wildcard_match};
+use super::{
+    failure, string_arg, success, usize_arg, wildcard_match, ToolContext, GREP_DEFAULT_LIMIT,
+};
 
 pub fn run(call: &ToolCall) -> ToolResult {
+    run_with_context(call, &ToolContext::default())
+}
+
+pub fn run_with_context(call: &ToolCall, ctx: &ToolContext) -> ToolResult {
     let root = string_arg(call, "path");
     let root_path = if root.is_empty() {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        if ctx.project_root.as_os_str().is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        } else {
+            ctx.project_root.clone()
+        }
     } else {
         PathBuf::from(&root)
     };
@@ -17,6 +27,7 @@ pub fn run(call: &ToolCall) -> ToolResult {
 pub fn run_with_root(call: &ToolCall, root: &Path) -> ToolResult {
     let pattern = string_arg(call, "pattern");
     let include = string_arg(call, "include");
+    let limit = usize_arg(call, "limit").unwrap_or(GREP_DEFAULT_LIMIT);
 
     if pattern.is_empty() {
         return failure("grep", "pattern is required".to_string());
@@ -46,14 +57,26 @@ pub fn run_with_root(call: &ToolCall, root: &Path) -> ToolResult {
                     index + 1,
                     line
                 ));
+                if matches.len() >= limit {
+                    break;
+                }
             }
+        }
+        if matches.len() >= limit {
+            break;
         }
     }
 
     if matches.is_empty() {
         return failure("grep", "No matches found".to_string());
     }
-    success("grep", matches.join("\n"))
+    let mut output = matches.join("\n");
+    if matches.len() >= limit {
+        output.push_str(&format!(
+            "\n\n(Results are truncated: showing first {limit} matches. Use a more specific pattern or include filter.)"
+        ));
+    }
+    success("grep", output)
 }
 
 #[cfg(test)]

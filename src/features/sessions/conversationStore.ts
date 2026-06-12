@@ -44,6 +44,7 @@ export type AgentStreamEvent =
 interface ConversationState {
   activeConversation: ConversationFile | null;
   streamingMessageId: string | null;
+  isCompacting: boolean;
   loadConversation: (sessionId: string) => Promise<void>;
   loadUiConversation: (sessionId: string) => Promise<void>;
   appendMessage: (sessionId: string, role: "user" | "assistant" | "system", content: string) => Promise<string>;
@@ -52,6 +53,7 @@ interface ConversationState {
   failStreamingMessage: (sessionId: string, message: string) => void;
   finishStreamingMessage: (sessionId: string) => void;
   compactConversation: (sessionId: string, summary: string) => Promise<void>;
+  compactNow: (sessionId: string) => Promise<{ status: string; summary: string }>;
   clearConversation: () => void;
 }
 
@@ -306,6 +308,7 @@ function clearSplitter(messageId: string | null) {
 export const useConversationStore = create<ConversationState>((set, get) => ({
   activeConversation: null,
   streamingMessageId: null,
+  isCompacting: false,
 
   loadConversation: async (sessionId) => {
     const conv = await invoke<ConversationFile>("get_ai_conversation", { sessionId });
@@ -497,7 +500,19 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     set({ activeConversation: normalizeConversation(conv), streamingMessageId: null });
   },
 
-  clearConversation: () => set({ activeConversation: null, streamingMessageId: null }),
+  compactNow: async (sessionId) => {
+    set({ isCompacting: true });
+    try {
+      const result = await invoke<{ status: string; summary: string }>("compact_now", { sessionId });
+      const conv = await invoke<ConversationFile>("get_ai_conversation", { sessionId });
+      set({ activeConversation: normalizeConversation(conv), streamingMessageId: null });
+      return result;
+    } finally {
+      set({ isCompacting: false });
+    }
+  },
+
+  clearConversation: () => set({ activeConversation: null, streamingMessageId: null, isCompacting: false }),
 }));
 
 function appendErrorToDraft(current: string, message: string) {

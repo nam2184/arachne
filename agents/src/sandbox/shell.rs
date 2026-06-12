@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -100,7 +100,7 @@ pub fn run_shell(command: &str, policy: &ShellPolicy) -> Result<ShellOutput, She
         cmd.env(k, v);
     }
 
-    let mut child = match cmd.spawn() {
+    let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             return Ok(ShellOutput {
@@ -207,6 +207,7 @@ pub fn validate(policy: &ShellPolicy) -> Result<(), ShellError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn policy_for(dir: &Path) -> ShellPolicy {
         ShellPolicy::new(dir).with_timeout(Duration::from_secs(10))

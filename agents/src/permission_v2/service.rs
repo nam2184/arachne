@@ -80,19 +80,17 @@ impl PermissionService {
             request_id,
         } = request;
 
-        let approved = self.approved.read();
-        // Order matters: base first, approved later so they win (last-match wins).
-        let rule = PermissionRuleset::evaluate_merged(
-            &[
-                &self.base_ruleset,
-                &PermissionRuleset {
-                    rules: approved.clone(),
-                },
-            ],
-            &permission,
-            &pattern,
-        );
-        drop(approved);
+        let rule = {
+            let approved_ruleset = PermissionRuleset {
+                rules: self.approved.read().clone(),
+            };
+            // Order matters: base first, approved later so they win (last-match wins).
+            PermissionRuleset::evaluate_merged(
+                &[&self.base_ruleset, &approved_ruleset],
+                &permission,
+                &pattern,
+            )
+        };
 
         match rule.action {
             PermissionAction::Allow => Ok(CheckOutcome::Allowed),
@@ -146,19 +144,17 @@ impl PermissionService {
             request_id,
         } = request;
 
-        let approved = self.approved.read();
-        // Order matters: base first, approved later so they win (last-match wins).
-        let rule = PermissionRuleset::evaluate_merged(
-            &[
-                &self.base_ruleset,
-                &PermissionRuleset {
-                    rules: approved.clone(),
-                },
-            ],
-            &permission,
-            &pattern,
-        );
-        drop(approved);
+        let rule = {
+            let approved_ruleset = PermissionRuleset {
+                rules: self.approved.read().clone(),
+            };
+            // Order matters: base first, approved later so they win (last-match wins).
+            PermissionRuleset::evaluate_merged(
+                &[&self.base_ruleset, &approved_ruleset],
+                &permission,
+                &pattern,
+            )
+        };
 
         match rule.action {
             PermissionAction::Allow => Ok(CheckOutcome::Allowed),

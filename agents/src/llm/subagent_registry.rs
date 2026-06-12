@@ -22,13 +22,6 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use rusqlite::Connection;
 
-// `SessionRepository` is intentionally not imported: the registry
-// opens its own `Connection` to do the depth check, since the
-// in-memory `Arc<Database>` is `!Sync` and the registry is held
-// across `await` points.
-
-use crate::database::repositories::SessionRepository;
-
 /// A `task` / `ask_peer` result delivered to a parent after its child
 /// finishes. The parent's `SessionRunner` drains these before the next
 /// LLM turn and includes them as a synthetic user message.

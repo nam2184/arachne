@@ -1,9 +1,8 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use serde_json::Value;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio_stream::Stream;
 
 use super::events::LlmEvent;
@@ -40,27 +39,10 @@ pub trait LlmProvider: Send + Sync {
 
 pub struct LlmStream {
     pub events: Pin<Box<dyn Stream<Item = LlmEvent> + Send>>,
-    pub tool_result_tx: mpsc::Sender<ToolResultInject>,
     pub abort_tx: Option<Arc<oneshot::Sender<()>>>,
 }
 
 impl LlmStream {
-    pub async fn inject_tool_result(
-        &self,
-        id: &str,
-        name: &str,
-        result: Value,
-    ) -> Result<(), LlmError> {
-        self.tool_result_tx
-            .send(ToolResultInject {
-                id: id.to_string(),
-                name: name.to_string(),
-                result,
-            })
-            .await
-            .map_err(|_| LlmError::new("stream_closed", "tool result channel closed"))
-    }
-
     pub fn abort(&self) {
         if let Some(tx) = self.abort_tx.as_ref() {
             if let Ok(sender) = Arc::try_unwrap(tx.clone()) {
@@ -68,13 +50,6 @@ impl LlmStream {
             }
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolResultInject {
-    pub id: String,
-    pub name: String,
-    pub result: Value,
 }
 
 /// Helper used by provider implementations to extract the JSON
@@ -105,4 +80,24 @@ pub fn system_prompt(agent_name: &str, languages: &[String]) -> String {
         agent_name,
         languages.join(", ")
     )
+}
+
+pub(super) fn log_sse_event_body(provider: &str, model: &str, body: &str) {
+    const MAX_SSE_LOG_BYTES: usize = 32 * 1024;
+
+    let body_truncated = body.len() > MAX_SSE_LOG_BYTES;
+    let body_display: String = if body_truncated {
+        body.chars().take(MAX_SSE_LOG_BYTES).collect()
+    } else {
+        body.to_string()
+    };
+
+    tracing::info!(
+        provider = %provider,
+        model = %model,
+        body_bytes = body.len(),
+        body_truncated,
+        body = %body_display,
+        "llm sse response body"
+    );
 }

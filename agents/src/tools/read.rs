@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{ToolCall, ToolResult};
 
-use super::{failure, string_arg, success, usize_arg, ToolContext};
+use super::{failure, string_arg, success, usize_arg, ToolContext, READ_DEFAULT_LIMIT};
 
 pub fn run(call: &ToolCall) -> ToolResult {
     run_with_context(call, &ToolContext::default())
@@ -21,7 +21,7 @@ pub fn run_with_context(call: &ToolCall, ctx: &ToolContext) -> ToolResult {
 
 pub fn run_with_path(call: &ToolCall, path: &Path) -> ToolResult {
     let offset = usize_arg(call, "offset").unwrap_or(1).max(1);
-    let limit = usize_arg(call, "limit");
+    let limit = usize_arg(call, "limit").or(Some(READ_DEFAULT_LIMIT));
 
     match std::fs::read_to_string(path) {
         Ok(content) => success("read", format_lines(&content, offset, limit)),

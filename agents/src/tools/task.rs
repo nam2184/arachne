@@ -88,23 +88,16 @@ pub async fn run_async(call: &ToolCall, runtime: ToolRuntime) -> ToolResult {
     // Build a child session. The child inherits the caller's project,
     // provider, and model. The directory is the caller's directory by
     // default; `ask_peer` overrides this when it wants to use a peer's.
-    let child = crate::AgentSession::child_of(
-        &caller,
+    let child_id = match runtime.session_service.create_session_with_parent(
+        caller.project_id.clone(),
         caller.directory.clone(),
         caller.provider.clone(),
         caller.model.clone(),
-    );
-    let child_id = child.id.clone();
-
-    if let Err(e) = runtime.session_service.create_session_with_parent(
-        caller.project_id.clone(),
-        child.directory.clone(),
-        child.provider.clone(),
-        child.model.clone(),
         Some(caller.id.clone()),
     ) {
-        return failure("task", format!("failed to create child session: {e}"));
-    }
+        Ok(id) => id,
+        Err(e) => return failure("task", format!("failed to create child session: {e}")),
+    };
     runtime
         .subagent_registry
         .register_child(&caller.id, &child_id);
@@ -143,20 +136,10 @@ pub async fn run_async(call: &ToolCall, runtime: ToolRuntime) -> ToolResult {
     };
     registry.push_completion(&parent_id, completion);
 
-    let state_label = if outcome.success {
-        "completed"
-    } else {
-        "error"
-    };
     let body = format!(
         "{envelope_open}<task_result>{}</task_result>\n</task>",
         escape_for_envelope(&outcome.text)
     );
-    let _state_label = if outcome.success {
-        "completed"
-    } else {
-        "error"
-    };
     success_or_failure("task", outcome.success, body, outcome.error)
 }
 
@@ -226,18 +209,8 @@ async fn run_child_foreground(
         }
     };
 
-    // 3. Run synchronously (SessionRunner is async-on-top-of-blocking
-    //    today, like the existing agent_service path). Wrap in a
-    //    tokio::task::spawn_blocking to avoid stalling the runtime.
-    let child_for_blocking = child_id.clone();
-    let join = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async move { runner.run(&child_for_blocking).await })
-    })
-    .await;
-
-    match join {
-        Ok(Ok(_result)) => {
+    match Box::pin(runner.run(&child_id)).await {
+        Ok(_result) => {
             // Extract the last assistant text from the child's
             // conversation.
             let text =
@@ -248,29 +221,16 @@ async fn run_child_foreground(
                 error: None,
             }
         }
-        Ok(Err(e)) => ChildOutcome {
+        Err(e) => ChildOutcome {
             success: false,
             text: format!("child session failed: {e}"),
             error: Some(e.to_string()),
-        },
-        Err(e) => ChildOutcome {
-            success: false,
-            text: format!("child runner panicked: {e}"),
-            error: Some(format!("join error: {e}")),
         },
     }
 }
 
 fn child_provider_registry(_runtime: &ToolRuntime) -> Arc<ProviderRegistry> {
-    // We don't have a handle to the parent's ProviderRegistry through
-    // ToolRuntime today. The child's own session has provider/model
-    // fields; a future iteration will plumb the registry through
-    // ToolRuntime. For now we hand back a registry with the three
-    // default providers registered (the same set the legacy path
-    // bootstraps).
-    let reg = Arc::new(ProviderRegistry::new());
-    reg.register_defaults_sync();
-    reg
+    Arc::clone(&_runtime.providers)
 }
 
 fn last_assistant_text(

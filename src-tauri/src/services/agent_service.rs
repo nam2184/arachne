@@ -1,13 +1,16 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use arachne_agents::{
     llm::providers::{AnthropicProvider, MiniMaxTokenPlanProvider, OpenAiProvider},
     llm::{ContentPart, SubagentRegistry},
-    ConversationService, LlmProvider, MessageRole, ProviderProtocol, ProviderRegistry,
-    ProviderService, SessionError, SessionRunEvent, SessionRunner, SessionService,
+    CompactionConfig, CompactionOutcome, CompactionRequest, CompactionService,
+    ConversationService, LlmProvider, MessageRole, ModelRegistry, ProviderProtocol,
+    ProviderRegistry, ProviderService, SessionError, SessionRunEvent, SessionRunner,
+    SessionService,
 };
 use tauri::{AppHandle, Emitter};
+
+use crate::services::permission_map::PermissionMap;
 
 const AGENT_EVENT: &str = "agent:event";
 
@@ -38,7 +41,8 @@ pub struct AgentService {
     conversation_service: Arc<ConversationService>,
     provider_service: Arc<ProviderService>,
     subagent_registry: Arc<SubagentRegistry>,
-    db_path: PathBuf,
+    permission_map: Arc<PermissionMap>,
+    compactor: Arc<CompactionService>,
 }
 
 impl AgentService {
@@ -46,11 +50,17 @@ impl AgentService {
         session_service: Arc<SessionService>,
         conversation_service: Arc<ConversationService>,
         provider_service: Arc<ProviderService>,
-        db_path: PathBuf,
+        subagent_registry: Arc<SubagentRegistry>,
+        permission_map: Arc<PermissionMap>,
     ) -> Arc<Self> {
         let providers = Arc::new(ProviderRegistry::new());
         providers.register_defaults_sync();
-        let subagent_registry = SubagentRegistry::new(db_path.clone());
+        let compactor = CompactionService::new(
+            Arc::clone(&conversation_service),
+            Arc::clone(&providers),
+            Arc::new(ModelRegistry::from_embedded_json()),
+            CompactionConfig::default(),
+        );
 
         Arc::new(Self {
             providers,
@@ -58,8 +68,44 @@ impl AgentService {
             conversation_service,
             provider_service,
             subagent_registry,
-            db_path,
+            permission_map,
+            compactor,
         })
+    }
+
+    pub fn compactor(&self) -> &Arc<CompactionService> {
+        &self.compactor
+    }
+
+    /// Build a `SessionRunner` wired with the auto-compactor so the
+    /// runner can transparently compact + retry when the request
+    /// would exceed the model context window.
+    pub fn build_runner(&self) -> SessionRunner {
+        SessionRunner::new(
+            Arc::clone(&self.session_service),
+            Arc::clone(&self.conversation_service),
+            Arc::clone(&self.providers),
+        )
+        .with_compactor(Arc::clone(&self.compactor))
+    }
+
+    pub async fn compact_now(
+        &self,
+        session_id: &str,
+    ) -> Result<CompactionOutcome, String> {
+        let session = self
+            .session_service
+            .get_session(session_id)?
+            .ok_or_else(|| format!("session not found: {session_id}"))?;
+        self.refresh_provider(&session.provider).await;
+        Ok(self
+            .compactor
+            .compact_now(CompactionRequest {
+                session_id: session_id.to_string(),
+                provider: session.provider,
+                model: session.model,
+            })
+            .await)
     }
 
     pub fn subagent_registry(&self) -> &Arc<SubagentRegistry> {
@@ -133,7 +179,7 @@ impl AgentService {
         let conversation_service = Arc::clone(&self.conversation_service);
         let providers = Arc::clone(&self.providers);
         let registry = Arc::clone(&self.subagent_registry);
-        let _ = self.db_path.clone(); // retained for future direct queries
+        let permissions = self.permission_map.get_or_create(session_id);
         let app_for_events = app.clone();
         let event_sink = Arc::new(move |event: SessionRunEvent| {
             emit_agent_event(
@@ -146,25 +192,13 @@ impl AgentService {
             );
         });
 
-        let run_result = tokio::task::spawn_blocking(move || {
-            // The runner manages its own per-session doom loop
-            // detector and (optionally) a v2 permission service for
-            // doom-loop user prompts. We don't wire the v2 service
-            // here yet — when the user enables the explicit
-            // doom-loop approval flow, the agent_service will pick up
-            // the configured `PermissionService` and pass it via
-            // `.with_permissions(...)`. Until then, doom loops
-            // surface as hard errors to the LLM, which is the safe
-            // default.
-            let runner = SessionRunner::new(session_service, conversation_service, providers)
-                .with_event_sink(event_sink)
-                .with_subagent_registry(Arc::clone(&registry))
-                .with_mode(mode);
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(runner.run(&session_id_clone))
-        })
-        .await
-        .map_err(|e| e.to_string())?;
+        let runner = self
+            .build_runner()
+            .with_event_sink(event_sink)
+            .with_subagent_registry(Arc::clone(&registry))
+            .with_permissions(permissions)
+            .with_mode(mode);
+        let run_result = runner.run(&session_id_clone).await;
 
         if let Err(error) = run_result {
             let message = chat_error_message(&error);

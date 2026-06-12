@@ -1,4 +1,5 @@
 pub mod agent_commands;
+pub mod compaction_commands;
 pub mod conversation_commands;
 pub mod file_commands;
 pub mod project_commands;

@@ -27,6 +27,7 @@ pub use model_spec::{ModelRegistry, ModelSpec, DEFAULT_CONTEXT_WINDOW, DEFAULT_M
 pub use permission::{PermissionAction, PermissionMode, PermissionRequest, PermissionService};
 pub use provider_service::ProviderService;
 pub use sessions::{
-    create_conversation_service, ConversationFile, ConversationMessage, ConversationService,
-    SessionService,
+    build_prompt, create_conversation_service, serialize_message, CompactionConfig,
+    CompactionOutcome, CompactionRequest, CompactionService, ConversationFile, ConversationMessage,
+    ConversationService, SessionService,
 };

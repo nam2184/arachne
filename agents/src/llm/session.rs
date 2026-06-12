@@ -8,10 +8,16 @@ use crate::llm::events::{FinishReason, LlmEvent, ToolResultValue};
 use crate::llm::providers::LlmProvider;
 use crate::llm::request::{ContentPart, LlmMessage, LlmRequest};
 use crate::llm::subagent_registry::SubagentRegistry;
+use crate::model_spec::ModelRegistry;
 use crate::permission::PermissionService;
 use crate::sessions::conversation::{ConversationMessage, ConversationService};
 use crate::sessions::service::SessionService;
-use crate::tools::{run_tool_async, run_tool_with_context, ToolContext, ToolRuntime};
+use crate::tools::{
+    bound_tool_output, estimate_tokens, run_tool_async, run_tool_with_context, ToolContext,
+    ToolRuntime, MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_OUTPUT_LINES,
+};
+
+use crate::sessions::conversation::ConversationFile;
 
 const MAX_STEPS: u32 = 25;
 
@@ -47,6 +53,16 @@ pub struct SessionRunner {
     /// on doom loop so the LLM sees a clear failure rather than an
     /// infinite loop.
     permissions: Option<Arc<crate::permission_v2::PermissionService>>,
+    /// Model registry used to look up per-model context windows
+    /// for request-size pre-checks. Opencode uses the registered
+    /// `model.limit.context` similarly to decide when to compact.
+    model_registry: Arc<ModelRegistry>,
+    /// Optional compactor. When set, the runner will attempt LLM-
+    /// driven auto-compaction when the assembled request would
+    /// exceed the model context window. When unset, overflow
+    /// surfaces as `SessionError::ContextOverflow` so the UI can
+    /// trigger manual compaction.
+    compactor: Option<Arc<crate::sessions::CompactionService>>,
 }
 
 impl SessionRunner {
@@ -54,6 +70,23 @@ impl SessionRunner {
         session_service: Arc<SessionService>,
         conversation_service: Arc<ConversationService>,
         providers: Arc<ProviderRegistry>,
+    ) -> Self {
+        Self::with_model_registry(
+            session_service,
+            conversation_service,
+            providers,
+            Arc::new(ModelRegistry::from_embedded_json()),
+        )
+    }
+
+    /// Construct a runner with an explicit model registry. Used by
+    /// tests and by callers that want to override the default
+    /// embedded registry.
+    pub fn with_model_registry(
+        session_service: Arc<SessionService>,
+        conversation_service: Arc<ConversationService>,
+        providers: Arc<ProviderRegistry>,
+        model_registry: Arc<ModelRegistry>,
     ) -> Self {
         Self {
             session_service,
@@ -66,6 +99,8 @@ impl SessionRunner {
             event_sink: None,
             doom: Arc::new(crate::sandbox::DoomLoopDetector::default()),
             permissions: None,
+            model_registry,
+            compactor: None,
         }
     }
 
@@ -125,6 +160,32 @@ impl SessionRunner {
         self
     }
 
+    /// Wire a `CompactionService` so the runner auto-compacts when
+    /// the assembled request would exceed the model context window.
+    /// Mirrors opencode's `runner.runTurn` -> `compaction.compactIfNeeded`
+    /// -> `compactAfterOverflow` flow.
+    pub fn with_compactor(mut self, compactor: Arc<crate::sessions::CompactionService>) -> Self {
+        self.compactor = Some(compactor);
+        self
+    }
+
+    /// Manual entrypoint for the LLM-driven compactor. Mirrors
+    /// `SessionCompaction.process` in opencode. Returns the
+    /// structured outcome so the Tauri command can surface a
+    /// status to the UI. The caller (Tauri command) supplies the
+    /// `CompactionRequest` because it already has the session row
+    /// in hand.
+    pub async fn run_compaction(
+        &self,
+        request: crate::sessions::CompactionRequest,
+    ) -> Result<crate::sessions::CompactionOutcome, String> {
+        let compactor = self
+            .compactor
+            .as_ref()
+            .ok_or_else(|| "compactor not configured".to_string())?;
+        Ok(compactor.compact_now(request).await)
+    }
+
     fn emit_event(&self, session_id: &str, step: u32, event: &LlmEvent) {
         if let Some(sink) = &self.event_sink {
             sink(SessionRunEvent {
@@ -137,6 +198,7 @@ impl SessionRunner {
 
     pub async fn run(&self, session_id: &str) -> Result<RunResult, SessionError> {
         let mut step = 0u32;
+        let mut attempted_compaction = false;
 
         // Opencode-style loop: re-query the persisted conversation
         // history on each iteration. The runner decides whether to
@@ -147,11 +209,66 @@ impl SessionRunner {
         // because some providers return "stop" even when the
         // assistant emitted tool calls.
         while step < self.max_steps {
-            let continue_loop = self.run_turn(session_id, step).await?;
-            step += 1;
-
-            if !continue_loop {
-                break;
+            match self.run_turn(session_id, step).await {
+                Ok(continue_loop) => {
+                    step += 1;
+                    if !continue_loop {
+                        break;
+                    }
+                }
+                Err(SessionError::ContextOverflow { .. }) if !attempted_compaction => {
+                    // Mirror opencode's `compaction.compactIfNeeded`
+                    // + `compactAfterOverflow`: ask the LLM to
+                    // summarize the conversation, then retry the
+                    // turn. We attempt auto-compaction at most once
+                    // per `run` call to avoid loops when compaction
+                    // itself cannot shrink the conversation enough.
+                    if let Some(compactor) = &self.compactor {
+                        let session = self
+                            .session_service
+                            .get_session(session_id)
+                            .map_err(|e| SessionError::Conversation(e))?
+                            .ok_or_else(|| SessionError::SessionNotFound(session_id.to_string()))?;
+                        attempted_compaction = true;
+                        match compactor
+                            .compact_now(crate::sessions::CompactionRequest {
+                                session_id: session_id.to_string(),
+                                provider: session.provider,
+                                model: session.model,
+                            })
+                            .await
+                        {
+                            crate::sessions::CompactionOutcome::Compacted { .. } => {
+                                tracing::info!(
+                                    session_id = %session_id,
+                                    step = step,
+                                    "auto-compaction succeeded; retrying turn"
+                                );
+                                continue;
+                            }
+                            outcome => {
+                                tracing::warn!(
+                                    session_id = %session_id,
+                                    step = step,
+                                    outcome = ?outcome,
+                                    "auto-compaction did not shrink the conversation; returning ContextOverflow"
+                                );
+                                return Err(SessionError::ContextOverflow {
+                                    session_id: session_id.to_string(),
+                                    estimated_tokens: 0,
+                                    context_window: 0,
+                                });
+                            }
+                        }
+                    } else {
+                        return Err(SessionError::ContextOverflow {
+                            session_id: session_id.to_string(),
+                            estimated_tokens: 0,
+                            context_window: 0,
+                        });
+                    }
+                }
+                Err(other) => return Err(other),
             }
         }
 
@@ -245,14 +362,30 @@ impl SessionRunner {
             .get_messages(session_id)
             .map_err(|e| SessionError::Conversation(e))?;
 
+        // Read the conversation file directly so we can also surface
+        // the persisted compaction summary (if any) as a synthetic
+        // system message. `get_messages` returns only the messages
+        // array; summary lives at the top level of the file.
+        let conversation: ConversationFile = self
+            .conversation_service
+            .read_ai_conversation(session_id)
+            .map_err(SessionError::Conversation)?;
+
         let mut messages = history_to_llm_messages(&history);
+
+        if let Some(summary) = conversation.summary.as_deref() {
+            if !summary.trim().is_empty() {
+                messages.push(LlmMessage::system(&format!(
+                    "Conversation summary:\n\n{summary}"
+                )));
+            }
+        }
 
         // Inject the active permission mode as a synthetic user message
         // so the LLM knows what behaviour to follow. The mode is set
         // per-turn from the chat UI's in-memory toggle and is not
         // persisted.
         let mode = self.mode;
-        println!("{:?}", self.mode);
         let mode_guidance = match mode {
             crate::permission::PermissionMode::Plan => "\
                 only read-only tools (read, glob, grep, webfetch, websearch) are allowed. \
@@ -263,13 +396,58 @@ impl SessionRunner {
                 all tools are allowed, including write, edit, apply_patch, and shell. You may make changes to the filesystem",
         };
         messages.push(LlmMessage::system(&format!(
-            "<permission_mode>{mode}</permission_mode>\
-             <instructions>You are in {mode} mode. In {mode} mode, {mode_guidance}. \
+            "Permission mode: {mode}\n\n\
+             You are in {mode} mode. In {mode} mode, {mode_guidance}. \
              Tool calls that violate the active mode will be rejected by the \
-             runtime; plan accordingly.</instructions>",
+             runtime; plan accordingly.",
         )));
 
         let system_prompt = system_prompt_for_session(&session.provider, &[]);
+
+        // Pre-check the assembled request against the model context
+        // window. Opencode estimates the same way and refuses to
+        // dispatch when input+output would exceed the budget. We
+        // surface a typed error so the UI can trigger compaction.
+        let spec = self
+            .model_registry
+            .lookup(&session.provider, &session.model);
+        let estimated_tokens: usize = messages
+            .iter()
+            .map(|m| {
+                let chars: usize = m
+                    .content
+                    .iter()
+                    .map(|p| match p {
+                        ContentPart::Text { text } => text.len(),
+                        ContentPart::Reasoning { text } => text.len(),
+                        ContentPart::ToolCall { input, .. } => {
+                            serde_json::to_string(input).map(|s| s.len()).unwrap_or(0)
+                        }
+                        ContentPart::ToolResult { result, .. } => {
+                            serde_json::to_string(result).map(|s| s.len()).unwrap_or(0)
+                        }
+                    })
+                    .sum();
+                estimate_tokens(&" ".repeat(chars))
+            })
+            .sum();
+        let token_budget = spec.context_window.saturating_sub(spec.max_output);
+        if spec.context_window > 0 && estimated_tokens > token_budget {
+            tracing::warn!(
+                session_id = %session_id,
+                provider = %session.provider,
+                model = %session.model,
+                estimated_tokens,
+                context_window = spec.context_window,
+                max_output = spec.max_output,
+                "estimated request exceeds model context window; refusing to dispatch"
+            );
+            return Err(SessionError::ContextOverflow {
+                session_id: session_id.to_string(),
+                estimated_tokens,
+                context_window: spec.context_window,
+            });
+        }
 
         let tools = if self.readonly_tools {
             readonly_tool_definitions()
@@ -422,11 +600,7 @@ impl SessionRunner {
                     text_buffer.push_str(&text);
                 }
                 LlmEvent::TextEnd { .. } => {
-                    flush_text_buffer(
-                        &mut text_buffer,
-                        &mut in_think_block,
-                        &mut assistant_parts,
-                    );
+                    flush_text_buffer(&mut text_buffer, &mut in_think_block, &mut assistant_parts);
                 }
                 LlmEvent::ReasoningDelta { text, .. } => {
                     if !text.is_empty() {
@@ -488,13 +662,15 @@ impl SessionRunner {
             // Inline-persist the latest finalized parts. Raw text is
             // intentionally finalized at TextEnd so XML tools are parsed
             // from the complete text segment instead of per delta.
-            if let Err(e) = flush_parts(&assistant_parts) {
-                tracing::warn!(
-                    session_id = %session_id,
-                    step = step,
-                    error = %e,
-                    "inline persistence failed; will retry at end of turn"
-                );
+            if !assistant_parts.is_empty() {
+                if let Err(e) = flush_parts(&assistant_parts) {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        step = step,
+                        error = %e,
+                        "inline persistence failed; will retry at end of turn"
+                    );
+                }
             }
         }
 
@@ -506,14 +682,11 @@ impl SessionRunner {
         // Tool results are appended to `assistant_parts` so the
         // persisted assistant message contains both the call and
         // the result, and the next turn's LLM request sees them
-        // through the standard message-history path (NOT through
-        // the in-memory `stream.inject_tool_result` channel, which
-        // is closed by the time we get here for OpenAI/Anthropic).
+        // through the standard message-history path on the next turn.
         if !pending_tool_calls.is_empty() {
             let permission = PermissionService::new(self.mode);
             let project_root = std::path::PathBuf::from(&session.directory);
-            let ctx = ToolContext::new(self.mode)
-                .with_project_root(project_root.clone());
+            let ctx = ToolContext::new(self.mode).with_project_root(project_root.clone());
             tracing::info!(
                 session_id = %session_id,
                 step = step,
@@ -681,6 +854,7 @@ impl SessionRunner {
                         caller_session_id: session_id.to_string(),
                         session_service: Arc::clone(&self.session_service),
                         conversation_service: Arc::clone(&self.conversation_service),
+                        providers: Arc::clone(&self.providers),
                         subagent_registry: Arc::clone(registry),
                         project_root: project_root.clone(),
                     };
@@ -711,13 +885,47 @@ impl SessionRunner {
                     (serde_json::json!({ "error": error }), None)
                 };
 
+                // Bound the persisted tool result so a single tool
+                // call cannot blow the model context window. The
+                // bounded string is what we store on the assistant
+                // message and what the LLM sees on subsequent
+                // turns; the live event keeps the full output so
+                // the UI can still display the untruncated result.
+                let bounded = if result.success {
+                    let out = bound_tool_output(output.as_deref().unwrap_or(""));
+                    if out.truncated {
+                        crate::tools::output_bounds::note_truncation();
+                    }
+                    out
+                } else {
+                    crate::tools::BoundedOutput {
+                        text: output.as_deref().unwrap_or("").to_string(),
+                        truncated: false,
+                    }
+                };
+                let persisted_output = if bounded.truncated {
+                    Some(bounded.text.clone())
+                } else {
+                    output.clone()
+                };
+                let result_value = if bounded.truncated {
+                    serde_json::json!({
+                        "text": bounded.text,
+                        "truncated": true,
+                        "max_lines": MAX_TOOL_OUTPUT_LINES,
+                        "max_bytes": MAX_TOOL_OUTPUT_BYTES,
+                    })
+                } else {
+                    result_value
+                };
+
                 let event = LlmEvent::ToolResult {
                     id: id.clone(),
                     name: name.clone(),
                     result: ToolResultValue::Json {
                         value: result_value.clone(),
                     },
-                    output,
+                    output: persisted_output,
                 };
                 self.emit_event(session_id, step, &event);
                 assistant_parts.push(ContentPart::tool_result(&id, &name, result_value.clone()));
@@ -741,8 +949,19 @@ impl SessionRunner {
             parts = assistant_parts.len(),
             finish_reason = ?finish_reason,
             needs_continuation = needs_continuation,
-            "llm turn finished; persisting assistant message"
+            "llm turn finished"
         );
+
+        if assistant_parts.is_empty() {
+            tracing::info!(
+                session_id = %session_id,
+                step = step,
+                finish_reason = ?finish_reason,
+                needs_continuation = needs_continuation,
+                "llm turn produced no assistant output; skipping assistant message persist"
+            );
+            return Ok(needs_continuation);
+        }
 
         // Final flush (also covers the case where inline flushes
         // failed earlier). This is the only persistence path the
@@ -840,7 +1059,7 @@ fn system_prompt_for_session(provider: &str, _extra: &[String]) -> String {
          \
          # Doing tasks\n\
          - When asked to do work, plan it before acting. Inspect the codebase first.\n\
-         - Tool results and user messages may include <system-reminder> tags. These are \
+         - Tool results and user messages may include system reminder sections. These are \
          reminders from the system; they are not part of the user input.\n\
          - Prefer small, correct changes over large speculative rewrites.\n\n\
          \
@@ -852,6 +1071,7 @@ fn system_prompt_for_session(provider: &str, _extra: &[String]) -> String {
          - The list of available tools and their JSON-Schema argument \
          definitions is sent on the request, not in this prompt. \
          To call a tool, use the provider's native tool-calling API. \
+         Do not write tool calls as XML, markdown, code blocks, or plain text. \
          Do not call a tool that isn't listed. Do not invent argument names.",
         name = agent_name,
     )
@@ -1115,7 +1335,19 @@ pub enum SessionError {
     Conversation(String),
     Llm(crate::llm::request::LlmError),
     Provider(String),
-    StepLimitExceeded { session_id: String, limit: u32 },
+    StepLimitExceeded {
+        session_id: String,
+        limit: u32,
+    },
+    /// Estimated request size exceeds the model context window. The
+    /// UI is expected to surface this and trigger a compaction
+    /// (see `ConversationService::compact_conversation`) before
+    /// retrying.
+    ContextOverflow {
+        session_id: String,
+        estimated_tokens: usize,
+        context_window: usize,
+    },
 }
 
 impl std::fmt::Display for SessionError {
@@ -1131,6 +1363,14 @@ impl std::fmt::Display for SessionError {
             SessionError::StepLimitExceeded { session_id, limit } => {
                 write!(f, "session {session_id} exceeded step limit {limit}")
             }
+            SessionError::ContextOverflow {
+                session_id,
+                estimated_tokens,
+                context_window,
+            } => write!(
+                f,
+                "session {session_id} request estimated at {estimated_tokens} tokens exceeds the {context_window}-token context window; compact the conversation before retrying"
+            ),
         }
     }
 }
@@ -1297,10 +1537,17 @@ mod tests {
         let mut buf = "<think>still thinking...".to_string();
         let mut in_think = false;
         flush_text_buffer(&mut buf, &mut in_think, &mut parts);
-        assert_eq!(parts.len(), 1, "unterminated think should yield a partial Reasoning, got: {parts:?}");
+        assert_eq!(
+            parts.len(),
+            1,
+            "unterminated think should yield a partial Reasoning, got: {parts:?}"
+        );
         assert!(part_is_reasoning(&parts[0]));
         assert_eq!(part_text(&parts[0]), Some("still thinking..."));
-        assert!(in_think, "in_think must be set so the runner knows we're mid-thought");
+        assert!(
+            in_think,
+            "in_think must be set so the runner knows we're mid-thought"
+        );
     }
 
     #[test]
@@ -1313,10 +1560,14 @@ mod tests {
         // events from the provider.
         let parts = flush_for_test("I will read it.\n<read>\n<path>src/lib.rs</path>\n</read>");
         assert!(
-            !parts.iter().any(|p| matches!(p, ContentPart::ToolCall { .. })),
+            !parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ToolCall { .. })),
             "xml tool call must NOT be parsed as ContentPart::ToolCall, got: {parts:?}"
         );
-        assert!(parts.iter().any(|p| part_is_text(p) && part_text(p).unwrap().contains("<read>")));
+        assert!(parts
+            .iter()
+            .any(|p| part_is_text(p) && part_text(p).unwrap().contains("<read>")));
     }
 
     #[test]
@@ -1327,9 +1578,8 @@ mod tests {
         // for the transcript. That's a fine fallback for models
         // that emit think blocks as raw text. The primary
         // structured path doesn't go through this buffer.
-        let parts = flush_for_test(
-            "<think>\n<read>\n<path>src/lib.rs</path>\n</read>\n</think>answer",
-        );
+        let parts =
+            flush_for_test("<think>\n<read>\n<path>src/lib.rs</path>\n</read>\n</think>answer");
         assert_eq!(parts.len(), 2);
         assert!(part_is_reasoning(&parts[0]));
         assert!(part_text(&parts[0]).unwrap().contains("<read>"));
@@ -1340,7 +1590,7 @@ mod tests {
 
     use crate::database::connection::Database;
     use crate::database::repositories::ProjectRepository;
-    use crate::llm::providers::{LlmStream, ToolResultInject};
+    use crate::llm::providers::LlmStream;
     use crate::llm::request::LlmError;
     use crate::sessions::service::SessionService;
     use std::sync::Once;
@@ -1445,10 +1695,8 @@ mod tests {
                 };
                 Box::pin(stream)
             };
-            let (tx, _rx) = tokio::sync::mpsc::channel::<ToolResultInject>(8);
             Ok(LlmStream {
                 events,
-                tool_result_tx: tx,
                 abort_tx: None,
             })
         }
@@ -1588,6 +1836,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finish_only_turn_does_not_persist_empty_assistant_message() {
+        init_tracing();
+        let (runner, _tmp, session_id) = run_with_scripted(
+            "scripted",
+            vec![vec![LlmEvent::Finish {
+                reason: FinishReason::Stop,
+                usage: None,
+            }]],
+            "/tmp",
+        )
+        .await;
+
+        let result = runner.run(&session_id).await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        let msgs = runner
+            .conversation_service
+            .get_messages(&session_id)
+            .expect("get_messages");
+        assert!(
+            msgs.iter().all(|m| m.role != "assistant"),
+            "finish-only turn should not persist an empty assistant message: {msgs:#?}"
+        );
+    }
+
+    #[tokio::test]
     async fn e2e_stream_accumulates_text_and_extracts_single_reasoning_part() {
         init_tracing();
         // The model streams a text buffer that contains a
@@ -1608,7 +1882,13 @@ mod tests {
         let chunks = text_delta_chunks(&full, 6);
         let (runner, _tmp, session_id) = run_with_scripted(
             "scripted",
-            vec![chunks, vec![LlmEvent::Finish { reason: FinishReason::Stop, usage: None }]],
+            vec![
+                chunks,
+                vec![LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                    usage: None,
+                }],
+            ],
             "/tmp",
         )
         .await;
@@ -1697,18 +1977,26 @@ mod tests {
         let mid = full.len() / 2;
         let (a, b) = full.split_at(mid);
         let events = vec![
-            LlmEvent::TextStart { id: "t".to_string() },
+            LlmEvent::TextStart {
+                id: "t".to_string(),
+            },
             LlmEvent::TextDelta {
                 id: "t".to_string(),
                 text: a.to_string(),
             },
-            LlmEvent::TextEnd { id: "t".to_string() },
-            LlmEvent::TextStart { id: "t".to_string() },
+            LlmEvent::TextEnd {
+                id: "t".to_string(),
+            },
+            LlmEvent::TextStart {
+                id: "t".to_string(),
+            },
             LlmEvent::TextDelta {
                 id: "t".to_string(),
                 text: b.to_string(),
             },
-            LlmEvent::TextEnd { id: "t".to_string() },
+            LlmEvent::TextEnd {
+                id: "t".to_string(),
+            },
             LlmEvent::Finish {
                 reason: FinishReason::Stop,
                 usage: None,
@@ -1716,7 +2004,13 @@ mod tests {
         ];
         let (runner, _tmp, session_id) = run_with_scripted(
             "scripted",
-            vec![events, vec![LlmEvent::Finish { reason: FinishReason::Stop, usage: None }]],
+            vec![
+                events,
+                vec![LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                    usage: None,
+                }],
+            ],
             "/tmp",
         )
         .await;
@@ -1842,12 +2136,8 @@ mod tests {
         };
         let scripts = run_with_structured_tool_call(&session_root_str, tool_call);
 
-        let (runner, _tmp, session_id) = run_with_scripted(
-            "scripted",
-            scripts,
-            &session_root_str,
-        )
-        .await;
+        let (runner, _tmp, session_id) =
+            run_with_scripted("scripted", scripts, &session_root_str).await;
 
         // (3)+(4) End-to-end: the runner loads the session, builds
         //         the ToolContext from session.directory, and
@@ -1872,7 +2162,9 @@ mod tests {
                     && m.content != "[]"
                     && serde_json::from_str::<Vec<ContentPart>>(&m.content)
                         .map(|parts| {
-                            parts.iter().any(|p| matches!(p, ContentPart::ToolCall { .. }))
+                            parts
+                                .iter()
+                                .any(|p| matches!(p, ContentPart::ToolCall { .. }))
                         })
                         .unwrap_or(false)
             })
@@ -1936,9 +2228,9 @@ mod tests {
         // 4. The Reasoning part from the structured `ReasoningDelta`
         //    should be persisted.
         assert!(
-            parts
-                .iter()
-                .any(|p| matches!(p, ContentPart::Reasoning { text } if text.contains("Let me find"))),
+            parts.iter().any(
+                |p| matches!(p, ContentPart::Reasoning { text } if text.contains("Let me find"))
+            ),
             "structured ReasoningDelta should produce a Reasoning part, got: {parts:#?}"
         );
     }
@@ -1964,7 +2256,10 @@ mod tests {
             "scripted",
             vec![
                 chunks,
-                vec![LlmEvent::Finish { reason: FinishReason::Stop, usage: None }],
+                vec![LlmEvent::Finish {
+                    reason: FinishReason::Stop,
+                    usage: None,
+                }],
             ],
             &session_root_str,
         )
@@ -1986,11 +2281,15 @@ mod tests {
         let parts: Vec<ContentPart> = serde_json::from_str(&assistant.content).expect("parts");
 
         assert!(
-            !parts.iter().any(|p| matches!(p, ContentPart::ToolCall { .. })),
+            !parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ToolCall { .. })),
             "xml-style tool call in text must NOT be parsed as a ToolCall, got: {parts:#?}"
         );
         assert!(
-            !parts.iter().any(|p| matches!(p, ContentPart::ToolResult { .. })),
+            !parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ToolResult { .. })),
             "no tool result should be produced when no tool was called, got: {parts:#?}"
         );
         // The XML is preserved as visible text.

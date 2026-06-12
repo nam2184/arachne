@@ -152,17 +152,54 @@ impl ConversationService {
     }
 
     pub fn compact_conversation(&self, session_id: &str, summary: String) -> Result<(), String> {
+        self.compact_conversation_with_recent(session_id, &summary, "")
+    }
+
+    /// Replace the persisted AI conversation with a summary and a
+    /// "recent" tail (preserved verbatim). The recent tail is the
+    /// structured equivalent of opencode's `tail_start_id` /
+    /// `recent` selection. The UI conversation file is left intact
+    /// (existing transcript messages preserved) and gets a new
+    /// system-role entry appended that records the compaction
+    /// summary so the chat panel can render the checkpoint.
+    /// Tauri callers that drive compaction from the UI can leave
+    /// `recent` empty to wipe the AI context.
+    pub fn compact_conversation_with_recent(
+        &self,
+        session_id: &str,
+        summary: &str,
+        recent: &str,
+    ) -> Result<(), String> {
         let session_lock = self.get_lock(session_id);
         let _session_guard = session_lock.lock();
         let lock_path = self.lock_file_path(session_id);
         let _file_guard = self.acquire_lock(&lock_path)?;
 
         let mut ai_conv = self.read_ai_conversation(session_id)?;
-        let mut ui_conv = self.read_ui_conversation(session_id)?;
-
-        ai_conv.summary = Some(summary.clone());
+        ai_conv.summary = Some(summary.to_string());
         ai_conv.messages.clear();
-        ui_conv.summary = Some(summary);
+
+        if !recent.trim().is_empty() {
+            let recent_message = ConversationMessage {
+                id: format!("recent-{}", uuid::Uuid::new_v4()),
+                role: "system".to_string(),
+                content: format!("<recent-context>\n{recent}\n</recent-context>"),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            };
+            ai_conv.messages.push(recent_message);
+        }
+
+        // Append a checkpoint entry to the UI conversation so the
+        // chat panel can render the new summary. Existing messages
+        // are preserved so the user still sees the full transcript.
+        let mut ui_conv = self.read_ui_conversation(session_id)?;
+        let checkpoint = ConversationMessage {
+            id: format!("compaction-{}", uuid::Uuid::new_v4()),
+            role: "system".to_string(),
+            content: format!("<conversation-checkpoint>\n{summary}\n</conversation-checkpoint>"),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        ui_conv.messages.push(checkpoint);
 
         self.write_ai_conversation(session_id, &ai_conv)?;
         self.write_ui_conversation(session_id, &ui_conv)

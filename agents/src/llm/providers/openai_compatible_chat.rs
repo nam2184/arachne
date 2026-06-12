@@ -4,9 +4,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
-use super::{LlmError, LlmProvider, LlmStream, ToolResultInject};
+use super::{log_sse_event_body, LlmError, LlmProvider, LlmStream};
 use crate::llm::events::{FinishReason, LlmEvent, ToolDefinition};
 use crate::llm::request::{ContentPart, LlmRequest};
 
@@ -109,53 +109,26 @@ impl LlmProvider for OpenAiCompatibleChatProvider {
         let body = build_request_body(&request, lower_messages);
 
         tracing::debug!(
-            "llm request: provider={} url={} model={} key={:?} tool_count={}",
+            "llm request: provider={} url={} model={} has_api_key={} tool_count={}",
             self.provider_name,
             self.chat_completions_url(),
             request.model,
-            api_key,
+            !api_key.is_empty(),
             request.tools.len(),
         );
 
         let (abort_tx, mut abort_rx) = oneshot::channel();
         let abort_tx = Arc::new(abort_tx);
-        let (tool_result_tx, tool_result_rx) = mpsc::channel::<ToolResultInject>(32);
-
         let auth_header = format!("Bearer {api_key}");
-        tracing::debug!(
-            "llm request header: provider={} url={} model={} Authorization={:?}",
-            self.provider_name,
-            self.chat_completions_url(),
-            request.model,
-            auth_header,
-        );
-
-        // Log the full request body as pretty-printed JSON so
-        // debug runs can see exactly what the provider is
-        // getting. Truncated to 32 KiB so a long message history
-        // doesn't blow up the log line; the truncation is
-        // surfaced in the log so it's not silent.
-        let body_str = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "<unserializable>".to_string());
-        let body_truncated = body_str.len() > 32 * 1024;
-        let body_display: String = if body_truncated {
-            body_str.chars().take(32 * 1024).collect()
-        } else {
-            body_str.clone()
-        };
+        let body_bytes = serde_json::to_vec(&body)
+            .map(|body| body.len())
+            .unwrap_or(0);
         tracing::info!(
-            "llm request body: provider={} url={} model={} body_bytes={} body_truncated={}",
+            "llm request body prepared: provider={} url={} model={} body_bytes={}",
             self.provider_name,
             self.chat_completions_url(),
             request.model,
-            body_str.len(),
-            body_truncated,
-        );
-        tracing::info!(
-            "llm request body json: provider={} url={} model={} body=\n{}",
-            self.provider_name,
-            self.chat_completions_url(),
-            request.model,
-            body_display,
+            body_bytes,
         );
 
         let response = self
@@ -171,6 +144,14 @@ impl LlmProvider for OpenAiCompatibleChatProvider {
                     .provider(&self.provider_name)
                     .model(&request.model)
             })?;
+
+        tracing::info!(
+            "llm response received: provider={} url={} model={} status={}",
+            self.provider_name,
+            self.chat_completions_url(),
+            request.model,
+            response.status().as_u16(),
+        );
 
         if !response.status().is_success() {
             let status = response.status();
@@ -188,9 +169,10 @@ impl LlmProvider for OpenAiCompatibleChatProvider {
                 .model(&request.model));
         }
 
+        let stream_provider = self.provider_name.clone();
+        let stream_model = request.model.clone();
         let stream = async_stream::stream! {
             let mut event_stream = response.bytes_stream();
-            let mut tool_result_rx = tool_result_rx;
 
             // Per-turn parser state. Tool-call arguments stream
             // across many `data: ...` chunks (one JSON fragment per
@@ -207,93 +189,74 @@ impl LlmProvider for OpenAiCompatibleChatProvider {
             // after the per-chunk branch already emitted one.
             let mut finished = false;
 
-            // The HTTP stream is the single source of truth for the LLM's
-            // turn. End the stream as soon as the HTTP response is done.
-            // Holding the stream open after the LLM has finished (waiting
-            // for `tool_result_rx.recv()` to return) deadlocks the runner,
-            // because the runner needs the stream to end in order to
-            // persist the assistant message.
-            loop {
-                tokio::select! {
-                    biased;
+            // The HTTP stream is the single source of truth for this
+            // provider turn. Tool results are produced by the runner
+            // after the stream ends and are included in the next request
+            // via persisted conversation history.
+            while let Some(chunk) = event_stream.next().await {
+                if matches!(abort_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)) {
+                    break;
+                }
 
-                    chunk = event_stream.next() => {
-                        let Some(chunk) = chunk else { break };
-                        if matches!(abort_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)) {
-                            break;
-                        }
+                let Ok(bytes) = chunk else { continue };
+                let text = String::from_utf8_lossy(&bytes);
 
-                        let Ok(bytes) = chunk else { continue };
-                        let text = String::from_utf8_lossy(&bytes);
+                let mut saw_done = false;
+                let mut finish_reason_seen: Option<FinishReason> = None;
+                let mut usage_seen: Option<crate::llm::events::Usage> = None;
 
-                        let mut saw_done = false;
-                        let mut finish_reason_seen: Option<FinishReason> = None;
-                        let mut usage_seen: Option<crate::llm::events::Usage> = None;
-
-                        for line in text.lines() {
-                            let line = line.trim();
-                            if line.is_empty() {
-                                continue;
-                            }
-
-                            if line == "data: [DONE]" || line == "[DONE]" {
-                                saw_done = true;
-                                break;
-                            }
-
-                            if let Some(data) = line.strip_prefix("data: ") {
-                                let data = data.trim();
-                                if data.is_empty() || data == "[DONE]" {
-                                    continue;
-                                }
-
-                                // Parse the chunk into (events, finish-metadata).
-                                // The parser no longer emits `Finish` events
-                                // itself — it returns the finish reason +
-                                // usage as out-of-band metadata so the
-                                // stream loop is the single source of
-                                // truth for the terminal `Finish` event.
-                                let parsed = parse_openai_chunk_into_events(data, &mut tool_state);
-                                if let Some(reason) = parsed.finish_reason {
-                                    finish_reason_seen = Some(reason);
-                                }
-                                if parsed.usage.is_some() {
-                                    usage_seen = parsed.usage;
-                                }
-                                for event in parsed.events {
-                                    yield event;
-                                }
-                            }
-                        }
-
-                        if saw_done || finish_reason_seen.is_some() {
-                            // Flush any tool calls the model streamed
-                            // but didn't terminate. OpenAI's wire
-                            // format only completes a tool call when
-                            // the arguments JSON closes; we detect
-                            // "closed" by the chunk's
-                            // `delta.tool_calls[*].function.arguments`
-                            // not being present OR by a terminal
-                            // finish reason.
-                            for event in tool_state.flush_all() {
-                                yield event;
-                            }
-                            let reason = finish_reason_seen.unwrap_or(FinishReason::Stop);
-                            yield LlmEvent::Finish { reason, usage: usage_seen };
-                            finished = true;
-                            break;
-                        }
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
                     }
 
-                    inject = tool_result_rx.recv() => {
-                        let Some(inject) = inject else { break };
-                        yield LlmEvent::ToolResult {
-                            id: inject.id,
-                            name: inject.name,
-                            result: crate::llm::events::ToolResultValue::Json { value: inject.result },
-                            output: None,
-                        };
+                    if line == "data: [DONE]" || line == "[DONE]" {
+                        log_sse_event_body(&stream_provider, &stream_model, line);
+                        saw_done = true;
+                        break;
                     }
+
+                    if let Some(data) = line.strip_prefix("data: ") {
+                        let data = data.trim();
+                        if data.is_empty() || data == "[DONE]" {
+                            continue;
+                        }
+                        log_sse_event_body(&stream_provider, &stream_model, data);
+
+                        // Parse the chunk into (events, finish-metadata).
+                        // The parser no longer emits `Finish` events
+                        // itself — it returns the finish reason +
+                        // usage as out-of-band metadata so the
+                        // stream loop is the single source of truth
+                        // for the terminal `Finish` event.
+                        let parsed = parse_openai_chunk_into_events(data, &mut tool_state);
+                        if let Some(reason) = parsed.finish_reason {
+                            finish_reason_seen = Some(reason);
+                        }
+                        if parsed.usage.is_some() {
+                            usage_seen = parsed.usage;
+                        }
+                        for event in parsed.events {
+                            yield event;
+                        }
+                    }
+                }
+
+                if saw_done || finish_reason_seen.is_some() {
+                    // Flush any tool calls the model streamed but
+                    // didn't terminate. OpenAI's wire format only
+                    // completes a tool call when the arguments JSON
+                    // closes; we detect "closed" by the chunk's
+                    // `delta.tool_calls[*].function.arguments` not
+                    // being present OR by a terminal finish reason.
+                    for event in tool_state.flush_all() {
+                        yield event;
+                    }
+                    let reason = finish_reason_seen.unwrap_or(FinishReason::Stop);
+                    yield LlmEvent::Finish { reason, usage: usage_seen };
+                    finished = true;
+                    break;
                 }
             }
 
@@ -313,13 +276,10 @@ impl LlmProvider for OpenAiCompatibleChatProvider {
                     usage: None,
                 };
             }
-
-            drop(tool_result_rx);
         };
 
         Ok(LlmStream {
             events: Box::pin(stream),
-            tool_result_tx,
             abort_tx: Some(abort_tx),
         })
     }
@@ -328,15 +288,25 @@ impl LlmProvider for OpenAiCompatibleChatProvider {
 /// State for accumulating tool-call argument deltas across SSE chunks.
 #[derive(Default)]
 struct OpenAiToolStreamState {
-    /// Active tool calls, keyed by the provider-assigned id. The
+    /// Active tool calls, keyed by the provider-assigned id (or a
+    /// synthesized `__index:N` key when the provider omits ids). The
     /// first chunk for an id has `function.name` set; subsequent
     /// chunks append to `arguments`. The `started` flag distinguishes
     /// "we already emitted ToolInputStart for this id" so we don't
     /// emit duplicates when the model re-sends the name.
     calls: HashMap<String, InFlightToolCall>,
+    /// Aliases from `tool_calls[*].index` to the resolved key.
+    /// We populate this whenever a delta includes both an `id` and
+    /// an `index` so subsequent index-only deltas correlate to the
+    /// same call.
+    index_aliases: HashMap<u64, String>,
+    /// Monotonic counter for synthetic keys when neither `id` nor
+    /// `index` is present. The OpenAI streaming spec requires at
+    /// least one of the two, so this is just a defensive fallback.
+    anon_seq: u64,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default, Debug)]
 struct InFlightToolCall {
     name: String,
     arguments: String,
@@ -352,14 +322,17 @@ impl OpenAiToolStreamState {
         };
 
         for call in tool_calls {
-            let Some(id) = call.get("id").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            // No `id` but an `index`? OpenAI's Responses API uses
-            // index-only; fall back to `index`. We still key by
-            // index-as-string so subsequent chunks match.
-            let key = id.to_string();
-            let entry = self.calls.entry(key.clone()).or_default();
+            // Resolve a stable key for this tool call. The OpenAI
+            // Chat Completions streaming protocol puts the
+            // provider-assigned `id` on the first delta and then
+            // sends the rest without it. Some providers (notably
+            // minimax and the OpenAI Responses API) only send
+            // `index` on every delta. To support both shapes we
+            // prefer `id` when present, otherwise fall back to
+            // `index`. We also remember the resolved key against
+            // the index so subsequent deltas that finally do send
+            // an `id` still correlate to the same call.
+            let key = self.resolve_call_key(call);
 
             if let Some(name) = call
                 .get("function")
@@ -367,46 +340,94 @@ impl OpenAiToolStreamState {
                 .and_then(|n| n.as_str())
             {
                 if !name.is_empty() {
-                    entry.name = name.to_string();
+                    // Bind the name to the index/alias so deltas
+                    // that omit the name still resolve to the
+                    // correct call.
+                    self.bind_name_for_key(&key, name);
                 }
             }
-            if let Some(args) = call
+            // Always append the `arguments` fragment. This is the
+            // critical fix: the model streams the JSON as a
+            // sequence of partial strings and we must concatenate
+            // them all per tool-call `index` before parsing.
+            let args_fragment = call
                 .get("function")
                 .and_then(|f| f.get("arguments"))
                 .and_then(|a| a.as_str())
-            {
-                entry.arguments.push_str(args);
-            }
-            if let Some(args_idx) = call.get("index").and_then(|i| i.as_u64()) {
-                // Some providers only send `index` (no `id`); use it
-                // as a secondary key so we still correlate.
-                let _ = args_idx;
+                .map(|s| s.to_string());
+            if let Some(fragment) = args_fragment.as_ref() {
+                if !fragment.is_empty() {
+                    self.append_arguments(&key, fragment);
+                }
             }
 
-            if !entry.closed {
-                if !entry.started && !entry.name.is_empty() {
-                    entry.started = true;
-                    events.push(LlmEvent::ToolInputStart {
-                        id: key.clone(),
-                        name: entry.name.clone(),
-                    });
-                }
-                if let Some(args) = call
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                {
-                    if !args.is_empty() {
-                        events.push(LlmEvent::ToolInputDelta {
+            // Emit the lifecycle events: ToolInputStart when the
+            // name first arrives, ToolInputDelta for each argument
+            // fragment.
+            let entry = self.calls.get(&key).cloned();
+            if let Some(entry) = entry {
+                if !entry.closed {
+                    if !entry.started && !entry.name.is_empty() {
+                        if let Some(slot) = self.calls.get_mut(&key) {
+                            slot.started = true;
+                        }
+                        events.push(LlmEvent::ToolInputStart {
                             id: key.clone(),
                             name: entry.name.clone(),
-                            text: args.to_string(),
                         });
+                    }
+                    if let Some(fragment) = args_fragment {
+                        if !fragment.is_empty() {
+                            events.push(LlmEvent::ToolInputDelta {
+                                id: key.clone(),
+                                name: entry.name.clone(),
+                                text: fragment,
+                            });
+                        }
                     }
                 }
             }
         }
         events
+    }
+
+    /// Resolve a stable key for a single `tool_calls[*]` entry. We
+    /// prefer `id` (the provider-assigned identifier) and fall
+    /// back to `index` (the integer position in the array). We
+    /// also alias the index → id mapping so later deltas that
+    /// finally include the id still correlate to the same call.
+    fn resolve_call_key(&mut self, call: &Value) -> String {
+        if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
+            if !id.is_empty() {
+                if let Some(index) = call.get("index").and_then(|i| i.as_u64()) {
+                    self.index_aliases.insert(index, id.to_string());
+                }
+                return id.to_string();
+            }
+        }
+        if let Some(index) = call.get("index").and_then(|i| i.as_u64()) {
+            if let Some(existing) = self.index_aliases.get(&index) {
+                return existing.clone();
+            }
+            return format!("__index:{index}");
+        }
+        // Last resort: synthesize a key from the call index in
+        // the array. Acceptable for one-off deltas but the same
+        // call can land under different synthetic keys if the
+        // provider alternates between index and no-index.
+        let fallback = format!("__anon:{}", self.anon_seq);
+        self.anon_seq += 1;
+        fallback
+    }
+
+    fn bind_name_for_key(&mut self, key: &str, name: &str) {
+        let entry = self.calls.entry(key.to_string()).or_default();
+        entry.name = name.to_string();
+    }
+
+    fn append_arguments(&mut self, key: &str, fragment: &str) {
+        let entry = self.calls.entry(key.to_string()).or_default();
+        entry.arguments.push_str(fragment);
     }
 
     /// Mark a tool call as complete and emit `ToolInputEnd` + `ToolCall`.
@@ -448,7 +469,13 @@ impl OpenAiToolStreamState {
         let ids: Vec<String> = self
             .calls
             .iter()
-            .filter_map(|(id, entry)| if !entry.closed { Some(id.clone()) } else { None })
+            .filter_map(|(id, entry)| {
+                if !entry.closed {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         let mut out = Vec::new();
         for id in ids {
@@ -710,6 +737,25 @@ mod body_tests {
             )))
     }
 
+    /// Build a minimal SSE chunk that carries only an `index=0`
+    /// `tool_calls[*].function.arguments` fragment (the shape used
+    /// by minimax after the first delta). The fragment is the string
+    /// value returned by the provider after JSON-decoding the SSE
+    /// chunk, so callers pass raw pieces like `"\"command\":"`.
+    fn build_index_only_chunk(arguments_fragment: &str) -> String {
+        serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": { "arguments": arguments_fragment }
+                    }]
+                }
+            }]
+        })
+        .to_string()
+    }
+
     #[test]
     fn build_request_body_includes_tools_field() {
         // After the opencode-style refactor, tools ARE sent on the
@@ -726,8 +772,7 @@ mod body_tests {
 
     #[test]
     fn build_request_body_omits_tools_field_when_empty() {
-        let req = LlmRequest::new("gpt-4o-mini", "openai")
-            .with_message(LlmMessage::user("hi"));
+        let req = LlmRequest::new("gpt-4o-mini", "openai").with_message(LlmMessage::user("hi"));
         let body = build_request_body(&req, |_| vec![]);
         assert!(
             body.get("tools").is_none(),
@@ -798,7 +843,9 @@ mod body_tests {
         let e2 = parse_openai_chunk_into_events(&chunk2.to_string(), &mut state);
 
         // First chunk: Start, Delta.
-        assert!(matches!(e1.events[0], LlmEvent::ToolInputStart { ref name, .. } if name == "read"));
+        assert!(
+            matches!(e1.events[0], LlmEvent::ToolInputStart { ref name, .. } if name == "read")
+        );
         assert!(matches!(e1.events[1], LlmEvent::ToolInputDelta { .. }));
         assert_eq!(e1.events.len(), 2, "chunk1 events: {e1:?}");
         assert!(e1.finish_reason.is_none());
@@ -810,12 +857,48 @@ mod body_tests {
 
         // Flush.
         let final_events = state.flush_all();
-        assert!(matches!(final_events[0], LlmEvent::ToolInputEnd { ref name, .. } if name == "read"));
+        assert!(
+            matches!(final_events[0], LlmEvent::ToolInputEnd { ref name, .. } if name == "read")
+        );
         let LlmEvent::ToolCall { name, input, .. } = &final_events[1] else {
             panic!("expected ToolCall, got: {final_events:?}");
         };
         assert_eq!(name, "read");
         assert_eq!(input["path"], "src/lib.rs");
+    }
+
+    /// Regression: the live provider (minimax) streams the `arguments`
+    /// JSON as a long sequence of partial deltas. The first delta
+    /// carries the provider-assigned `id`; every subsequent delta
+    /// carries only `index` and a fragment. We must correlate by
+    /// `index` after the first delta and concatenate every
+    /// fragment for the same `index` before parsing.
+    #[test]
+    fn tool_stream_correlates_by_index_when_id_drops() {
+        let mut state = OpenAiToolStreamState::default();
+        let chunks = vec![
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_abc","index":0,"function":{"name":"shell","arguments":"{\"command\":\""}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"echo "}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"hello \\\\"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":" world\"}"}}]}}]}"#,
+        ];
+        for chunk in &chunks {
+            parse_openai_chunk_into_events(chunk, &mut state);
+        }
+        let final_events = state.flush_all();
+        let tool_call = final_events
+            .iter()
+            .find_map(|e| match e {
+                LlmEvent::ToolCall { name, input, .. } => Some((name.clone(), input.clone())),
+                _ => None,
+            })
+            .expect("expected ToolCall event");
+        let (name, input) = tool_call;
+        assert_eq!(name, "shell");
+        assert_eq!(
+            input["command"], "echo hello \\ world",
+            "args did not concatenate in order; got: {input}"
+        );
     }
 
     #[test]
@@ -884,7 +967,10 @@ mod body_tests {
         );
         // No `Finish` event from the parser itself.
         assert!(
-            !parsed.events.iter().any(|e| matches!(e, LlmEvent::Finish { .. })),
+            !parsed
+                .events
+                .iter()
+                .any(|e| matches!(e, LlmEvent::Finish { .. })),
             "parser must not emit Finish events, got: {parsed:?}"
         );
     }
@@ -908,7 +994,134 @@ mod body_tests {
         let LlmEvent::ToolCall { input, .. } = &fin[1] else {
             panic!("expected ToolCall, got: {fin:?}");
         };
-        assert!(input.is_null(), "expected Null on parse failure, got: {input}");
+        assert!(
+            input.is_null(),
+            "expected Null on parse failure, got: {input}"
+        );
+    }
+
+    /// Regression: the exact `shell` tool call shape from the
+    /// production log. The `arguments` JSON is streamed as ~25
+    /// tiny fragments; the first fragment carries the provider id
+    /// and the rest carry only `index=0`. The final assembled
+    /// `arguments` must parse cleanly and the parsed `command`
+    /// must match the original string byte-for-byte.
+    #[test]
+    fn tool_stream_shell_command_with_long_path_extracts_correctly() {
+        let mut state = OpenAiToolStreamState::default();
+        let first = concat!(
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_abc","index":0,"type":"function","#,
+            r#""function":{"name":"shell","arguments":"{"}}]}}]}"#
+        );
+        // Subsequent deltas: only `index` plus a fragment.
+        // Each fragment is a *raw JSON string literal fragment* —
+        // the same bytes that would appear inside the surrounding
+        // quotes on the wire. The full target JSON is:
+        //   {"command":"cd C:\\Users\\mrowe\\AppData\\...\\Cabinet-Factory && ls"}
+        // and after JSON parsing the value of `command` is the
+        // single-backslash string.
+        let fragments = [
+            "\"command\":",
+            "\"cd C:\\\\Users\\\\mrowe\\\\AppData\\\\Roaming\\\\PYTHA\\\\.configurator-Configurator-Dev\\\\plugins\\\\Cabinet-Factory && ls\"",
+            "}",
+        ];
+        let mut chunks = vec![first.to_string()];
+        for fragment in fragments {
+            let chunk = build_index_only_chunk(fragment);
+            chunks.push(chunk);
+        }
+        for chunk in &chunks {
+            parse_openai_chunk_into_events(chunk, &mut state);
+        }
+        let final_events = state.flush_all();
+        let tool_call = final_events
+            .iter()
+            .find_map(|e| match e {
+                LlmEvent::ToolCall { name, input, .. } => Some((name.clone(), input.clone())),
+                _ => None,
+            })
+            .expect("expected ToolCall event");
+        let (name, input) = tool_call;
+        assert_eq!(name, "shell");
+        let command = input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .expect("command should be a string");
+        // The expected parsed string: each `\\` in the JSON literal
+        // collapses to a single `\` in the actual string.
+        let expected = "cd C:\\Users\\mrowe\\AppData\\Roaming\\PYTHA\\.configurator-Configurator-Dev\\plugins\\Cabinet-Factory && ls";
+        assert_eq!(
+            command, expected,
+            "command mismatch; got: {command:?}, full input: {input}"
+        );
+    }
+
+    /// Regression: the `glob` tool call from a real session.
+    /// Verifies the `pattern` field is recovered intact.
+    #[test]
+    fn tool_stream_glob_pattern_extracts_correctly() {
+        let mut state = OpenAiToolStreamState::default();
+        let first = concat!(
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_glob","index":0,"type":"function","#,
+            r#""function":{"name":"glob","arguments":"{"}}]}}]}"#
+        );
+        let fragments = ["\"pattern\":\"src/**/*.ts\"", "}"];
+        let mut chunks = vec![first.to_string()];
+        for fragment in fragments {
+            let chunk = build_index_only_chunk(fragment);
+            chunks.push(chunk);
+        }
+        for chunk in &chunks {
+            parse_openai_chunk_into_events(chunk, &mut state);
+        }
+        let final_events = state.flush_all();
+        let tool_call = final_events
+            .iter()
+            .find_map(|e| match e {
+                LlmEvent::ToolCall { name, input, .. } => Some((name.clone(), input.clone())),
+                _ => None,
+            })
+            .expect("expected ToolCall event");
+        let (name, input) = tool_call;
+        assert_eq!(name, "glob");
+        let pattern = input
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .expect("pattern should be a string");
+        assert_eq!(pattern, "src/**/*.ts");
+    }
+
+    /// Regression: the production log showed a chunk that carries
+    /// `finish_reason: "tool_calls"` together with a `<think>`
+    /// `delta.content`. The parser must surface the finish reason
+    /// (so the stream loop can stop accepting more deltas) and
+    /// the text event (so the runner can render the reasoning).
+    #[test]
+    fn tool_stream_finish_reason_alongside_text_delta() {
+        let mut state = OpenAiToolStreamState::default();
+        let chunk = r#"{"choices":[{"finish_reason":"tool_calls","index":0,"delta":{"content":"\n</think>\n","role":"assistant"}}]}"#;
+        let parsed = parse_openai_chunk_into_events(chunk, &mut state);
+        // Finish reason must be surfaced as out-of-band metadata.
+        assert!(
+            matches!(parsed.finish_reason, Some(FinishReason::ToolCalls)),
+            "expected finish_reason=ToolCalls, got: {:?}",
+            parsed.finish_reason
+        );
+        // The `<think>` text must be emitted as a TextDelta so
+        // the runner can route it to the think-block.
+        let text_deltas: Vec<&str> = parsed
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                LlmEvent::TextDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text_deltas,
+            vec!["\n</think>\n"],
+            "expected single TextDelta for the think close, got: {parsed:?}"
+        );
     }
 }
 

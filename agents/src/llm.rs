@@ -10,7 +10,6 @@ pub use events::{
 };
 pub use providers::{
     AnthropicProvider, LlmProvider, LlmStream, MiniMaxTokenPlanProvider, OpenAiProvider,
-    ToolResultInject,
 };
 pub use request::{ContentPart, LlmError, LlmMessage, LlmRequest, LlmResponse, ToolCallEntry};
 pub use session::{

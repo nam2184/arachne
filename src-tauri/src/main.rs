@@ -6,7 +6,8 @@ mod error;
 mod services;
 
 use arachne_agents::{
-    create_conversation_service, ConversationService, ProviderService, SessionService,
+    create_conversation_service, llm::SubagentRegistry, ConversationService, ProviderService,
+    SessionService,
 };
 use services::agent_service::AgentService;
 use services::memory_service::MemoryService;
@@ -14,7 +15,6 @@ use services::permission_map::PermissionMap;
 use services::project_service::ProjectService;
 use services::settings_service::SettingsService;
 use services::stack_detector::StackDetector;
-use services::watcher_service::WatcherService;
 
 pub struct AppState {
     pub project_service: Arc<ProjectService>,
@@ -24,7 +24,6 @@ pub struct AppState {
     pub settings_service: Arc<SettingsService>,
     pub memory_service: Arc<MemoryService>,
     pub stack_detector: Arc<StackDetector>,
-    pub watcher_service: Arc<WatcherService>,
     pub permission_map: Arc<PermissionMap>,
 }
 
@@ -56,7 +55,6 @@ pub fn run() {
 
     let stack_detector = StackDetector::new();
     let memory_service = MemoryService::new();
-    let watcher_service = WatcherService::new();
 
     let app_dirs = directories::ProjectDirs::from("ai", "arachne", "arachne");
     let app_data_dir = app_dirs
@@ -93,14 +91,16 @@ pub fn run() {
         tracing::warn!("Failed to load settings: {}", e);
     }
 
+    let permission_map = Arc::new(PermissionMap::new());
+    let subagent_registry = SubagentRegistry::new(db_path.clone());
+
     let agent_service = AgentService::new(
         Arc::clone(&session_service),
         Arc::clone(&conversation_service),
         Arc::clone(&provider_service),
-        db_path.clone(),
+        Arc::clone(&subagent_registry),
+        Arc::clone(&permission_map),
     );
-
-    let permission_map = Arc::new(PermissionMap::new());
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -114,7 +114,6 @@ pub fn run() {
             settings_service: Arc::clone(&settings_service),
             memory_service: Arc::clone(&memory_service),
             stack_detector: Arc::clone(&stack_detector),
-            watcher_service: Arc::clone(&watcher_service),
             permission_map: Arc::clone(&permission_map),
         })
         .manage(permission_map)
@@ -164,6 +163,7 @@ pub fn run() {
             commands::provider_commands::set_active_provider,
             commands::permission_commands::permission_list_pending,
             commands::permission_commands::permission_reply,
+            commands::compaction_commands::compact_now,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

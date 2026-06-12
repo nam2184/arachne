@@ -8,14 +8,12 @@ tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
 arachne-agents = { path = "../agents" }
-tauri = { version = "2.0", features = ["devtools"] }
+tauri = { version = "2.0", features = [] }
 tauri-plugin-dialog = "2.0"
 tauri-plugin-fs = "2.0"
 tauri-plugin-shell = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-notify = "8.2.0"
 walkdir = "2.4"
 thiserror = "2.0.18"
 chrono = { version = "0.4", features = ["serde"] }
@@ -30,3 +28,4 @@ default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
 dev-logs = []
 prod-logs = []
+devtools = ["tauri/devtools"]

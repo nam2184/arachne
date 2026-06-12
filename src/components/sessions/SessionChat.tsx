@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Check, FolderSearch, GripHorizontal, Search, Terminal, Wrench, X } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, FolderSearch, GripHorizontal, Search, Terminal, Wrench, X } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -25,9 +25,11 @@ interface SessionChatProps {
   session: AgentSession;
   messages: SessionChatMessage[];
   isSending: boolean;
+  isCompacting: boolean;
   streamingMessageId: string | null;
   onSendMessage: (content: string, mode: ChatMode) => void | Promise<void>;
   onUpdateSessionProvider: (sessionId: string, provider: string, model: string) => Promise<void>;
+  onCompact: () => void | Promise<void>;
   onClose: () => void;
 }
 
@@ -35,13 +37,43 @@ const CHAT_WIDTH = 700;
 const CHAT_HEIGHT = 600;
 const EDGE_PADDING = 16;
 
+function ContextCheckpoint({ content }: { content: string }) {
+  const [open, setOpen] = useState(false);
+  const match = content.match(/<conversation-checkpoint>([\s\S]*?)<\/conversation-checkpoint>/);
+  const summary = match ? match[1].trim() : content;
+  return (
+    <div className="flex justify-center" data-testid="context-checkpoint">
+      <div className="w-full max-w-[80%] rounded-none border border-dashed border-[#3a3a3a] bg-[#0d0d0d] px-4 py-2 text-xs text-[#a0a0a0]">
+        <button
+          type="button"
+          onClick={() => setOpen((value) => !value)}
+          className="flex w-full items-center justify-between gap-2 text-left"
+        >
+          <span className="flex items-center gap-2 text-[#f5f5f5]">
+            {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+            Context compacted
+          </span>
+          <span className="text-[10px] uppercase tracking-wide text-[#737373]">summary</span>
+        </button>
+        {open && (
+          <pre className="mt-2 max-h-64 overflow-y-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-[#cfcfcf]">
+            {summary}
+          </pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function SessionChat({
   session,
   messages,
   isSending,
+  isCompacting,
   streamingMessageId,
   onSendMessage,
   onUpdateSessionProvider,
+  onCompact,
   onClose,
 }: SessionChatProps) {
   const [input, setInput] = useState("");
@@ -198,6 +230,16 @@ export function SessionChat({
             </div>
           </div>
           <Button
+            variant="outline"
+            size="sm"
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={onCompact}
+            disabled={isCompacting || isSending}
+            title="Summarize the conversation so the next prompt fits the model context"
+          >
+            {isCompacting ? "Compacting…" : "Compact"}
+          </Button>
+          <Button
             variant="ghost"
             size="icon"
             onPointerDown={(event) => event.stopPropagation()}
@@ -322,6 +364,12 @@ export function SessionChat({
                 const reasoning = message.reasoning ?? "";
                 const content = message.content ?? "";
                 const parts = message.parts ?? [];
+
+                if (message.role === "system" && content.includes("<conversation-checkpoint>")) {
+                  return (
+                    <ContextCheckpoint key={message.id ?? `${message.timestamp}-${index}`} content={content} />
+                  );
+                }
 
                 return (
                   <div

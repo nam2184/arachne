@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ignore::WalkBuilder;
 use parking_lot::RwLock;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, trace};
 
 use crate::domain::TechStack;
 
@@ -29,7 +29,6 @@ impl StackDetector {
 
         let mut stack = TechStack::new();
         let mut scanned_files = 0usize;
-        let mut hyperpolyglot_detections = 0usize;
         let mut fallback_detections = 0usize;
         let mut undetected_files = 0usize;
 
@@ -52,29 +51,19 @@ impl StackDetector {
             scanned_files += 1;
             let path = entry.path();
 
-            match self.detect_with_hyperpolyglot(path) {
-                Some(language) => {
-                    hyperpolyglot_detections += 1;
-                    trace!(file = %path.display(), language = %language, "hyperpolyglot detected language");
-                    stack.add_language(language);
-                }
-                None => {
-                    if let Some(language) = self.detect_with_fallback(path) {
-                        fallback_detections += 1;
-                        trace!(file = %path.display(), language = %language, "fallback detected language");
-                        stack.add_language(language);
-                    } else {
-                        undetected_files += 1;
-                        trace!(file = %path.display(), "language detection missed file");
-                    }
-                }
+            if let Some(language) = self.detect_with_fallback(path) {
+                fallback_detections += 1;
+                trace!(file = %path.display(), language = %language, "detected language");
+                stack.add_language(language);
+            } else {
+                undetected_files += 1;
+                trace!(file = %path.display(), "language detection missed file");
             }
         }
 
         info!(
             project = %cache_key,
             scanned_files,
-            hyperpolyglot_detections,
             fallback_detections,
             undetected_files,
             languages = ?stack.languages,
@@ -83,28 +72,6 @@ impl StackDetector {
 
         self.cache.write().insert(cache_key, stack.clone());
         stack
-    }
-
-    fn detect_with_hyperpolyglot(&self, path: &Path) -> Option<String> {
-        match hyperpolyglot::detect(path) {
-            Ok(Some(detection)) => {
-                debug!(
-                    file = %path.display(),
-                    language = detection.language(),
-                    strategy = detection.variant(),
-                    "hyperpolyglot detection succeeded"
-                );
-                Some(detection.language().to_string())
-            }
-            Ok(None) => {
-                debug!(file = %path.display(), "hyperpolyglot could not detect language");
-                None
-            }
-            Err(error) => {
-                warn!(file = %path.display(), error = %error, "hyperpolyglot detection failed; falling back");
-                None
-            }
-        }
     }
 
     fn detect_with_fallback(&self, path: &Path) -> Option<String> {

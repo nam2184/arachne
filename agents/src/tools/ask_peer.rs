@@ -105,23 +105,16 @@ pub async fn run_async(call: &ToolCall, runtime: ToolRuntime) -> ToolResult {
 
     // 3. Spawn the child. The child is rooted at the peer's directory and
     //    inherits the peer's provider/model.
-    let child = crate::AgentSession::child_of(
-        &caller,
+    let child_id = match runtime.session_service.create_session_with_parent(
+        caller.project_id.clone(),
         peer.directory.clone(),
         peer.provider.clone(),
         peer.model.clone(),
-    );
-    let child_id = child.id.clone();
-
-    if let Err(e) = runtime.session_service.create_session_with_parent(
-        caller.project_id.clone(),
-        child.directory.clone(),
-        child.provider.clone(),
-        child.model.clone(),
         Some(caller.id.clone()),
     ) {
-        return failure("ask_peer", format!("failed to create child session: {e}"));
-    }
+        Ok(id) => id,
+        Err(e) => return failure("ask_peer", format!("failed to create child session: {e}")),
+    };
     runtime
         .subagent_registry
         .register_child(&caller.id, &child_id);
@@ -187,7 +180,7 @@ async fn run_child_readonly(
         Ok(Some(_child)) => SessionRunner::new(
             Arc::clone(&runtime.session_service),
             Arc::clone(&runtime.conversation_service),
-            child_provider_registry(),
+            child_provider_registry(&runtime),
         )
         // The readonly tool set is enforced via the `TaskKind::AskPeer`
         // flag in the runner. (We pass a hint that says "this is a
@@ -203,15 +196,8 @@ async fn run_child_readonly(
         }
     };
 
-    let child_for_blocking = child_id.clone();
-    let join = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async move { runner.run(&child_for_blocking).await })
-    })
-    .await;
-
-    match join {
-        Ok(Ok(_result)) => {
+    match Box::pin(runner.run(&child_id)).await {
+        Ok(_result) => {
             let text =
                 last_assistant_text(&runtime.conversation_service, &child_id).unwrap_or_default();
             ChildOutcome {
@@ -220,23 +206,16 @@ async fn run_child_readonly(
                 error: None,
             }
         }
-        Ok(Err(e)) => ChildOutcome {
+        Err(e) => ChildOutcome {
             success: false,
             text: format!("peer query failed: {e}"),
             error: Some(e.to_string()),
         },
-        Err(e) => ChildOutcome {
-            success: false,
-            text: format!("peer runner panicked: {e}"),
-            error: Some(format!("join error: {e}")),
-        },
     }
 }
 
-fn child_provider_registry() -> Arc<ProviderRegistry> {
-    let reg = Arc::new(ProviderRegistry::new());
-    reg.register_defaults_sync();
-    reg
+fn child_provider_registry(runtime: &ToolRuntime) -> Arc<ProviderRegistry> {
+    Arc::clone(&runtime.providers)
 }
 
 fn last_assistant_text(

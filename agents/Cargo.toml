@@ -6,14 +6,12 @@ edition = "2021"
 [dependencies]
 async-stream = "0.3"
 async-trait = "0.1"
-bytes = "1.9"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
-hyperpolyglot = "0.1.7"
 ignore = "0.4"
 ipnet = "2.12"
 parking_lot = "0.12"
-reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rusqlite = { version = "0.40.0", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

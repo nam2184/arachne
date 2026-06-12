@@ -32,6 +32,8 @@ export function SessionWorkspace() {
     finishStreamingMessage,
     streamingMessageId,
   } = useConversationStore();
+  const compactNow = useConversationStore((state) => state.compactNow);
+  const isCompacting = useConversationStore((state) => state.isCompacting);
   const initializePermissions = usePermissionStore((state) => state.initialize);
   const [isCreating, setIsCreating] = useState(false);
   const [isChatSending, setIsChatSending] = useState(false);
@@ -199,6 +201,16 @@ export function SessionWorkspace() {
     clearConversation();
   }, [clearConversation]);
 
+  const compactChat = useCallback(async () => {
+    if (!chatSessionId || isChatSending || isCompacting) return;
+    try {
+      await compactNow(chatSessionId);
+    } catch (compactError) {
+      setError(formatError(compactError));
+      console.error("Failed to compact conversation:", compactError);
+    }
+  }, [chatSessionId, compactNow, isChatSending, isCompacting]);
+
   const chatSession = chatSessionId ? sessions.get(chatSessionId) ?? null : null;
   const chatMessages = activeConversation?.session_id === chatSessionId
     ? activeConversation.messages
@@ -235,9 +247,11 @@ export function SessionWorkspace() {
           session={chatSession}
           messages={chatMessages}
           isSending={isChatSending}
+          isCompacting={isCompacting}
           streamingMessageId={streamingMessageId}
           onSendMessage={sendChatMessage}
           onUpdateSessionProvider={updateSessionProvider}
+          onCompact={compactChat}
           onClose={closeChat}
         />
       )}
