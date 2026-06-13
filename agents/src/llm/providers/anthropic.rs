@@ -81,10 +81,17 @@ impl LlmProvider for AnthropicProvider {
                     "system" => {
                         for part in &msg.content {
                             if let ContentPart::Text { text } = part {
-                                system_parts.push(serde_json::json!({
-                                    "type": "text",
-                                    "text": text
-                                }));
+                                // Drop empty system text blocks. An
+                                // empty system block is a small
+                                // waste per call but the cost
+                                // compounds across every system
+                                // message on the wire.
+                                if !text.is_empty() {
+                                    system_parts.push(serde_json::json!({
+                                        "type": "text",
+                                        "text": text
+                                    }));
+                                }
                             }
                         }
                     }
@@ -93,6 +100,15 @@ impl LlmProvider for AnthropicProvider {
                         for part in &msg.content {
                             match part {
                                 ContentPart::Text { text } => {
+                                    // Skip empty text blocks. Empty
+                                    // text contributes zero context
+                                    // to the model but still
+                                    // costs bytes on the wire and
+                                    // on Anthropic's prompt cache
+                                    // prefix hash.
+                                    if text.is_empty() {
+                                        continue;
+                                    }
                                     content_parts.push(serde_json::json!({
                                         "type": "text",
                                         "text": text
@@ -185,7 +201,7 @@ impl LlmProvider for AnthropicProvider {
         }
 
         if let Some(system_val) = system {
-            body["system"] = system_val;
+            body["system"] = lower_system_with_cache(system_val);
         }
 
         // Tools: advertise JSON-Schema definitions on the wire.
@@ -195,12 +211,37 @@ impl LlmProvider for AnthropicProvider {
             body["tools"] = serde_json::Value::Array(lower_tools(&request.tools));
         }
 
-        // Opencode's transform.ts forces `thinking: { type:
-        // "adaptive" }` for minimax-M3 on the Anthropic-Messages
-        // route because minimax's Anthropic interface defaults
-        // thinking off, unlike Chat Completions. Mirror that.
-        if request.model.to_lowercase().contains("minimax-m3") {
+        // Per-model thinking defaults. Anthropic's extended
+        // thinking is the dominant output-token lever for Claude;
+        // opencode sets a 16k budget for "high" effort and the
+        // cap is `model.limit.output - 1` (Anthropic requires
+        // `budget_tokens < max_tokens`). We don't have a per-model
+        // `limit.output` registry yet, so we fall back to a
+        // conservative 8k budget that fits inside the default
+        // 8k `max_tokens` set above. Users who want more
+        // reasoning can raise `max_tokens` on the request.
+        let model_lower = request.model.to_lowercase();
+        if model_lower.contains("minimax-m3") {
+            // opencode's transform.ts forces `thinking: { type:
+            // "adaptive" }` for minimax-M3 on the Anthropic-Messages
+            // route because minimax's Anthropic interface defaults
+            // thinking off, unlike Chat Completions. Mirror that.
             body["thinking"] = serde_json::json!({ "type": "adaptive" });
+        } else if model_lower.contains("opus")
+            || model_lower.contains("sonnet")
+            || model_lower.contains("haiku")
+        {
+            // Claude 3.7+ and Claude 4 family support extended
+            // thinking via `budget_tokens`. 8k is a conservative
+            // default that won't blow the 8k max_tokens above on
+            // smaller models; the caller can raise max_tokens for
+            // larger thinking budgets.
+            body["thinking"] = serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": 8_000_u32.min(
+                    body["max_tokens"].as_u64().unwrap_or(8_000).saturating_sub(1) as u32,
+                ),
+            });
         }
 
         let (abort_tx, mut abort_rx) = oneshot::channel();
@@ -212,6 +253,10 @@ impl LlmProvider for AnthropicProvider {
             .header("x-api-key", api_key.as_str())
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
+            .header(
+                "x-session-affinity",
+                request.session_id.as_deref().unwrap_or(""),
+            )
             .json(&body)
             .send()
             .await
@@ -585,17 +630,71 @@ fn parse_anthropic_usage(value: &Value) -> Option<Usage> {
     })
 }
 
+/// Anthropic-Messages allows up to 4 `cache_control` breakpoints
+/// per request. We use two: the last system block and the last
+/// tool. Both are stable across turns (system prompt is set once
+/// per session; tools only change when the registry mutates, and
+/// callers must keep them sorted for cache reuse — see
+/// `sort_tools_by_name` in `session.rs`).
+///
+/// Caching reduces Anthropic's per-1k-token price from $3 to $0.30
+/// for read-cached content (10x cheaper). One intra-turn tool-call
+/// loop reuses both breakpoints, paying back the cache write on
+/// the first read.
+const ANTHROPIC_CACHE_BREAKPOINTS_MAX: usize = 4;
+
 fn lower_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
+    let n = tools.len();
+    // We use 1 of the 4 allowed cache breakpoints here (the last
+    // tool). The system block uses another one. We never add a
+    // per-tool cache marker (would be wasted budget — only the
+    // last is useful for cross-turn cache reuse).
+    debug_assert!(
+        n <= ANTHROPIC_CACHE_BREAKPOINTS_MAX,
+        "tool count {n} exceeds Anthropic cache breakpoint cap"
+    );
     tools
         .iter()
-        .map(|t| {
-            serde_json::json!({
+        .enumerate()
+        .map(|(i, t)| {
+            let is_last = i + 1 == n && n > 0;
+            let mut entry = serde_json::json!({
                 "name": t.name,
                 "description": t.description,
                 "input_schema": t.parameters,
-            })
+            });
+            if is_last {
+                entry["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+            }
+            entry
         })
         .collect()
+}
+
+/// Wrap the assembled system prompt in the Anthropic wire shape
+/// and attach a `cache_control` marker to the last system block.
+/// The system prompt rarely changes mid-session, so this is the
+/// highest-value breakpoint available.
+fn lower_system_with_cache(system: serde_json::Value) -> serde_json::Value {
+    match system {
+        serde_json::Value::String(s) => serde_json::json!([{
+            "type": "text",
+            "text": s,
+            "cache_control": { "type": "ephemeral" },
+        }]),
+        serde_json::Value::Array(mut blocks) => {
+            if let Some(last) = blocks.last_mut() {
+                if let Some(obj) = last.as_object_mut() {
+                    obj.insert(
+                        "cache_control".to_string(),
+                        serde_json::json!({ "type": "ephemeral" }),
+                    );
+                }
+            }
+            serde_json::Value::Array(blocks)
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]

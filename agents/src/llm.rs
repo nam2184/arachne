@@ -9,7 +9,8 @@ pub use events::{
     Usage,
 };
 pub use providers::{
-    AnthropicProvider, LlmProvider, LlmStream, MiniMaxTokenPlanProvider, OpenAiProvider,
+    xml_tool_call, AnthropicProvider, LlmProvider, LlmStream, MiniMaxTokenPlanProvider,
+    OpenAiProvider,
 };
 pub use request::{ContentPart, LlmError, LlmMessage, LlmRequest, LlmResponse, ToolCallEntry};
 pub use session::{

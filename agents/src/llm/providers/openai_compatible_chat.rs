@@ -136,6 +136,10 @@ impl LlmProvider for OpenAiCompatibleChatProvider {
             .post(self.chat_completions_url())
             .header("Authorization", &auth_header)
             .header("Content-Type", "application/json")
+            .header(
+                "x-session-affinity",
+                request.session_id.as_deref().unwrap_or(""),
+            )
             .json(&body)
             .send()
             .await
@@ -679,6 +683,17 @@ fn build_request_body(
         "stream_options": { "include_usage": true },
     });
 
+    if let Some(session_id) = &request.session_id {
+        // `user` on Chat Completions is the documented cache-routing
+        // hint: OpenAI uses it to bucket requests from the same end
+        // user, which keeps the implicit prefix cache hot across
+        // turns. OpenAI Responses uses `prompt_cache_key` instead;
+        // both are passed through by the AI SDK OpenAI provider
+        // when the chat-completions path picks them up. The header
+        // is for upstream gateways that key on it.
+        body["user"] = serde_json::json!(session_id);
+    }
+
     if let Some(temp) = request.temperature {
         body["temperature"] = serde_json::json!(temp);
     }
@@ -690,6 +705,26 @@ fn build_request_body(
     }
     if let Some(stop) = &request.stop {
         body["stop"] = serde_json::json!(stop);
+    }
+
+    // Per-model output-token defaults. opencode's transform.ts
+    // sets `reasoning_effort: "medium"` and `textVerbosity: "low"`
+    // for GPT-5 family — textVerbosity is the single biggest
+    // output-token lever because it forces terse prose. We
+    // default to those values for the GPT-5 family and leave
+    // other models alone.
+    let model_lower = request.model.to_lowercase();
+    if model_lower.contains("gpt-5") && !model_lower.contains("gpt-5-chat") {
+        if !body.as_object().map_or(true, |o| o.contains_key("reasoning_effort")) {
+            if !model_lower.contains("gpt-5-pro") {
+                body["reasoning_effort"] = serde_json::json!("medium");
+            }
+        }
+        if model_lower.contains("gpt-5.")
+            && !body.as_object().map_or(true, |o| o.contains_key("verbosity"))
+        {
+            body["verbosity"] = serde_json::json!("low");
+        }
     }
 
     // Tools: advertise the JSON-Schema definitions on the wire. The

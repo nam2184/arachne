@@ -6,12 +6,13 @@ use tokio::sync::oneshot;
 use tokio_stream::Stream;
 
 use super::events::LlmEvent;
-use super::request::{LlmError, LlmMessage, LlmRequest, LlmResponse};
+use super::request::{LlmError, LlmRequest, LlmResponse};
 
 pub mod anthropic;
 pub mod minimax_token_plan;
 pub mod openai;
 mod openai_compatible_chat;
+pub mod xml_tool_call;
 
 pub use anthropic::AnthropicProvider;
 pub use minimax_token_plan::MiniMaxTokenPlanProvider;
@@ -58,28 +59,6 @@ impl LlmStream {
 pub fn parse_sse_line(line: &str) -> Option<String> {
     const PREFIX: &str = "data: ";
     line.strip_prefix(PREFIX).map(|s| s.to_string())
-}
-
-pub fn to_llm_messages(history: &[(String, String)]) -> Vec<LlmMessage> {
-    let mut messages = Vec::new();
-    for (role, content) in history {
-        match role.as_str() {
-            "user" => messages.push(LlmMessage::user(content)),
-            "assistant" => messages.push(LlmMessage::assistant(content)),
-            "system" => messages.push(LlmMessage::system(content)),
-            "tool" => {} // tool results handled separately
-            _ => messages.push(LlmMessage::user(content)),
-        }
-    }
-    messages
-}
-
-pub fn system_prompt(agent_name: &str, languages: &[String]) -> String {
-    format!(
-        "You are {}, an AI coding assistant. Languages detected in this project: {}.",
-        agent_name,
-        languages.join(", ")
-    )
 }
 
 pub(super) fn log_sse_event_body(provider: &str, model: &str, body: &str) {

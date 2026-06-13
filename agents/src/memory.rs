@@ -1,3 +1,13 @@
+//! Project-scoped long-term memory store. **Planned future API**.
+//!
+//! The shape (per-project `ProjectMemory` with `facts`, `patterns`,
+//! and `recent_learns`) is the minimum surface the runner will need
+//! to inject "what we've learned about this project" into the
+//! system prompt on subsequent sessions. Today the runner does not
+//! call this — it is a placeholder for the v2 work where the
+//! compactor will also extract durable facts from the conversation
+//! summary and store them here. Do not delete.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

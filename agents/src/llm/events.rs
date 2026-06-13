@@ -178,6 +178,23 @@ pub enum LlmEvent {
         name: String,
         message: String,
     },
+    /// Emitted when the runner detects an XML tool call block inside
+    /// streamed text (e.g. `<tool_call>…</tool_call>`, `<tool name="x">…</tool>`,
+    /// `<invoke name="x">…</invoke>`, `<function_calls>…</function_calls>`,
+    /// `<antml:function_calls>…</antml:function_calls>`, or a self-closing
+    /// variant). The model emitted this instead of using the provider's
+    /// native tool-calling API. The runner strips the block from the
+    /// visible text, appends a `ContentPart::tool_result` describing the
+    /// violation to the assistant message, and continues the turn so
+    /// the model can self-correct on the next provider call. `raw`
+    /// holds the inner body (or the whole block for self-closing tags
+    /// and unterminated-at-flush cases) and is intended for diagnostics
+    /// rather than execution.
+    InvalidToolCall {
+        id: String,
+        name: String,
+        raw: String,
+    },
     Finish {
         reason: FinishReason,
         usage: Option<Usage>,
@@ -226,6 +243,10 @@ impl LlmEvent {
         matches!(self, LlmEvent::ToolCall { .. })
     }
 
+    pub fn is_invalid_tool_call(&self) -> bool {
+        matches!(self, LlmEvent::InvalidToolCall { .. })
+    }
+
     pub fn is_step_finish(&self) -> bool {
         matches!(self, LlmEvent::StepFinish { .. })
     }
@@ -246,6 +267,15 @@ impl LlmEvent {
         match self {
             LlmEvent::ToolCall { id, .. } => Some(id),
             _ => None,
+        }
+    }
+
+    /// Convenience constructor for `LlmEvent::InvalidToolCall`.
+    pub fn invalid_tool_call(id: impl Into<String>, name: impl Into<String>, raw: impl Into<String>) -> Self {
+        LlmEvent::InvalidToolCall {
+            id: id.into(),
+            name: name.into(),
+            raw: raw.into(),
         }
     }
 }

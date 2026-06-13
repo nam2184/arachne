@@ -1,3 +1,13 @@
+//! Named prompt presets. **Planned future API**.
+//!
+//! Each constant is a stable, hand-curated prompt the runner
+//! can offer as a starting point for new sessions (or surface
+//! in a UI dropdown). Today the runner uses inline prompts in
+//! `system_prompt_for_session` and `sessions/compaction.rs`; the
+//! preset library will replace those once the v2 preset loader
+//! is in. The strings here are intentionally a bit terser than
+//! the inline ones so the UI can display them as previews.
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PromptPreset {
     pub id: String,

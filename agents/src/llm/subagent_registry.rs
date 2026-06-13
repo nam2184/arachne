@@ -81,6 +81,24 @@ impl SubagentRegistry {
         })
     }
 
+    /// No-op registry. Used by the runner when dispatching a tool
+    /// that needs async I/O (`webfetch`) but the parent session
+    /// has no real subagent tree (e.g. a top-level session in a
+    /// Tauri context). The registry methods will reject any
+    /// `task` / `ask_peer` attempt with `DatabaseUnavailable` /
+    /// `OpenFailed`; `webfetch` ignores the registry entirely.
+    ///
+    /// The `db_path` is an arbitrary placeholder; `open()` is
+    /// only called from `check_spawn` / `register_child` /
+    /// `complete_child` and the registry is never consulted in
+    /// the webfetch path.
+    pub fn new_noop() -> Arc<Self> {
+        Arc::new(Self {
+            state: RwLock::new(State::default()),
+            db_path: PathBuf::from(":memory:"), // not opened unless someone calls `check_spawn`
+        })
+    }
+
     fn open(&self) -> Result<Connection, String> {
         Connection::open(&self.db_path).map_err(|e| format!("db open: {e}"))
     }

@@ -5,6 +5,7 @@ use tokio_stream::StreamExt;
 
 use crate::domain::ToolCall;
 use crate::llm::events::{FinishReason, LlmEvent, ToolResultValue};
+use crate::llm::providers::xml_tool_call::{InvalidToolCallHit, XmlToolCallScanner};
 use crate::llm::providers::LlmProvider;
 use crate::llm::request::{ContentPart, LlmMessage, LlmRequest};
 use crate::llm::subagent_registry::SubagentRegistry;
@@ -37,6 +38,13 @@ pub struct SessionRunner {
     subagent_registry: Option<Arc<SubagentRegistry>>,
     max_steps: u32,
     readonly_tools: bool,
+    /// When set, the runner writes the *full* (untruncated)
+    /// output of any tool that gets bounded to the file system at
+    /// `<dir>/<tool>-<seq>.txt` and includes the path in the
+    /// truncation marker. Mirrors opencode's `Truncate.write`
+    /// behavior. `None` (default) disables spillover — bounded
+    /// outputs are just clipped and the marker says "suppressed".
+    spill_dir: Option<std::path::PathBuf>,
     /// Permission mode for this turn. The runner injects it into the
     /// LLM's context as a synthetic user message and uses it when
     /// gating tool calls in the dispatch block.
@@ -95,6 +103,7 @@ impl SessionRunner {
             subagent_registry: None,
             max_steps: MAX_STEPS,
             readonly_tools: false,
+            spill_dir: None,
             mode: crate::permission::PermissionMode::default(),
             event_sink: None,
             doom: Arc::new(crate::sandbox::DoomLoopDetector::default()),
@@ -127,9 +136,18 @@ impl SessionRunner {
 
     /// Set the permission mode for this turn. The mode is injected into
     /// the LLM context as a synthetic user message and used to gate
-    /// tool-call dispatch.
+    /// tool-call dispatch. Setting `Plan` mode also implies
+    /// `readonly_tools = true` so the model never sees the write /
+    /// edit / apply_patch / shell tool schemas on the wire — the
+    /// tool list matches the system prompt's "you may not call
+    /// these" reminder, instead of advertising them and then
+    /// rejecting the call. `Build` mode (the default) advertises
+    /// the full tool list.
     pub fn with_mode(mut self, mode: crate::permission::PermissionMode) -> Self {
         self.mode = mode;
+        if matches!(mode, crate::permission::PermissionMode::Plan) {
+            self.readonly_tools = true;
+        }
         self
     }
 
@@ -139,6 +157,27 @@ impl SessionRunner {
     /// own runners without it.
     pub fn with_subagent_registry(mut self, registry: Arc<SubagentRegistry>) -> Self {
         self.subagent_registry = Some(registry);
+        self
+    }
+
+    /// Return a no-op subagent registry. Used by the runner when
+    /// dispatching async tools that don't need sub-sessions
+    /// (`webfetch`); the registry is never consulted in that
+    /// path. Avoids forcing every top-level session to wire up a
+    /// real DB-backed registry just so a fetch can be async.
+    pub fn subagent_registry_noop(&self) -> Arc<SubagentRegistry> {
+        SubagentRegistry::new_noop()
+    }
+
+    /// Wire the directory where bounded-but-truncated tool
+    /// outputs get spilled to disk (opencode `TruncationDir`
+    /// pattern). Pass `None` (or skip this call) to disable
+    /// spillover — bounded outputs are just clipped and the
+    /// marker says "suppressed". The Tauri runtime wires the
+    /// app-data-dir-relative `tool-output/` path; tests use
+    /// `tempdir()`.
+    pub fn with_spill_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.spill_dir = Some(dir.into());
         self
     }
 
@@ -449,11 +488,7 @@ impl SessionRunner {
             });
         }
 
-        let tools = if self.readonly_tools {
-            readonly_tool_definitions()
-        } else {
-            default_tool_definitions()
-        };
+        let tools = tools_for_model(&session.model, self.readonly_tools);
 
         // The LLM is told about tools via the request body's
         // structured `tools` field. Providers return tool calls as
@@ -487,7 +522,8 @@ impl SessionRunner {
         let request = LlmRequest::new(&session.model, &session.provider)
             .with_system(system_prompt.clone())
             .with_messages(messages)
-            .with_tools(tools);
+            .with_tools(tools)
+            .with_session_id(session_id.to_string());
 
         let provider = self
             .providers
@@ -525,6 +561,18 @@ impl SessionRunner {
         // `LlmEvent::ToolCall` events from the provider.
         let mut text_buffer = String::new();
         let mut in_think_block = false;
+        // XML tool call detector. Some local / instruct-tuned models
+        // emit tool calls inside the text stream as XML blocks
+        // (`<tool_call>…</tool_call>`, `<tool name="x">…</tool>`,
+        // `<invoke …>`, `<function_calls>…</function_calls>`,
+        // `<antml:function_calls>…</antml:function_calls>`,
+        // self-closing variants). The scanner strips these from the
+        // visible text and emits `LlmEvent::InvalidToolCall` events
+        // so the runner can append a synthetic `tool_result` to the
+        // assistant message and the model self-corrects on the next
+        // turn.
+        let mut xml_scanner = XmlToolCallScanner::new();
+        let mut invalid_tool_call_hits: Vec<InvalidToolCallHit> = Vec::new();
         let mut assistant_parts: Vec<ContentPart> = Vec::new();
         let mut needs_continuation = false;
         let mut finish_reason = FinishReason::Unknown;
@@ -581,6 +629,7 @@ impl SessionRunner {
                 LlmEvent::ProviderError { .. } => "provider_error",
                 LlmEvent::TaskCall { .. } => "task_call",
                 LlmEvent::TaskResult { .. } => "task_result",
+                LlmEvent::InvalidToolCall { .. } => "invalid_tool_call",
             };
             tracing::debug!(
                 session_id = %session_id,
@@ -592,12 +641,39 @@ impl SessionRunner {
 
             match event {
                 LlmEvent::TextDelta { text, .. } => {
-                    // Buffer text so we can still detect <think>…</think>
-                    // markers for models that emit thinking as raw
-                    // text. The buffered text is flushed as visible
-                    // text or as `Reasoning` parts at TextEnd (or
-                    // stream end) — never as tool calls.
-                    text_buffer.push_str(&text);
+                    // Scan the delta for XML tool call blocks. The
+                    // scanner returns the visible text (with any
+                    // detected blocks stripped) and a list of
+                    // complete hits. We feed the visible text into
+                    // the existing buffer so <think>…</think>
+                    // detection still works, and we surface each
+                    // hit as a typed `LlmEvent::InvalidToolCall`
+                    // event so the UI can render a "the model
+                    // emitted a tool call as XML" indicator.
+                    let outcome = xml_scanner.feed(&text);
+                    if !outcome.text.is_empty() {
+                        text_buffer.push_str(&outcome.text);
+                    }
+                    for hit in outcome.hits {
+                        let id = crate::llm::providers::xml_tool_call::next_invalid_tool_call_id();
+                        let (name, raw) = (hit.name.clone(), hit.raw.clone());
+                        let event = LlmEvent::InvalidToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            raw: raw.clone(),
+                        };
+                        self.emit_event(session_id, step, &event);
+                        invalid_tool_call_hits.push(hit);
+                        let raw_preview: String = raw.chars().take(120).collect();
+                        tracing::warn!(
+                            session_id = %session_id,
+                            step = step,
+                            tool = %id,
+                            name = %name,
+                            raw_preview = %raw_preview,
+                            "detected XML tool call block in streamed text; stripping and feeding back as tool_result"
+                        );
+                    }
                 }
                 LlmEvent::TextEnd { .. } => {
                     flush_text_buffer(&mut text_buffer, &mut in_think_block, &mut assistant_parts);
@@ -676,6 +752,69 @@ impl SessionRunner {
 
         if !text_buffer.is_empty() || in_think_block {
             flush_text_buffer(&mut text_buffer, &mut in_think_block, &mut assistant_parts);
+        }
+
+        // Flush the XML tool call scanner. Any in-flight block that
+        // never closed (model emitted a partial tag) is reported
+        // here as a synthetic hit so the model still gets
+        // `tool_result` feedback on the next turn.
+        let tail = xml_scanner.flush();
+        if !tail.text.is_empty() {
+            text_buffer.push_str(&tail.text);
+            flush_text_buffer(&mut text_buffer, &mut in_think_block, &mut assistant_parts);
+        }
+        for hit in tail.hits {
+            let id = crate::llm::providers::xml_tool_call::next_invalid_tool_call_id();
+            let (name, _) = (hit.name.clone(), hit.raw.clone());
+            let event = LlmEvent::InvalidToolCall {
+                id: id.clone(),
+                name: hit.name.clone(),
+                raw: hit.raw.clone(),
+            };
+            self.emit_event(session_id, step, &event);
+            invalid_tool_call_hits.push(hit);
+            tracing::warn!(
+                session_id = %session_id,
+                step = step,
+                tool = %id,
+                name = %name,
+                "stream ended inside an XML tool call block; emitting synthetic hit"
+            );
+        }
+
+        // Synthesize `ContentPart::tool_result` entries for every
+        // detected XML tool call block. These ride along with the
+        // persisted assistant message and reach the model on the
+        // next turn through the standard tool-result channel so it
+        // can self-correct. We do NOT set `needs_continuation` here:
+        // the next turn's `run_turn` will be triggered by a real
+        // `ToolCall` event (or by the user) — synthetic feedback
+        // alone is not a reason to loop.
+        for hit in &invalid_tool_call_hits {
+            let id = crate::llm::providers::xml_tool_call::next_invalid_tool_call_id();
+            let preview: String = hit.raw.chars().take(120).collect();
+            let message = format!(
+                "do not emit tool calls as XML, markdown, code blocks, or plain text. \
+                 The XML tool call block you emitted for `{}` was discarded. \
+                 Use the provider's native tool-calling API (the structured `tools` field on the request). \
+                 Detected body: {}",
+                hit.name,
+                preview
+            );
+            assistant_parts.push(ContentPart::tool_result(
+                &id,
+                &hit.name,
+                serde_json::json!({ "error": message }),
+            ));
+        }
+        if !invalid_tool_call_hits.is_empty() {
+            tracing::info!(
+                session_id = %session_id,
+                step = step,
+                count = invalid_tool_call_hits.len(),
+                "appended XML-tool-call feedback tool_results to assistant parts"
+            );
+            let _ = flush_parts(&assistant_parts);
         }
 
         // After the stream is done, dispatch the pending tool calls.
@@ -843,12 +982,15 @@ impl SessionRunner {
                 }
 
                 // Dispatch through the async path so the `task` and
-                // `ask_peer` tools can drive child sessions. For
-                // read-only runs (e.g. an `ask_peer` child), the runner
-                // has no ToolRuntime; it falls back to the sync path
-                // inside `run_tool_async` for non-task tools, but task
-                // / ask_peer are unreachable because the tool set is
-                // already filtered.
+                // `ask_peer` tools can drive child sessions, and so
+                // `webfetch` can await HTTP without blocking the
+                // executor. For read-only runs (e.g. an `ask_peer`
+                // child), the runner has no ToolRuntime; the async
+                // path is still used for `webfetch` (which doesn't
+                // need a runtime), and other tools fall back to the
+                // sync path inside `run_tool_async`.
+                let needs_async_runtime = matches!(name.as_str(), "task" | "ask_peer");
+                let needs_async_dispatch = needs_async_runtime || name == "webfetch";
                 let result = if let Some(registry) = &self.subagent_registry {
                     let runtime = ToolRuntime {
                         caller_session_id: session_id.to_string(),
@@ -858,13 +1000,49 @@ impl SessionRunner {
                         subagent_registry: Arc::clone(registry),
                         project_root: project_root.clone(),
                     };
+                    if needs_async_dispatch {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            step = step,
+                            tool = %name,
+                            project_root = %project_root.display(),
+                            "dispatching via async path (subagent registry present)"
+                        );
+                        run_tool_async(&tool_call, &runtime).await
+                    } else {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            step = step,
+                            tool = %name,
+                            project_root = %project_root.display(),
+                            "dispatching via sync path (subagent registry present, tool doesn't need it)"
+                        );
+                        run_tool_with_context(&tool_call, &ctx)
+                    }
+                } else if needs_async_dispatch && name == "webfetch" {
                     tracing::debug!(
                         session_id = %session_id,
                         step = step,
                         tool = %name,
                         project_root = %project_root.display(),
-                        "dispatching via async path (subagent registry present)"
+                        "dispatching via async path (no subagent registry; tool needs async I/O)"
                     );
+                    // For the no-registry case the only async tool
+                    // we route here is `webfetch`, which doesn't
+                    // need a runtime at all. Build a minimal
+                    // `ToolRuntime` whose `subagent_registry` is
+                    // never consulted. We use the session's
+                    // existing providers / services so any future
+                    // tools added to the async-no-runtime set can
+                    // resolve them.
+                    let runtime = ToolRuntime {
+                        caller_session_id: session_id.to_string(),
+                        session_service: Arc::clone(&self.session_service),
+                        conversation_service: Arc::clone(&self.conversation_service),
+                        providers: Arc::clone(&self.providers),
+                        subagent_registry: self.subagent_registry_noop(),
+                        project_root: project_root.clone(),
+                    };
                     run_tool_async(&tool_call, &runtime).await
                 } else {
                     tracing::debug!(
@@ -891,8 +1069,24 @@ impl SessionRunner {
                 // message and what the LLM sees on subsequent
                 // turns; the live event keeps the full output so
                 // the UI can still display the untruncated result.
+                //
+                // Tool-specific policy: `shell` uses
+                // `tail_bound_output` (opencode's `tail()` function)
+                // because the relevant signal — exit code, error
+                // trace, final state — is at the end of the output,
+                // not the beginning. Every other tool uses the
+                // head-bounded `bound_tool_output`. When
+                // `self.spill_dir` is set, the *full* untruncated
+                // text is written to disk and the path surfaces in
+                // the marker so the model can re-read it.
                 let bounded = if result.success {
-                    let out = bound_tool_output(output.as_deref().unwrap_or(""));
+                    let raw = output.as_deref().unwrap_or("");
+                    let spill = self.spill_dir.as_deref();
+                    let out = if name == "shell" {
+                        crate::tools::output_bounds::tail_bound_output(raw, spill, &name)
+                    } else {
+                        bound_tool_output(raw, spill, &name)
+                    };
                     if out.truncated {
                         crate::tools::output_bounds::note_truncation();
                     }
@@ -901,6 +1095,8 @@ impl SessionRunner {
                     crate::tools::BoundedOutput {
                         text: output.as_deref().unwrap_or("").to_string(),
                         truncated: false,
+                        dropped_lines: 0,
+                        spill_path: None,
                     }
                 };
                 let persisted_output = if bounded.truncated {
@@ -909,12 +1105,16 @@ impl SessionRunner {
                     output.clone()
                 };
                 let result_value = if bounded.truncated {
-                    serde_json::json!({
+                    let mut value = serde_json::json!({
                         "text": bounded.text,
                         "truncated": true,
                         "max_lines": MAX_TOOL_OUTPUT_LINES,
                         "max_bytes": MAX_TOOL_OUTPUT_BYTES,
-                    })
+                    });
+                    if let Some(path) = &bounded.spill_path {
+                        value["spill_path"] = serde_json::Value::String(path.clone());
+                    }
+                    value
                 } else {
                     result_value
                 };
@@ -1072,7 +1272,10 @@ fn system_prompt_for_session(provider: &str, _extra: &[String]) -> String {
          definitions is sent on the request, not in this prompt. \
          To call a tool, use the provider's native tool-calling API. \
          Do not write tool calls as XML, markdown, code blocks, or plain text. \
-         Do not call a tool that isn't listed. Do not invent argument names.",
+         Do not call a tool that isn't listed. Do not invent argument names. \
+         The runtime will strip and reject any XML tool call block it sees \
+         in your text and feed the rejection back as a `tool_result` so you \
+         can self-correct on the next turn.",
         name = agent_name,
     )
 }
@@ -1127,103 +1330,13 @@ fn flush_text_buffer(
 }
 
 fn default_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
-    vec![
-        crate::llm::events::ToolDefinition::new(
-            "read",
-            "Read a file from disk",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path to the file to read" },
-                    "offset": { "type": "integer", "description": "Line offset to start reading from", "minimum": 1 },
-                    "limit": { "type": "integer", "description": "Maximum number of lines to read" }
-                },
-                "required": ["path"]
-            }),
-        ),
-        crate::llm::events::ToolDefinition::new(
-            "write",
-            "Write content to a file",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path to the file to write" },
-                    "content": { "type": "string", "description": "Content to write" }
-                },
-                "required": ["path", "content"]
-            }),
-        ),
-        crate::llm::events::ToolDefinition::new(
-            "edit",
-            "Replace text in an existing file",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path to the file to edit" },
-                    "old_string": { "type": "string", "description": "Text to find and replace" },
-                    "new_string": { "type": "string", "description": "Replacement text" }
-                },
-                "required": ["path", "old_string", "new_string"]
-            }),
-        ),
-        crate::llm::events::ToolDefinition::new(
-            "glob",
-            "Find files by glob pattern",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Root directory to search from" },
-                    "pattern": { "type": "string", "description": "Glob pattern to match files against" }
-                },
-                "required": ["path"]
-            }),
-        ),
-        crate::llm::events::ToolDefinition::new(
-            "grep",
-            "Search file contents",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Root directory to search from" },
-                    "pattern": { "type": "string", "description": "Text pattern to search for" },
-                    "include": { "type": "string", "description": "File name pattern to filter by" }
-                },
-                "required": ["path", "pattern"]
-            }),
-        ),
-        crate::llm::events::ToolDefinition::new(
-            "shell",
-            "Run a shell command",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string", "description": "Shell command to execute" },
-                    "workdir": { "type": "string", "description": "Working directory for the command" }
-                },
-                "required": ["command"]
-            }),
-        ),
+    let mut tools = vec![
         crate::llm::events::ToolDefinition::new(
             "apply_patch",
             "Apply a file-oriented patch",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "patchText": { "type": "string", "description": "Full patch text describing file operations" }
-                },
-                "required": ["patchText"]
-            }),
-        ),
-        crate::llm::events::ToolDefinition::new(
-            "todo",
-            "Update the session todo list",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "content": { "type": "string", "description": "Todo content to set" }
-                },
-                "required": ["content"]
-            }),
+            object_schema(serde_json::json!({
+                "patchText": { "type": "string", "description": "Full patch text describing file operations" }
+            }), &["patchText"]),
         ),
         crate::llm::events::ToolDefinition::new(
             "ask_peer",
@@ -1231,96 +1344,217 @@ fn default_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
              read-only (read/glob/grep/webfetch), so this is for consulting another \
              session's analysis without risking writes. Cross-repo only — the caller \
              and peer must live in different directories.",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "peer_session_id": {
-                        "type": "string",
-                        "description": "ID of the peer session to consult"
-                    },
-                    "question": {
-                        "type": "string",
-                        "description": "The question to ask the peer"
-                    },
-                    "max_turns": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 5,
-                        "description": "Maximum number of model turns the peer is allowed to take (1-5, default 3)"
-                    }
+            object_schema(serde_json::json!({
+                "peer_session_id": {
+                    "type": "string",
+                    "description": "ID of the peer session to consult"
                 },
-                "required": ["peer_session_id", "question"]
-            }),
+                "question": {
+                    "type": "string",
+                    "description": "The question to ask the peer"
+                },
+                "max_turns": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "description": "Maximum number of model turns the peer is allowed to take (1-5, default 3)"
+                }
+            }), &["peer_session_id", "question"]),
         ),
-    ]
+        crate::llm::events::ToolDefinition::new(
+            "edit",
+            "Replace text in an existing file",
+            object_schema(serde_json::json!({
+                "path": { "type": "string", "description": "Path to the file to edit" },
+                "old_string": { "type": "string", "description": "Text to find and replace" },
+                "new_string": { "type": "string", "description": "Replacement text" }
+            }), &["path", "old_string", "new_string"]),
+        ),
+        crate::llm::events::ToolDefinition::new(
+            "glob",
+            "Find files by glob pattern",
+            object_schema(serde_json::json!({
+                "path": { "type": "string", "description": "Root directory to search from" },
+                "pattern": { "type": "string", "description": "Glob pattern to match files against" }
+            }), &["path"]),
+        ),
+        crate::llm::events::ToolDefinition::new(
+            "grep",
+            "Search file contents",
+            object_schema(serde_json::json!({
+                "path": { "type": "string", "description": "Root directory to search from" },
+                "pattern": { "type": "string", "description": "Text pattern to search for" },
+                "include": { "type": "string", "description": "File name pattern to filter by" }
+            }), &["path", "pattern"]),
+        ),
+        crate::llm::events::ToolDefinition::new(
+            "read",
+            "Read a file from disk",
+            object_schema(serde_json::json!({
+                "path": { "type": "string", "description": "Path to the file to read" },
+                "offset": { "type": "integer", "description": "Line offset to start reading from", "minimum": 1 },
+                "limit": { "type": "integer", "description": "Maximum number of lines to read" }
+            }), &["path"]),
+        ),
+        crate::llm::events::ToolDefinition::new(
+            "shell",
+            "Run a shell command",
+            object_schema(serde_json::json!({
+                "command": { "type": "string", "description": "Shell command to execute" },
+                "workdir": { "type": "string", "description": "Working directory for the command" }
+            }), &["command"]),
+        ),
+        crate::llm::events::ToolDefinition::new(
+            "todo",
+            "Update the session todo list",
+            object_schema(serde_json::json!({
+                "content": { "type": "string", "description": "Todo content to set" }
+            }), &["content"]),
+        ),
+        crate::llm::events::ToolDefinition::new(
+            "write",
+            "Write content to a file",
+            object_schema(serde_json::json!({
+                "path": { "type": "string", "description": "Path to the file to write" },
+                "content": { "type": "string", "description": "Content to write" }
+            }), &["path", "content"]),
+        ),
+    ];
+    sort_tools_by_name(&mut tools);
+    tools
 }
 
 /// Read-only tool subset used by `ask_peer` child sessions. Excludes
 /// `write`, `edit`, `apply_patch`, `shell`, `task`, and `ask_peer`
 /// itself. The peer can read files, search, and fetch the web.
 pub fn readonly_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
-    vec![
-        crate::llm::events::ToolDefinition::new(
-            "read",
-            "Read a file from disk",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path to a file to read" },
-                    "offset": { "type": "integer", "minimum": 1 },
-                    "limit": { "type": "integer", "minimum": 1 }
-                },
-                "required": ["path"]
-            }),
-        ),
+    let mut tools = vec![
         crate::llm::events::ToolDefinition::new(
             "glob",
             "Find files by glob pattern",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Root directory" },
-                    "pattern": { "type": "string", "description": "Glob pattern" }
-                },
-                "required": ["path"]
-            }),
+            object_schema(serde_json::json!({
+                "path": { "type": "string", "description": "Root directory" },
+                "pattern": { "type": "string", "description": "Glob pattern" }
+            }), &["path"]),
         ),
         crate::llm::events::ToolDefinition::new(
             "grep",
             "Search file contents",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "pattern": { "type": "string" },
-                    "include": { "type": "string" }
-                },
-                "required": ["path", "pattern"]
-            }),
+            object_schema(serde_json::json!({
+                "path": { "type": "string" },
+                "pattern": { "type": "string" },
+                "include": { "type": "string" }
+            }), &["path", "pattern"]),
+        ),
+        crate::llm::events::ToolDefinition::new(
+            "read",
+            "Read a file from disk",
+            object_schema(serde_json::json!({
+                "path": { "type": "string", "description": "Path to a file to read" },
+                "offset": { "type": "integer", "minimum": 1 },
+                "limit": { "type": "integer", "minimum": 1 }
+            }), &["path"]),
         ),
         crate::llm::events::ToolDefinition::new(
             "webfetch",
             "Fetch a web URL",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string" }
-                },
-                "required": ["url"]
-            }),
+            object_schema(serde_json::json!({
+                "url": { "type": "string" }
+            }), &["url"]),
         ),
         crate::llm::events::ToolDefinition::new(
             "websearch",
             "Search the web",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string" }
-                },
-                "required": ["query"]
-            }),
+            object_schema(serde_json::json!({
+                "query": { "type": "string" }
+            }), &["query"]),
         ),
-    ]
+    ];
+    sort_tools_by_name(&mut tools);
+    tools
+}
+
+/// Wrap a property map in the canonical object schema envelope:
+/// `type: object`, `properties`, `required`, and
+/// `additionalProperties: false`. The latter is mandatory for
+/// OpenAI strict-mode tools and a useful hint everywhere else: it
+/// stops the model from inventing field names that aren't in the
+/// schema, which would otherwise round-trip as parse errors.
+fn object_schema(
+    properties: serde_json::Value,
+    required: &[&str],
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    })
+}
+
+/// Names of the file-mutation tools that we surface to the model.
+/// The GPT family gets `apply_patch` instead of `edit`/`write`
+/// (matching opencode's `ToolRegistry.tools` filter) because GPT
+/// is trained on the diff-style `*** Begin Patch` format. Other
+/// models are better at find-and-replace.
+const EDIT_TOOLS: &[&str] = &["edit", "write"];
+const APPLY_PATCH_TOOL: &str = "apply_patch";
+
+/// True when the model is in the GPT family that supports the
+/// `*** Begin Patch` diff format. Mirrors opencode's
+/// `usePatch = modelID.includes("gpt-") && !modelID.includes("oss")
+/// && !modelID.includes("gpt-4")` — the `-chat` suffix is excluded
+/// because gpt-5-chat is a non-tool-calling chat model, and `gpt-4`
+/// is excluded because the original gpt-4 was not trained on
+/// `apply_patch` either. The `-oss` suffix excludes the open-weight
+/// gpt-oss family, which we don't currently support but the rule
+/// keeps room for it.
+fn model_uses_apply_patch(model_id: &str) -> bool {
+    let id = model_id.to_lowercase();
+    id.contains("gpt-")
+        && !id.contains("gpt-4")
+        && !id.contains("oss")
+        && !id.contains("gpt-5-chat")
+}
+
+/// Return the tool list to advertise to the model for this turn.
+///
+/// The filter is layered:
+/// 1. If `readonly` is set (Plan mode or `ask_peer` child session),
+///    return the read-only subset regardless of model. Plan mode
+///    is a safety gate and must win over the GPT/preferred-edit-tool
+///    heuristic — a Plan-mode GPT-5 still can't write.
+/// 2. Otherwise, start with the full `default_tool_definitions()`.
+///    For GPT-family models that speak `apply_patch`, drop `edit`
+///    and `write`. For everything else, drop `apply_patch`.
+/// 3. The output is sorted by name for prompt-cache stability —
+///    `apply_patch` ↔ `edit`/`write` filtering must not change the
+///    order of the other tools on the wire.
+pub fn tools_for_model(model_id: &str, readonly: bool) -> Vec<crate::llm::events::ToolDefinition> {
+    if readonly {
+        let mut tools = readonly_tool_definitions();
+        sort_tools_by_name(&mut tools);
+        return tools;
+    }
+
+    let mut tools = default_tool_definitions();
+    if model_uses_apply_patch(model_id) {
+        tools.retain(|tool| !EDIT_TOOLS.contains(&tool.name.as_str()));
+    } else {
+        tools.retain(|tool| tool.name != APPLY_PATCH_TOOL);
+    }
+    sort_tools_by_name(&mut tools);
+    tools
+}
+
+/// Sort tool definitions in-place by name. Tool order on the wire
+/// is significant for prompt caching (Anthropic and OpenAI both
+/// hash the literal request bytes; any reordering of the `tools`
+/// array busts the cache prefix). Sorting by name makes the order
+/// stable across turns and across optional-tool toggles (e.g.
+/// `apply_patch` ↔ `edit`/`write` filtering by model).
+fn sort_tools_by_name(tools: &mut [crate::llm::events::ToolDefinition]) {
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
 #[derive(Debug)]
@@ -1450,6 +1684,166 @@ mod tests {
         assert!(system_prompt_for_session("anthropic", &[]).contains("Claude"));
         assert!(system_prompt_for_session("openai", &[]).contains("GPT"));
         assert!(system_prompt_for_session("minimax", &[]).contains("MiniMax"));
+    }
+
+    fn tool_names(tools: &[crate::llm::events::ToolDefinition]) -> Vec<&str> {
+        let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        names.sort();
+        names
+    }
+
+    fn is_sorted_by_name(tools: &[crate::llm::events::ToolDefinition]) -> bool {
+        tools.windows(2).all(|pair| pair[0].name <= pair[1].name)
+    }
+
+    #[test]
+    fn model_uses_apply_patch_recognises_gpt5_family() {
+        // Pure function, no I/O. The exact match set is the GPT-5
+        // family that was trained on the `*** Begin Patch` format.
+        assert!(model_uses_apply_patch("gpt-5"));
+        assert!(model_uses_apply_patch("gpt-5-turbo"));
+        assert!(model_uses_apply_patch("gpt-5-mini"));
+        assert!(model_uses_apply_patch("openai/gpt-5"));
+        assert!(model_uses_apply_patch("GPT-5"));
+    }
+
+    #[test]
+    fn model_uses_apply_patch_rejects_non_gpt5_models() {
+        // Claude, Gemini, llama, gpt-4, gpt-oss, gpt-5-chat,
+        // minimax. None of these are trained on `apply_patch`.
+        for id in [
+            "claude-3-5-sonnet-latest",
+            "claude-3-5-haiku-latest",
+            "claude-sonnet-4-20250514",
+            "gemini-1.5-pro",
+            "gemini-2.5-pro",
+            "llama-3.1-70b",
+            "MiniMax-M3",
+            "MiniMax-M2.7",
+            "gpt-4",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4-turbo",
+            "gpt-oss-120b",
+            "gpt-5-chat-latest",
+        ] {
+            assert!(
+                !model_uses_apply_patch(id),
+                "{id} should NOT use apply_patch"
+            );
+        }
+    }
+
+    #[test]
+    fn tools_for_model_gpt5_gets_apply_patch_and_no_edit_or_write() {
+        let tools = tools_for_model("gpt-5", false);
+        let names = tool_names(&tools);
+        assert!(names.contains(&"apply_patch"), "apply_patch missing: {names:?}");
+        assert!(!names.contains(&"edit"), "edit should be dropped: {names:?}");
+        assert!(!names.contains(&"write"), "write should be dropped: {names:?}");
+        // All other tools still present.
+        for name in ["glob", "grep", "read", "shell", "todo", "ask_peer"] {
+            assert!(names.contains(&name), "{name} missing: {names:?}");
+        }
+        assert!(is_sorted_by_name(&tools), "tools must be sorted by name: {tools:#?}");
+    }
+
+    #[test]
+    fn tools_for_model_claude_gets_edit_and_write_and_no_apply_patch() {
+        let tools = tools_for_model("claude-sonnet-4-20250514", false);
+        let names = tool_names(&tools);
+        assert!(names.contains(&"edit"), "edit missing: {names:?}");
+        assert!(names.contains(&"write"), "write missing: {names:?}");
+        assert!(
+            !names.contains(&"apply_patch"),
+            "apply_patch should be dropped for Claude: {names:?}"
+        );
+        assert!(is_sorted_by_name(&tools));
+    }
+
+    #[test]
+    fn tools_for_model_gpt4_falls_back_to_edit_and_write() {
+        // gpt-4 was not trained on apply_patch.
+        let tools = tools_for_model("gpt-4o", false);
+        let names = tool_names(&tools);
+        assert!(names.contains(&"edit"));
+        assert!(names.contains(&"write"));
+        assert!(!names.contains(&"apply_patch"), "gpt-4 should not get apply_patch: {names:?}");
+    }
+
+    #[test]
+    fn tools_for_model_minimax_and_gemini_get_edit_and_write() {
+        // The non-GPT-5 providers all use the find-and-replace
+        // (`edit`/`write`) tool pair.
+        for id in ["MiniMax-M3", "gemini-1.5-pro", "llama-3.1-70b"] {
+            let tools = tools_for_model(id, false);
+            let names = tool_names(&tools);
+            assert!(names.contains(&"edit"), "{id} missing edit: {names:?}");
+            assert!(names.contains(&"write"), "{id} missing write: {names:?}");
+            assert!(
+                !names.contains(&"apply_patch"),
+                "{id} should not get apply_patch: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tools_for_model_readonly_overrides_gpt_apply_patch() {
+        // Plan mode and ask_peer children are read-only regardless
+        // of model. Even gpt-5 must not see write tools when the
+        // permission mode is Plan.
+        let tools = tools_for_model("gpt-5", true);
+        let names = tool_names(&tools);
+        assert_eq!(
+            names,
+            vec!["glob", "grep", "read", "webfetch", "websearch"],
+            "read-only mode must return exactly the read-only subset"
+        );
+        // Crucially: apply_patch is *not* exposed in read-only mode
+        // even for gpt-5. Plan mode is a safety gate, not a
+        // capability toggle.
+        assert!(!names.contains(&"apply_patch"));
+    }
+
+    #[test]
+    fn tools_for_model_readonly_for_claude() {
+        let tools = tools_for_model("claude-sonnet-4-20250514", true);
+        let names = tool_names(&tools);
+        assert_eq!(names, vec!["glob", "grep", "read", "webfetch", "websearch"]);
+    }
+
+    #[test]
+    fn tools_for_model_output_is_stable_across_models() {
+        // The tool list must be alphabetically sorted so the wire
+        // order is identical across all turns (cache stability).
+        // Verify that both the GPT and Claude branches sort the
+        // output the same way.
+        let gpt = tools_for_model("gpt-5", false);
+        let claude = tools_for_model("claude-3-5-sonnet-latest", false);
+        assert!(is_sorted_by_name(&gpt));
+        assert!(is_sorted_by_name(&claude));
+    }
+
+    #[test]
+    fn tools_for_model_filters_are_disjoint() {
+        // The two file-mutation toolsets are mutually exclusive —
+        // no model ever sees both `apply_patch` and (`edit` or
+        // `write`). The GPT branch keeps `apply_patch`; the
+        // non-GPT branch keeps `edit`/`write`. Tuple shape is
+        // (model_id, has_apply_patch, has_edit, has_write).
+        let cases = [
+            ("gpt-5", true, false, false),    // GPT branch: apply_patch only
+            ("gpt-4o", false, true, true),    // non-GPT: edit + write
+            ("claude", false, true, true),
+            ("MiniMax-M3", false, true, true),
+        ];
+        for (id, has_patch, has_edit, has_write) in cases {
+            let tools = tools_for_model(id, false);
+            let names = tool_names(&tools);
+            assert_eq!(names.contains(&"apply_patch"), has_patch, "apply_patch in {id}: {names:?}");
+            assert_eq!(names.contains(&"edit"), has_edit, "edit in {id}: {names:?}");
+            assert_eq!(names.contains(&"write"), has_write, "write in {id}: {names:?}");
+        }
     }
 
     fn part_text(p: &ContentPart) -> Option<&str> {
@@ -1664,6 +2058,11 @@ mod tests {
     struct ScriptedProvider {
         provider_name: String,
         scripts: std::sync::Mutex<Vec<Vec<LlmEvent>>>,
+        /// When set, every `LlmRequest` the runner dispatches is
+        /// cloned into this vec. Tests use it to assert on the
+        /// exact tool list (and other request fields) the runner
+        /// produced for a given model.
+        captured_requests: Option<std::sync::Arc<std::sync::Mutex<Vec<LlmRequest>>>>,
     }
 
     impl ScriptedProvider {
@@ -1671,7 +2070,24 @@ mod tests {
             Self {
                 provider_name: provider_name.to_string(),
                 scripts: std::sync::Mutex::new(scripts),
+                captured_requests: None,
             }
+        }
+
+        fn with_capture(
+            provider_name: &str,
+            scripts: Vec<Vec<LlmEvent>>,
+        ) -> (Self, std::sync::Arc<std::sync::Mutex<Vec<LlmRequest>>>) {
+            let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink_for_provider = std::sync::Arc::clone(&sink);
+            (
+                Self {
+                    provider_name: provider_name.to_string(),
+                    scripts: std::sync::Mutex::new(scripts),
+                    captured_requests: Some(sink_for_provider),
+                },
+                sink,
+            )
         }
     }
 
@@ -1685,7 +2101,10 @@ mod tests {
             vec!["scripted-model".to_string()]
         }
 
-        async fn stream(&self, _request: LlmRequest) -> Result<LlmStream, LlmError> {
+        async fn stream(&self, request: LlmRequest) -> Result<LlmStream, LlmError> {
+            if let Some(sink) = &self.captured_requests {
+                sink.lock().unwrap().push(request);
+            }
             let script = self.scripts.lock().unwrap().remove(0);
             let events: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = LlmEvent> + Send>> = {
                 let stream = async_stream::stream! {
@@ -1787,6 +2206,21 @@ mod tests {
         scripts: Vec<Vec<LlmEvent>>,
         session_directory: &str,
     ) -> (SessionRunner, TempDir, String) {
+        run_with_scripted_model(
+            provider_name,
+            scripts,
+            session_directory,
+            "scripted-model",
+        )
+        .await
+    }
+
+    async fn run_with_scripted_model(
+        provider_name: &str,
+        scripts: Vec<Vec<LlmEvent>>,
+        session_directory: &str,
+        model_id: &str,
+    ) -> (SessionRunner, TempDir, String) {
         let tmp = TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("test.sqlite");
         let project_id = {
@@ -1817,7 +2251,7 @@ mod tests {
                 "p1".to_string(),
                 session_directory.to_string(),
                 provider_name.to_string(),
-                "scripted-model".to_string(),
+                model_id.to_string(),
             )
             .expect("create_session");
         runner
@@ -1833,6 +2267,65 @@ mod tests {
             )
             .expect("append user");
         (runner, tmp, session_id)
+    }
+
+    async fn run_with_scripted_capture(
+        provider_name: &str,
+        scripts: Vec<Vec<LlmEvent>>,
+        session_directory: &str,
+        model_id: &str,
+    ) -> (
+        SessionRunner,
+        TempDir,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<LlmRequest>>>,
+    ) {
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("test.sqlite");
+        let project_id = {
+            let db = Database::new(db_path.clone()).expect("db open");
+            db.init().expect("db init");
+            let project = crate::domain::Project {
+                id: "p1".to_string(),
+                path: session_directory.to_string(),
+                name: "arachne".to_string(),
+                tech_stack: Vec::new(),
+                created_at: chrono::Utc::now(),
+            };
+            ProjectRepository::insert(&db, &project).expect("insert project");
+            project.id
+        };
+        assert_eq!(project_id, "p1");
+
+        let session_service = SessionService::new(db_path);
+        let conv_service = ConversationService::new(tmp.path().join("conversations"));
+        let providers: Arc<ProviderRegistry> = Arc::new(ProviderRegistry::new());
+        let (scripted, capture_sink) = ScriptedProvider::with_capture(provider_name, scripts);
+        providers.register(Arc::new(scripted)).await;
+        let runner = SessionRunner::new(session_service, conv_service, providers);
+
+        let session_id = runner
+            .session_service
+            .create_session(
+                "p1".to_string(),
+                session_directory.to_string(),
+                provider_name.to_string(),
+                model_id.to_string(),
+            )
+            .expect("create_session");
+        runner
+            .conversation_service
+            .create_conversation(&session_id)
+            .expect("create conversation");
+        runner
+            .conversation_service
+            .append_message(
+                &session_id,
+                crate::MessageRole::User,
+                "please use some tools".to_string(),
+            )
+            .expect("append user");
+        (runner, tmp, session_id, capture_sink)
     }
 
     #[tokio::test]
@@ -2235,23 +2728,25 @@ mod tests {
         );
     }
 
-    /// Regression test for the opencode-style refactor: an LLM that
-    /// emits an XML-style tool call embedded in its text stream
-    /// (the OLD format) is now treated as plain text. The runner
-    /// does NOT extract tool calls from text — it relies on
-    /// structured events from the provider.
+    /// The XML tool call detector: when the model emits a tool
+    /// call as a `<tool name="x">…</tool>` (or `<invoke …>`,
+    /// `<function_calls>`, `<antml:function_calls>`, etc.) inside
+    /// the text stream, the runner strips the block from the
+    /// visible text, emits a typed `LlmEvent::InvalidToolCall`
+    /// on the event sink, and appends a synthetic
+    /// `ContentPart::tool_result` describing the violation to the
+    /// assistant message so the model sees feedback on the next
+    /// turn. This test drives a scripted provider that emits an
+    /// XML block and asserts all three.
     #[tokio::test]
-    async fn e2e_xml_text_tool_call_is_not_extracted() {
+    async fn e2e_xml_tool_call_in_text_is_stripped_and_reported() {
         init_tracing();
         let session_root = TempDir::new().expect("tempdir");
-        let session_root_path = session_root.path().to_path_buf();
-        let session_root_str = session_root_path.to_str().unwrap().to_string();
+        let session_root_str = session_root.path().to_str().unwrap().to_string();
 
-        // The scripted "LLM" emits a text block that contains the
-        // OLD XML tool format. The runner must treat the entire
-        // thing as visible text and NOT produce a `ContentPart::ToolCall`.
-        let model_text = "<read>\n<path>/etc/hostname</path>\n</read>".to_string();
-        let chunks = text_delta_chunks(&model_text, 6);
+        let model_text =
+            "before <tool name=\"read\">{\"path\":\"/etc/hostname\"}</tool> after".to_string();
+        let chunks = text_delta_chunks(&model_text, 7);
         let (runner, _tmp, session_id) = run_with_scripted(
             "scripted",
             vec![
@@ -2265,8 +2760,36 @@ mod tests {
         )
         .await;
 
+        let captured: Arc<std::sync::Mutex<Vec<LlmEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_sink = Arc::clone(&captured);
+        let runner = runner.with_event_sink(Arc::new(move |ev: SessionRunEvent| {
+            captured_for_sink.lock().unwrap().push(ev.event);
+        }));
+
         let result = runner.run(&session_id).await;
         assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        let emitted: Vec<LlmEvent> = captured.lock().unwrap().clone();
+        let invalid: Vec<&LlmEvent> = emitted
+            .iter()
+            .filter(|e| matches!(e, LlmEvent::InvalidToolCall { .. }))
+            .collect();
+        assert_eq!(
+            invalid.len(),
+            1,
+            "expected exactly one InvalidToolCall event, got: {emitted:#?}"
+        );
+        match invalid[0] {
+            LlmEvent::InvalidToolCall { name, raw, .. } => {
+                assert_eq!(name, "read", "invalid_tool_call.name should be the inner tool name");
+                assert!(
+                    raw.contains("/etc/hostname"),
+                    "raw body should contain the inner JSON, got: {raw:?}"
+                );
+            }
+            _ => unreachable!(),
+        }
 
         let msgs = runner
             .conversation_service
@@ -2280,19 +2803,40 @@ mod tests {
             .expect("non-empty assistant message");
         let parts: Vec<ContentPart> = serde_json::from_str(&assistant.content).expect("parts");
 
+        // The XML block must NOT be a real ToolCall part — it was
+        // never an actual tool call.
         assert!(
             !parts
                 .iter()
                 .any(|p| matches!(p, ContentPart::ToolCall { .. })),
-            "xml-style tool call in text must NOT be parsed as a ToolCall, got: {parts:#?}"
+            "xml block must NOT be parsed as a real ToolCall, got: {parts:#?}"
         );
-        assert!(
-            !parts
-                .iter()
-                .any(|p| matches!(p, ContentPart::ToolResult { .. })),
-            "no tool result should be produced when no tool was called, got: {parts:#?}"
+
+        // The runner must have appended a synthetic ToolResult
+        // describing the violation so the model sees feedback on
+        // the next turn.
+        let feedback: Vec<&ContentPart> = parts
+            .iter()
+            .filter(|p| matches!(p, ContentPart::ToolResult { .. }))
+            .collect();
+        assert_eq!(
+            feedback.len(),
+            1,
+            "expected one synthetic ToolResult with the violation, got: {parts:#?}"
         );
-        // The XML is preserved as visible text.
+        match feedback[0] {
+            ContentPart::ToolResult { name, result, .. } => {
+                assert_eq!(name, "read", "feedback name should be the inner tool name");
+                let serialized = serde_json::to_string(result).unwrap_or_default();
+                assert!(
+                    serialized.contains("do not emit tool calls as XML"),
+                    "feedback message should tell the model to use the native tool-calling API, got: {serialized}"
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        // The visible text must NOT contain the XML block.
         let combined_text: String = parts
             .iter()
             .filter_map(|p| match p {
@@ -2302,9 +2846,166 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         assert!(
-            combined_text.contains("<read>"),
-            "xml text must remain visible to the user, got: {combined_text:?}"
+            !combined_text.contains("<tool"),
+            "xml block must be stripped from visible text, got: {combined_text:?}"
         );
+        assert!(
+            !combined_text.contains("</tool>"),
+            "xml block close must be stripped from visible text, got: {combined_text:?}"
+        );
+        assert!(
+            combined_text.contains("before") && combined_text.contains("after"),
+            "surrounding text must remain visible, got: {combined_text:?}"
+        );
+    }
+
+    /// End-to-end: a GPT-5 model session must receive `apply_patch`
+    /// in the request body's tool list and must NOT receive `edit`
+    /// or `write`. Mirrors opencode's per-model `apply_patch` ↔
+    /// `edit`/`write` toggle (see `ToolRegistry.tools` in opencode).
+    /// The test drives a scripted provider with a capture sink so
+    /// we can introspect the exact `LlmRequest` the runner built.
+    #[tokio::test]
+    async fn e2e_gpt5_session_advertises_apply_patch_not_edit_or_write() {
+        init_tracing();
+        let (runner, _tmp, session_id, capture) = run_with_scripted_capture(
+            "scripted",
+            vec![vec![LlmEvent::Finish {
+                reason: FinishReason::Stop,
+                usage: None,
+            }]],
+            "/tmp",
+            "gpt-5",
+        )
+        .await;
+
+        let result = runner.run(&session_id).await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        let captured: Vec<LlmRequest> = capture.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "expected exactly one captured request, got {}",
+            captured.len()
+        );
+        let request = &captured[0];
+        let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"apply_patch"),
+            "apply_patch missing for gpt-5: {names:?}"
+        );
+        assert!(
+            !names.contains(&"edit"),
+            "edit should be dropped for gpt-5: {names:?}"
+        );
+        assert!(
+            !names.contains(&"write"),
+            "write should be dropped for gpt-5: {names:?}"
+        );
+        // Other tools still present so the model can read, search, etc.
+        for name in ["glob", "grep", "read", "shell", "todo"] {
+            assert!(names.contains(&name), "{name} missing for gpt-5: {names:?}");
+        }
+        // Stable wire order — prompt cache prefix depends on it.
+        let sorted: Vec<&str> = {
+            let mut s = names.clone();
+            s.sort();
+            s
+        };
+        assert_eq!(names, sorted, "tool list must be sorted alphabetically: {names:?}");
+    }
+
+    /// End-to-end counterpart: a Claude session gets `edit` and
+    /// `write` and does NOT get `apply_patch`.
+    #[tokio::test]
+    async fn e2e_claude_session_advertises_edit_and_write_not_apply_patch() {
+        init_tracing();
+        let (runner, _tmp, session_id, capture) = run_with_scripted_capture(
+            "scripted",
+            vec![vec![LlmEvent::Finish {
+                reason: FinishReason::Stop,
+                usage: None,
+            }]],
+            "/tmp",
+            "claude-sonnet-4-20250514",
+        )
+        .await;
+
+        let result = runner.run(&session_id).await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        let captured: Vec<LlmRequest> = capture.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1);
+        let request = &captured[0];
+        let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"edit"), "edit missing for claude: {names:?}");
+        assert!(names.contains(&"write"), "write missing for claude: {names:?}");
+        assert!(
+            !names.contains(&"apply_patch"),
+            "apply_patch should be dropped for claude: {names:?}"
+        );
+    }
+
+    /// End-to-end: a minimax session (non-GPT, non-OSS) gets
+    /// `edit` and `write` and not `apply_patch`, matching the
+    /// default for everything that isn't the GPT-5 family.
+    #[tokio::test]
+    async fn e2e_minimax_session_advertises_edit_and_write_not_apply_patch() {
+        init_tracing();
+        let (runner, _tmp, session_id, capture) = run_with_scripted_capture(
+            "scripted",
+            vec![vec![LlmEvent::Finish {
+                reason: FinishReason::Stop,
+                usage: None,
+            }]],
+            "/tmp",
+            "MiniMax-M3",
+        )
+        .await;
+
+        let result = runner.run(&session_id).await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        let captured: Vec<LlmRequest> = capture.lock().unwrap().clone();
+        let names: Vec<&str> = captured[0].tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"edit"));
+        assert!(names.contains(&"write"));
+        assert!(!names.contains(&"apply_patch"));
+    }
+
+    /// Plan mode (read-only) on a GPT-5 model must not surface
+    /// `apply_patch` even though the model class would normally
+    /// get it. Plan mode is a safety gate, not a model preference.
+    #[tokio::test]
+    async fn e2e_plan_mode_on_gpt5_omits_apply_patch() {
+        init_tracing();
+        let (runner, _tmp, session_id, capture) = run_with_scripted_capture(
+            "scripted",
+            vec![vec![LlmEvent::Finish {
+                reason: FinishReason::Stop,
+                usage: None,
+            }]],
+            "/tmp",
+            "gpt-5",
+        )
+        .await;
+        let runner = runner.with_mode(crate::permission::PermissionMode::Plan);
+
+        let result = runner.run(&session_id).await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        let captured: Vec<LlmRequest> = capture.lock().unwrap().clone();
+        let names: Vec<&str> = captured[0].tools.iter().map(|t| t.name.as_str()).collect();
+        // Read-only subset only.
+        assert_eq!(
+            names,
+            vec!["glob", "grep", "read", "webfetch", "websearch"],
+            "Plan mode must be read-only regardless of model"
+        );
+        assert!(!names.contains(&"apply_patch"));
+        assert!(!names.contains(&"edit"));
+        assert!(!names.contains(&"write"));
     }
 
     #[test]
@@ -2331,6 +3032,125 @@ mod tests {
             )
             .expect("upsert");
         assert!(!runner.has_unfulfilled_tool_calls(&session_id));
+    }
+
+    /// End-to-end: a `shell` tool call that produces more lines
+    /// than the head-bounded cap should be tail-truncated (last N
+    /// lines kept, head dropped) per opencode's `tail()` policy.
+    /// A non-shell tool of the same size would keep the *first*
+    /// N lines instead.
+    #[tokio::test]
+    async fn e2e_shell_uses_tail_bound_output() {
+        use crate::llm::events::FinishReason;
+        use crate::llm::events::LlmEvent;
+
+        init_tracing();
+        // Lines 0..MAX_TOOL_OUTPUT_LINES plus 50 more, then the
+        // last line is a sentinel "TRAILING_ERROR". Tail-bound
+        // output should keep the last MAX_TOOL_OUTPUT_LINES lines
+        // and drop the head (lines 0..50). The sentinel should
+        // survive.
+        let extra: usize = 50;
+        let total_lines: usize = crate::tools::output_bounds::MAX_TOOL_OUTPUT_LINES + extra;
+        let shell_cmd = format!(
+            "i=0; while [ $i -lt {total_lines} ]; do echo \"line $i\"; i=$((i+1)); done; echo TRAILING_ERROR"
+        );
+
+        // Build a runner that uses real `scripted` provider
+        // (capture sink) and the real shell tool via the
+        // `run_with_structured_tool_call` helper adapted to
+        // produce a shell call.
+        let tool_call = LlmEvent::ToolCall {
+            id: "call_shell_1".to_string(),
+            name: "shell".to_string(),
+            input: serde_json::json!({ "command": shell_cmd }),
+            provider_executed: Some(false),
+        };
+
+        // Two-turn script: turn 1 emits the shell call + finish;
+        // turn 2 (after the tool result is in) is a brief
+        // acknowledgment + stop.
+        let turn1 = vec![
+            tool_call,
+            LlmEvent::Finish {
+                reason: FinishReason::ToolCalls,
+                usage: None,
+            },
+        ];
+        let turn2 = vec![
+            LlmEvent::TextDelta {
+                id: "text-0".to_string(),
+                text: "saw the trailing error.".to_string(),
+            },
+            LlmEvent::Finish {
+                reason: FinishReason::Stop,
+                usage: None,
+            },
+        ];
+
+        let (runner, _tmp, session_id) = run_with_scripted(
+            "scripted",
+            vec![turn1, turn2],
+            "/tmp",
+        )
+        .await;
+        // Plan mode is the runner default; it would deny shell.
+        // Build mode allows it.
+        let runner = runner.with_mode(crate::permission::PermissionMode::Build);
+
+        let result = runner.run(&session_id).await;
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        // Find the assistant message containing the shell call's
+        // tool result. The runner dispatches shell through the
+        // real tool, then bounds the result via
+        // `tail_bound_output` (because tool name == "shell").
+        let msgs = runner
+            .conversation_service
+            .get_messages(&session_id)
+            .expect("get_messages");
+        let assistant_with_result = msgs
+            .iter()
+            .rev()
+            .filter(|m| m.role == "assistant")
+            .find(|m| {
+                !m.content.is_empty()
+                    && m.content != "[]"
+                    && serde_json::from_str::<Vec<ContentPart>>(&m.content)
+                        .map(|parts| {
+                            parts
+                                .iter()
+                                .any(|p| matches!(p, ContentPart::ToolResult { .. }))
+                        })
+                        .unwrap_or(false)
+            })
+            .expect("non-empty assistant message containing a ToolResult");
+        let parts: Vec<ContentPart> =
+            serde_json::from_str(&assistant_with_result.content).expect("parts");
+
+        let result_parts: Vec<&ContentPart> = parts
+            .iter()
+            .filter(|p| matches!(p, ContentPart::ToolResult { .. }))
+            .collect();
+        assert_eq!(result_parts.len(), 1, "expected one ToolResult, got: {parts:#?}");
+
+        // The bounded text should:
+        //  1. NOT contain the first 50 dropped lines.
+        //  2. Contain the trailing sentinel (proves tail-style).
+        //  3. End with the truncation marker.
+        let result_json = serde_json::to_string(result_parts[0]).unwrap();
+        assert!(
+            !result_json.contains("line 0\n") && !result_json.contains("line 49\n"),
+            "head of shell output should be tail-truncated, but the bounded result still contains early lines: {result_json}"
+        );
+        assert!(
+            result_json.contains("TRAILING_ERROR"),
+            "trailing sentinel should survive tail-bound truncation, got: {result_json}"
+        );
+        assert!(
+            result_json.contains("output truncated"),
+            "tail-bound result should include the truncation marker, got: {result_json}"
+        );
     }
 
     #[test]

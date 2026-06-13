@@ -1,3 +1,12 @@
+//! In-process pub/sub for the agent runtime. **Planned future API**.
+//!
+//! `MessageBus` is a topic-keyed fan-out of `String` messages
+//! between background jobs (e.g. the compactor, the tool-result
+//! pruner, child subagent completions). Today the runner uses
+//! `SubagentRegistry::take_completions` for the only cross-job
+//! signalling it needs; the bus will be wired up when the
+//! pruner / background jobs land. Do not delete.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

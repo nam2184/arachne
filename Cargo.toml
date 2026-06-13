@@ -1,3 +1,41 @@
 [workspace]
 members = ["agents", "src-tauri"]
 resolver = "2"
+
+# Release profile tuned for the bundled Tauri binary.
+# - `lto = "thin"` is the cheap end of LTO; the heavy version
+#   (`"fat"`) is several minutes of extra link time for ~3-5%
+#   binary size, not worth it.
+# - `codegen-units = 1` enables whole-program optimisation for the
+#   Rust side at the cost of slower release builds.
+# - `panic = "abort"` strips unwinding tables; saves a few hundred
+#   KB and is fine for a Tauri CLI that turns errors into user
+#   messages, not panics.
+# - `strip = "debuginfo"` keeps symbol tables in a separate file
+#   for profilers (pprof, samply) without bloating the binary.
+# - `incremental = false` because codegen-units = 1 plus LTO does
+#   not benefit from incremental compilation.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+incremental = false
+opt-level = 3
+
+# Dev profile inherits the default opt-level = 0 (fast compile,
+# slow runtime) plus these overrides. `debug = 1` is enough for
+# `dbg!` and stack traces; line-tables-only mode is faster to
+# link than full debug info.
+[profile.dev]
+debug = 1
+incremental = true
+opt-level = 0
+
+# Release-with-debug is the profile CI / release-candidate
+# builds use. Keeps debug symbols available for crash reports
+# while still applying LTO and strip.
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = "none"

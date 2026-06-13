@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::file_mutation::FileMutationService;
 use crate::{ToolCall, ToolResult};
@@ -32,10 +32,6 @@ pub fn run_with_path(call: &ToolCall, path: &Path) -> ToolResult {
         Ok(_) => success("write", format!("Wrote {}", target.canonical.display())),
         Err(error) => failure("write", error.to_string()),
     }
-}
-
-pub fn run_with_pathbuf(call: &ToolCall, path: PathBuf) -> ToolResult {
-    run_with_path(call, &path)
 }
 
 #[cfg(test)]

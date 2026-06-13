@@ -96,7 +96,17 @@ impl ContentPart {
 
     pub fn as_prompt_text(&self) -> Option<String> {
         match self {
-            Self::Text { text } => Some(text.clone()),
+            Self::Text { text } => {
+                // Drop empty text blocks before serializing: they
+                // contribute nothing to the model but still cost
+                // tokens in array form (`{"type":"text","text":""}`)
+                // and waste cache prefix bytes.
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text.clone())
+                }
+            }
             Self::ToolCall { id, name, input } => Some(format!(
                 "<tool_call id=\"{id}\" name=\"{name}\">\n<input>{}</input>\n</tool_call>",
                 serde_json::to_string(input).unwrap_or_else(|_| "null".to_string())
@@ -128,6 +138,13 @@ pub struct LlmRequest {
     pub max_tokens: Option<u32>,
     pub top_p: Option<f32>,
     pub stop: Option<Vec<String>>,
+    /// Stable session identifier. Providers use this to set
+    /// `prompt_cache_key` (OpenAI), `prompt_cache_key` /
+    /// `prompt_cache_key` (OpenRouter), or `x-session-affinity`
+    /// (Anthropic). Same value across all turns of a session
+    /// pins the request to the same backend shard and keeps the
+    /// automatic prompt cache warm.
+    pub session_id: Option<String>,
 }
 
 impl LlmRequest {
@@ -142,6 +159,7 @@ impl LlmRequest {
             max_tokens: None,
             top_p: None,
             stop: None,
+            session_id: None,
         }
     }
 
@@ -166,6 +184,11 @@ impl LlmRequest {
     /// `tools` via the provider's request builder.
     pub fn with_tools(mut self, tools: impl IntoIterator<Item = ToolDefinition>) -> Self {
         self.tools.extend(tools);
+        self
+    }
+
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
         self
     }
 

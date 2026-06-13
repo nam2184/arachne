@@ -26,7 +26,7 @@ use crate::llm::SubagentRegistry;
 use crate::permission::{PermissionMode, PermissionService};
 use crate::permission_v2::PermissionService as V2PermissionService;
 use crate::sandbox::{DoomLoopDetector, NetworkPolicy, SandboxPolicy, ShellExit, ShellPolicy};
-use crate::{Tool, ToolCall, ToolResult};
+use crate::{ToolCall, ToolResult};
 
 pub use output_bounds::{
     bound_tool_output, estimate_tokens, BoundedOutput, CHARS_PER_TOKEN, GLOB_DEFAULT_LIMIT,
@@ -130,28 +130,6 @@ impl SandboxedContext {
     }
 }
 
-pub fn default_tools() -> Vec<Tool> {
-    vec![
-        Tool::new("read", "Read a file from disk"),
-        Tool::new("write", "Write content to a file"),
-        Tool::new("edit", "Replace text in an existing file"),
-        Tool::new("apply_patch", "Apply a file-oriented patch"),
-        Tool::new("glob", "Find files by glob-like pattern"),
-        Tool::new("grep", "Search file contents"),
-        Tool::new("shell", "Run a shell command"),
-        Tool::new("task", "Run a subagent task"),
-        Tool::new("skill", "Load a skill by name"),
-        Tool::new("todo", "Update the session todo list"),
-        Tool::new("question", "Ask the user a structured question"),
-        Tool::new("webfetch", "Fetch a web URL"),
-        Tool::new("websearch", "Search the web"),
-        Tool::new("lsp", "Query language-server context"),
-        Tool::new("plan", "Enter or exit planning mode"),
-        Tool::new("external_directory", "Request external directory access"),
-        Tool::new("invalid", "Report invalid tool calls"),
-    ]
-}
-
 pub fn run_tool(call: &ToolCall) -> ToolResult {
     run_tool_with_context(call, &ToolContext::default())
 }
@@ -191,8 +169,9 @@ pub fn run_tool_with_context(call: &ToolCall, context: &ToolContext) -> ToolResu
 }
 
 /// Async tool dispatch for tools that need the `ToolRuntime` (sub-sessions,
-/// etc.). Falls back to the sync path for everything else. The agent
-/// runner uses this for any tool whose name is `task` or `ask_peer`.
+/// etc.) or that need to await async I/O (HTTP). Falls back to the
+/// sync path for everything else. The agent runner uses this for
+/// any tool whose name is `task`, `ask_peer`, or `webfetch`.
 pub async fn run_tool_async(call: &ToolCall, runtime: &ToolRuntime) -> ToolResult {
     if let Err(error) = PermissionService::new(PermissionMode::Build).assert_tool_call(call) {
         return failure(&call.name, error.to_string());
@@ -201,6 +180,10 @@ pub async fn run_tool_async(call: &ToolCall, runtime: &ToolRuntime) -> ToolResul
     match call.name.as_str() {
         "task" => task::run_async(call, runtime.clone()).await,
         "ask_peer" => ask_peer::run_async(call, runtime.clone()).await,
+        // `webfetch` performs a real HTTP GET. Doing it on the
+        // async path keeps the executor unblocked. It doesn't need
+        // the `ToolRuntime` (no sub-sessions, no message bus).
+        "webfetch" => webfetch::run_async(call).await,
         // Everything else: defer to the sync path. The caller is already
         // running in an async context, but the underlying tool is sync.
         // Thread the caller's project_root through so file-system
@@ -627,9 +610,21 @@ mod tests {
 
     #[test]
     fn sandboxed_webfetch_allows_public_url() {
+        // The sandboxed path is the sync dispatcher; real network
+        // I/O is on the async path. The sandboxed success
+        // criterion here is therefore: the URL passes the
+        // network policy check (i.e. isn't loopback-blocked), and
+        // the dispatch reaches the `webfetch` tool. The
+        // async-required error is the expected terminal state
+        // for the sync path; the previous "validated URL"
+        // success was a stub.
         let (ctx, _dir) = make_context();
         let result = run_tool_sandboxed(&call("webfetch", &[("url", "https://example.com")]), &ctx);
-        assert!(result.success, "result: {:?}", result);
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            !result.success && error.contains("async runtime"),
+            "expected async-routing error (network policy passed), got: {result:?}"
+        );
     }
 }
 

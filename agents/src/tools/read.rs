@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::{ToolCall, ToolResult};
 
@@ -27,10 +27,6 @@ pub fn run_with_path(call: &ToolCall, path: &Path) -> ToolResult {
         Ok(content) => success("read", format_lines(&content, offset, limit)),
         Err(error) => failure("read", error.to_string()),
     }
-}
-
-pub fn run_with_pathbuf(call: &ToolCall, path: PathBuf) -> ToolResult {
-    run_with_path(call, &path)
 }
 
 fn format_lines(content: &str, offset: usize, limit: Option<usize>) -> String {
