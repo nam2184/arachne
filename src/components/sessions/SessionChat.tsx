@@ -88,7 +88,14 @@ export function SessionChat({
   // active mode is sent to the backend on each prompt and injected into
   // the LLM's context as a synthetic user message.
   const [mode, setMode] = useState<ChatMode>("plan");
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollViewportRef = useRef<HTMLDivElement>(null);
+  // True when the user is "pinned" to the bottom of the chat —
+  // within `SCROLL_BOTTOM_THRESHOLD_PX` of the scrollHeight.
+  // Updated on every user scroll. While pinned, new streamed
+  // content auto-scrolls. When the user scrolls up to read
+  // history, the auto-scroll stops, so they can review past
+  // turns without the view jumping.
+  const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
   const inputRef = useRef<HTMLInputElement>(null);
   const dragRef = useRef<{
     pointerId: number;
@@ -115,11 +122,53 @@ export function SessionChat({
     setConfigError(null);
   }, [session.id, session.provider, session.model]);
 
+  // Auto-scroll on streaming content, but only when the user is
+  // pinned to the bottom. A small threshold (in px) absorbs
+  // sub-pixel rounding and wheel-tick imprecision — the user
+  // is "pinned" as long as they're within 32 px of the bottom.
+  // Once they scroll up to read history, the auto-scroll
+  // pauses. A subsequent scroll back to the bottom re-arms
+  // it. This matches the behavior of every chat app from Slack
+  // to the GitHub issue page.
+  const SCROLL_BOTTOM_THRESHOLD_PX = 32;
+
+  // Single source of truth for the "is the user at the bottom"
+  // predicate. Called on every scroll event AND on every
+  // mutation of the messages array (so the threshold check
+  // stays accurate as the viewport grows from a stream).
+  const updatePinned = () => {
+    const el = scrollViewportRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setIsPinnedToBottom(distanceFromBottom <= SCROLL_BOTTOM_THRESHOLD_PX);
+  };
+
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [isSending, messages]);
+    const el = scrollViewportRef.current;
+    if (!el) return;
+    el.addEventListener("scroll", updatePinned, { passive: true });
+    // Also re-check on resize (e.g. chat width changes): the
+    // "clientHeight" changes and the pinned calculation would
+    // be stale.
+    const observer = new ResizeObserver(updatePinned);
+    observer.observe(el);
+    updatePinned();
+    return () => {
+      el.removeEventListener("scroll", updatePinned);
+      observer.disconnect();
+    };
+  }, []);
+
+  // Auto-scroll when the model is streaming new content AND
+  // the user is pinned. When the user has scrolled up to read
+  // history, we do nothing — the streamed content keeps
+  // arriving, the chat just doesn't jump.
+  useEffect(() => {
+    if (!isPinnedToBottom) return;
+    const el = scrollViewportRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [isSending, messages, isPinnedToBottom]);
 
   const handleSend = async () => {
     const content = input.trim();
@@ -350,7 +399,7 @@ export function SessionChat({
             <p className={cn("mt-2 text-xs", configError ? "text-[#ff5f5f]" : "text-[#bdbdbd]")}>{configError ?? configStatus}</p>
           )}
         </div>
-        <ScrollArea className="flex-1 px-6 py-4" ref={scrollRef}>
+        <ScrollArea className="flex-1 px-6 py-4" viewportRef={scrollViewportRef}>
           <div className="space-y-4">
             {messages.length === 0 ? (
               <div className="flex h-full items-center justify-center">

@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev --features dev-logs",
-    "tauri:prod": "tauri build --features prod-logs"
+    "tauri:prod": "tauri build --features prod-logs",
+    "test:providers": "sh -c 'if [ -f .env ]; then set -a; . ./.env; set +a; fi; cargo test -p arachne-agents live_smoke_streams_configured_aisdk_providers_from_env -- --ignored --nocapture'"
   },
   "dependencies": {
     "@radix-ui/react-scroll-area": "^1.2.10",

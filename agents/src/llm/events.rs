@@ -202,10 +202,8 @@ pub enum LlmEvent {
     ProviderError {
         message: String,
     },
-    /// Emitted when a parent session spawns a child sub-agent (via the
-    /// `task` tool) or asks a peer session a question (via the
-    /// `ask_peer` tool). The UI can use this to render a "consulted
-    /// peer / spawned sub-agent" indicator under the parent's bubble.
+    /// Emitted when a parent session spawns child work. The UI can use this
+    /// to render a spawned sub-agent indicator under the parent's bubble.
     TaskCall {
         id: String,
         child_session_id: String,
@@ -227,7 +225,6 @@ pub enum LlmEvent {
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
     Task,
-    AskPeer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,7 +268,11 @@ impl LlmEvent {
     }
 
     /// Convenience constructor for `LlmEvent::InvalidToolCall`.
-    pub fn invalid_tool_call(id: impl Into<String>, name: impl Into<String>, raw: impl Into<String>) -> Self {
+    pub fn invalid_tool_call(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        raw: impl Into<String>,
+    ) -> Self {
         LlmEvent::InvalidToolCall {
             id: id.into(),
             name: name.into(),

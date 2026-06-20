@@ -94,13 +94,14 @@ impl SessionRepository {
     pub fn insert(db: &Database, session: &AgentSession) -> Result<(), String> {
         db.connection()
             .execute(
-                "INSERT INTO agent_sessions (id, project_id, directory, provider, model, parent_session_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO agent_sessions (id, project_id, directory, provider, model, summary_json, parent_session_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     session.id,
                     session.project_id,
                     session.directory,
                     session.provider,
                     session.model,
+                    session.summary_json,
                     session.parent_session_id,
                     session.created_at.to_rfc3339()
                 ],
@@ -115,7 +116,7 @@ impl SessionRepository {
             .prepare(
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
-                       s.parent_session_id,
+                       s.parent_session_id, s.summary_json,
                        (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id
                 FROM agent_sessions s
                 ",
@@ -137,7 +138,7 @@ impl SessionRepository {
             .prepare(
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
-                       s.parent_session_id,
+                       s.parent_session_id, s.summary_json,
                        (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id
                 FROM agent_sessions s
                 WHERE s.id = ?1
@@ -156,7 +157,7 @@ impl SessionRepository {
             .prepare(
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
-                       s.parent_session_id,
+                       s.parent_session_id, s.summary_json,
                        (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id
                 FROM agent_sessions s
                 WHERE s.project_id = ?1
@@ -219,7 +220,7 @@ impl SessionRepository {
             .prepare(
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
-                       s.parent_session_id,
+                       s.parent_session_id, s.summary_json,
                        (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id
                 FROM agent_sessions s
                 WHERE s.parent_session_id = ?1
@@ -245,6 +246,20 @@ impl SessionRepository {
             .execute(
                 "UPDATE agent_sessions SET provider = ?1, model = ?2 WHERE id = ?3",
                 params![provider, model, id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn update_summary(
+        db: &Database,
+        id: &str,
+        summary_json: Option<&str>,
+    ) -> Result<(), String> {
+        db.connection()
+            .execute(
+                "UPDATE agent_sessions SET summary_json = ?1 WHERE id = ?2",
+                params![summary_json, id],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -443,7 +458,8 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
         directory: row.get(2)?,
         provider: row.get(3)?,
         model: row.get(4)?,
-        group_id: row.get(7)?,
+        summary_json: row.get(7)?,
+        group_id: row.get(8)?,
         parent_session_id: if parent_session_id.as_deref() == Some("") {
             None
         } else {
@@ -502,6 +518,7 @@ mod tests {
             provider: "anthropic".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
             group_id: None,
+            summary_json: None,
             parent_session_id: None,
             created_at: ts(2026, 1, 2, 12, 0, 0),
         }

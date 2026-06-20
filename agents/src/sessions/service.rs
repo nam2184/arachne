@@ -28,9 +28,8 @@ impl SessionService {
     }
 
     /// Same as `create_session` but with an optional `parent_session_id` for
-    /// sub-agents / `ask_peer` children. When `parent.is_some()` the
-    /// directory is allowed to differ from the caller's (the `ask_peer`
-    /// flow points the child at the peer's directory) but it still must
+    /// sub-agents and peer-tool subsessions. When `parent.is_some()` the
+    /// directory is allowed to differ from the caller's but it still must
     /// exist.
     pub fn create_session_with_parent(
         &self,
@@ -54,6 +53,11 @@ impl SessionService {
         session.parent_session_id = parent;
         let id = session.id.clone();
         SessionRepository::insert(&db, &session)?;
+        if session.parent_session_id.is_none() {
+            if let Err(error) = self.refresh_session_summary(&id) {
+                tracing::warn!(session_id = %id, error = %error, "failed to generate routing summary");
+            }
+        }
         Ok(id)
     }
 
@@ -63,6 +67,20 @@ impl SessionService {
 
     pub fn get_all_sessions(&self) -> Result<Vec<AgentSession>, String> {
         SessionRepository::list(&self.db()?)
+    }
+
+    pub fn sessions_in_group(&self, group_id: &str) -> Result<Vec<AgentSession>, String> {
+        let groups = self.get_all_groups()?;
+        let Some(group) = groups.into_iter().find(|group| group.id == group_id) else {
+            return Ok(Vec::new());
+        };
+        let mut sessions = Vec::new();
+        for session_id in group.session_ids {
+            if let Some(session) = self.get_session(&session_id)? {
+                sessions.push(session);
+            }
+        }
+        Ok(sessions)
     }
 
     pub fn delete_session(&self, id: &str) -> Result<(), String> {
@@ -104,6 +122,24 @@ impl SessionService {
         model: &str,
     ) -> Result<(), String> {
         SessionRepository::update_provider(&self.db()?, session_id, provider, model)
+    }
+
+    pub fn update_session_summary(
+        &self,
+        session_id: &str,
+        summary_json: Option<&str>,
+    ) -> Result<(), String> {
+        SessionRepository::update_summary(&self.db()?, session_id, summary_json)
+    }
+
+    pub fn refresh_session_summary(&self, session_id: &str) -> Result<(), String> {
+        let session = self
+            .get_session(session_id)?
+            .ok_or_else(|| format!("session not found: {session_id}"))?;
+        let summary = crate::routing::DiscoveryDispatcher::default()
+            .discover(std::path::Path::new(&session.directory));
+        let json = serde_json::to_string(&summary).map_err(|e| e.to_string())?;
+        self.update_session_summary(session_id, Some(&json))
     }
 
     fn db(&self) -> Result<Database, String> {
@@ -516,7 +552,7 @@ mod tests {
             )
             .unwrap();
 
-        // A different directory for the child (e.g. peer ask_peer use
+        // A different directory for the child (e.g. peer-tool subsession use
         // case).
         let peer_dir = tempfile::tempdir().unwrap();
         let child_id = service

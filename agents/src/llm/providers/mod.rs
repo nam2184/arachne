@@ -8,20 +8,31 @@ use tokio_stream::Stream;
 use super::events::LlmEvent;
 use super::request::{LlmError, LlmRequest, LlmResponse};
 
-pub mod anthropic;
+mod aisdk_provider;
+mod aisdk_wrappers;
 pub mod minimax_token_plan;
-pub mod openai;
-mod openai_compatible_chat;
-pub mod xml_tool_call;
+mod openai_compatible_backend;
+mod openai_compatible_http;
+mod openai_compatible_sdk;
 
-pub use anthropic::AnthropicProvider;
+pub use aisdk_provider::{
+    api_key_env as aisdk_api_key_env, docs_url as aisdk_docs_url,
+    provider_base_url_env as aisdk_provider_base_url_env,
+    provider_model_env as aisdk_provider_model_env,
+    supported_provider_names as aisdk_supported_provider_names,
+};
+pub use aisdk_wrappers::provider_from_config as aisdk_provider_from_config;
+pub use aisdk_wrappers::*;
 pub use minimax_token_plan::MiniMaxTokenPlanProvider;
-pub use openai::OpenAiProvider;
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     fn provider_name(&self) -> &str;
     fn supported_models(&self) -> Vec<String>;
+
+    fn backend_name(&self) -> &str {
+        "unknown"
+    }
 
     async fn stream(&self, request: LlmRequest) -> Result<LlmStream, LlmError>;
 
@@ -79,4 +90,38 @@ pub(super) fn log_sse_event_body(provider: &str, model: &str, body: &str) {
         body = %body_display,
         "llm sse response body"
     );
+}
+
+pub(super) fn openai_compatible_endpoint_url(base_url: &str, path: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    let path = path.trim_start_matches('/');
+    if base_url.ends_with(&format!("/{path}")) {
+        base_url.to_string()
+    } else {
+        format!("{base_url}/{path}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_url_appends_chat_completions_to_base_api_url() {
+        assert_eq!(
+            openai_compatible_endpoint_url("https://api.minimax.io/v1", "chat/completions"),
+            "https://api.minimax.io/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn endpoint_url_does_not_double_append_chat_completions() {
+        assert_eq!(
+            openai_compatible_endpoint_url(
+                "https://api.minimax.io/v1/chat/completions/",
+                "chat/completions",
+            ),
+            "https://api.minimax.io/v1/chat/completions"
+        );
+    }
 }

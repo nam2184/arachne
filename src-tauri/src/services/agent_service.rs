@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use arachne_agents::{
-    llm::providers::{AnthropicProvider, MiniMaxTokenPlanProvider, OpenAiProvider},
+    llm::providers::{aisdk_provider_from_config, MiniMaxTokenPlanProvider},
     llm::{ContentPart, SubagentRegistry},
+    sandbox::SandboxPolicy,
+    tools::SandboxedContext,
     CompactionConfig, CompactionOutcome, CompactionRequest, CompactionService,
     ConversationService, LlmProvider, MessageRole, ModelRegistry, ProviderProtocol,
     ProviderRegistry, ProviderService, SessionError, SessionRunEvent, SessionRunner,
@@ -89,6 +91,18 @@ impl AgentService {
         .with_compactor(Arc::clone(&self.compactor))
     }
 
+    /// Build a production runner for a concrete session. Tool execution is
+    /// rooted at `directory` and enforced by the v2 sandbox path.
+    pub fn build_runner_for_session(&self, session_id: &str, directory: &str) -> SessionRunner {
+        let permissions = self.permission_map.get_or_create(session_id);
+        let sandbox = SandboxPolicy::new(std::path::PathBuf::from(directory));
+        let sandboxed_ctx = Arc::new(SandboxedContext::new(sandbox, Arc::clone(&permissions)));
+
+        self.build_runner()
+            .with_permissions(permissions)
+            .with_sandboxed_context(sandboxed_ctx)
+    }
+
     pub async fn compact_now(
         &self,
         session_id: &str,
@@ -126,15 +140,10 @@ impl AgentService {
             ProviderProtocol::OpenAI if config.name == "minimax" => {
                 Arc::new(MiniMaxTokenPlanProvider::from_config(&config))
             }
-            ProviderProtocol::OpenAI if config.name == "openai" => Arc::new(OpenAiProvider::new(
-                config.api_key.clone(),
-                config.base_url.clone(),
-            )),
-            ProviderProtocol::Anthropic if config.name == "anthropic" => Arc::new(AnthropicProvider::new(
-                config.api_key.clone(),
-                config.base_url.clone(),
-            )),
-            _ => return,
+            _ => match aisdk_provider_from_config(&config) {
+                Some(provider) => provider,
+                None => return,
+            },
         };
 
         self.providers.register(provider).await;
@@ -175,11 +184,7 @@ impl AgentService {
         self.refresh_provider(&session.provider).await;
 
         let session_id_clone = session_id.to_string();
-        let session_service = Arc::clone(&self.session_service);
-        let conversation_service = Arc::clone(&self.conversation_service);
-        let providers = Arc::clone(&self.providers);
         let registry = Arc::clone(&self.subagent_registry);
-        let permissions = self.permission_map.get_or_create(session_id);
         let app_for_events = app.clone();
         let event_sink = Arc::new(move |event: SessionRunEvent| {
             emit_agent_event(
@@ -193,10 +198,9 @@ impl AgentService {
         });
 
         let runner = self
-            .build_runner()
+            .build_runner_for_session(session_id, &session.directory)
             .with_event_sink(event_sink)
             .with_subagent_registry(Arc::clone(&registry))
-            .with_permissions(permissions)
             .with_mode(mode);
         let run_result = runner.run(&session_id_clone).await;
 
@@ -265,6 +269,6 @@ fn append_assistant_error(
     let content = serde_json::to_string(&vec![ContentPart::text(message)])
         .unwrap_or_else(|_| message.to_string());
     conversation_service
-        .append_message(session_id, MessageRole::Assistant, content)
+        .append_ui_message(session_id, MessageRole::Assistant, content)
         .map(|_| ())
 }

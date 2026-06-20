@@ -29,6 +29,7 @@ impl Database {
                 directory TEXT NOT NULL,
                 provider TEXT NOT NULL,
                 model TEXT NOT NULL,
+                summary_json TEXT,
                 parent_session_id TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (project_id) REFERENCES projects(id)
@@ -94,6 +95,10 @@ impl Database {
         );
         let _ = self.conn.execute(
             "ALTER TABLE agent_sessions ADD COLUMN parent_session_id TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE agent_sessions ADD COLUMN summary_json TEXT",
             [],
         );
         let _ = self.conn.execute(

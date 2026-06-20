@@ -1,6 +1,6 @@
 //! In-memory registry of live sub-agent sessions.
 //!
-//! Sub-agents (sessions spawned via the `task` tool) and `ask_peer` children
+//! Sub-agents (sessions spawned via the `task` tool) and peer-tool subsessions
 //! are persisted as normal `AgentSession` rows with a `parent_session_id`
 //! link. This registry mirrors that tree in memory for the lifetime of the
 //! process so we can:
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use rusqlite::Connection;
 
-/// A `task` / `ask_peer` result delivered to a parent after its child
+/// A `task` result delivered to a parent after its child
 /// finishes. The parent's `SessionRunner` drains these before the next
 /// LLM turn and includes them as a synthetic user message.
 #[derive(Debug, Clone)]
@@ -36,7 +36,6 @@ pub struct ChildCompletion {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildKind {
     Task,
-    AskPeer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,14 +54,18 @@ pub const MAX_DEPTH: u32 = 1;
 #[derive(Default)]
 struct State {
     /// In-flight children per parent. A child may be either a foreground
-    /// `task`/`ask_peer` (the parent is blocked on it) or a background
-    /// `task` (parent has already returned). Both register here so we can
-    /// cancel them on parent abort.
+    /// `task` (the parent is blocked on it), a peer-tool subsession, or a
+    /// background `task` (parent has already returned). All register here so
+    /// we can cancel them on parent abort.
     children_by_parent: HashMap<String, HashSet<String>>,
     /// Reverse map for fast ancestor walks and cancel-tree.
     parent_of: HashMap<String, String>,
     /// Completed child results waiting to be drained by the parent.
     completions: HashMap<String, Vec<ChildCompletion>>,
+    /// Turn-scoped peer-tool subsessions keyed by caller, peer, and turn.
+    peer_subsessions: HashMap<(String, String, u64), String>,
+    /// Reverse lookup for diagnostics/tests.
+    peer_by_subsession: HashMap<String, String>,
 }
 
 pub struct SubagentRegistry {
@@ -85,7 +88,7 @@ impl SubagentRegistry {
     /// that needs async I/O (`webfetch`) but the parent session
     /// has no real subagent tree (e.g. a top-level session in a
     /// Tauri context). The registry methods will reject any
-    /// `task` / `ask_peer` attempt with `DatabaseUnavailable` /
+    /// `task` attempt with `DatabaseUnavailable` /
     /// `OpenFailed`; `webfetch` ignores the registry entirely.
     ///
     /// The `db_path` is an arbitrary placeholder; `open()` is
@@ -110,7 +113,7 @@ impl SubagentRegistry {
     ///    in the DB is NULL or absent). This caps tree depth at 2 —
     ///    grandchildren are forbidden, so sub-agents can't recursively
     ///    spawn sub-agents of their own.
-    /// 2. `target_session_id`, if Some (used by `ask_peer` to point at an
+    /// 2. `target_session_id`, if Some (used by peer tools to point at an
     ///    existing session), must not be `parent_id` itself.
     pub fn check_spawn(
         &self,
@@ -218,13 +221,71 @@ impl SubagentRegistry {
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// Create or reuse the subsession used to execute a peer-targeted tool
+    /// call for one caller/peer/turn tuple.
+    pub fn get_or_create_peer_subsession<F>(
+        &self,
+        caller_id: &str,
+        peer_id: &str,
+        turn_id: u64,
+        create: F,
+    ) -> Result<String, String>
+    where
+        F: FnOnce() -> Result<String, String>,
+    {
+        let key = (caller_id.to_string(), peer_id.to_string(), turn_id);
+        let mut state = self.state.write();
+        if let Some(existing) = state.peer_subsessions.get(&key) {
+            return Ok(existing.clone());
+        }
+
+        let child_id = create()?;
+        state
+            .children_by_parent
+            .entry(caller_id.to_string())
+            .or_default()
+            .insert(child_id.clone());
+        state
+            .parent_of
+            .insert(child_id.clone(), caller_id.to_string());
+        state.peer_subsessions.insert(key, child_id.clone());
+        state
+            .peer_by_subsession
+            .insert(child_id.clone(), peer_id.to_string());
+        Ok(child_id)
+    }
+
+    pub fn peer_for_subsession(&self, subsession_id: &str) -> Option<String> {
+        self.state
+            .read()
+            .peer_by_subsession
+            .get(subsession_id)
+            .cloned()
+    }
+
+    /// Drop the turn-scoped peer-subsession cache entries. The session rows
+    /// remain persisted for audit/canvas visibility, but a future turn gets a
+    /// fresh subsession.
+    pub fn complete_peer_subsessions(&self, caller_id: &str, turn_id: u64) {
+        let mut state = self.state.write();
+        let keys: Vec<_> = state
+            .peer_subsessions
+            .keys()
+            .filter(|(caller, _, turn)| caller == caller_id && *turn == turn_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(child_id) = state.peer_subsessions.remove(&key) {
+                state.peer_by_subsession.remove(&child_id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::connection::test_support::test_db;
-    use crate::database::repositories::ProjectRepository;
     use crate::Project;
     use chrono::Utc;
 
@@ -316,8 +377,8 @@ mod tests {
 
     #[test]
     fn cannot_target_ancestor() {
-        // Only a primary can call ask_peer / task, and it must not
-        // target itself or any ancestor. We use a primary that has a
+        // Only a primary can spawn child work, and it must not target itself
+        // or any ancestor. We use a primary that has a
         // child of its own — the depth check still passes (primary is
         // depth 0) and we exercise the cycle path.
         let (path, _g) = seed_path();
@@ -360,7 +421,7 @@ mod tests {
             "primary",
             ChildCompletion {
                 child_session_id: "c2".into(),
-                kind: ChildKind::AskPeer,
+                kind: ChildKind::Task,
                 text: "there".into(),
                 success: true,
             },

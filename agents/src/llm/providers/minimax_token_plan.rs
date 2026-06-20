@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use super::openai_compatible_chat::OpenAiCompatibleChatProvider;
+use super::openai_compatible_backend::OpenAiCompatibleBackend;
 use super::{LlmError, LlmProvider, LlmStream};
 use crate::llm::request::LlmRequest;
 use crate::ProviderConfig;
@@ -9,29 +9,30 @@ pub const DEFAULT_BASE_URL: &str = "https://api.minimax.io/v1";
 pub const DEFAULT_MODEL: &str = "MiniMax-M3";
 
 pub struct MiniMaxTokenPlanProvider {
-    inner: OpenAiCompatibleChatProvider,
+    inner: OpenAiCompatibleBackend,
 }
 
 impl MiniMaxTokenPlanProvider {
-    pub fn new(api_key: Option<String>, base_url: Option<String>) -> Self {
+    pub fn new(api_key: Option<String>, base_url: Option<String>, use_sdk: bool) -> Self {
         let api_key = api_key
             .or_else(|| std::env::var("MINIMAX_TOKEN_PLAN_KEY").ok())
             .or_else(|| std::env::var("MINIMAX_API_KEY").ok());
 
         Self {
-            inner: OpenAiCompatibleChatProvider::new(
+            inner: OpenAiCompatibleBackend::new(
                 "minimax",
                 api_key,
                 base_url,
                 DEFAULT_BASE_URL,
                 "MINIMAX_TOKEN_PLAN_KEY",
                 &["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.5"],
+                use_sdk,
             ),
         }
     }
 
     pub fn from_config(config: &ProviderConfig) -> Self {
-        Self::new(config.api_key.clone(), config.base_url.clone())
+        Self::new(config.api_key.clone(), config.base_url.clone(), true)
     }
 
     pub fn with_base_url(mut self, url: &str) -> Self {
@@ -56,6 +57,10 @@ impl LlmProvider for MiniMaxTokenPlanProvider {
 
     fn supported_models(&self) -> Vec<String> {
         self.inner.supported_models()
+    }
+
+    fn backend_name(&self) -> &str {
+        self.inner.backend_name()
     }
 
     async fn stream(&self, request: LlmRequest) -> Result<LlmStream, LlmError> {
@@ -99,17 +104,16 @@ mod tests {
     #[tokio::test]
     async fn minimax_endpoint_returns_http_status() {
         let provider =
-            MiniMaxTokenPlanProvider::new(Some("invalid-token-plan-key".to_string()), None);
-        let status = provider.endpoint_status(DEFAULT_MODEL).await.unwrap();
+            MiniMaxTokenPlanProvider::new(Some("invalid-token-plan-key".to_string()), None, true);
+        let err = provider.endpoint_status(DEFAULT_MODEL).await.unwrap_err();
 
-        assert_ne!(status.as_u16(), 404);
-        assert!(status.is_success() || status.is_client_error() || status.is_server_error());
+        assert_eq!(err.code, "unsupported");
     }
 
     #[tokio::test]
     async fn stream_produces_events_or_http_error() {
         let provider =
-            MiniMaxTokenPlanProvider::new(Some("invalid-token-plan-key".to_string()), None);
+            MiniMaxTokenPlanProvider::new(Some("invalid-token-plan-key".to_string()), None, true);
         let request =
             LlmRequest::new(DEFAULT_MODEL, "minimax").with_message(LlmMessage::user("say hello"));
 
@@ -136,8 +140,8 @@ mod tests {
                 _ => unreachable!("expected error"),
             };
             assert!(
-                err.code.starts_with("http_"),
-                "should be an HTTP error, got: {} - {}",
+                err.code.starts_with("http_") || err.code.starts_with("sdk_"),
+                "should be an HTTP or SDK error, got: {} - {}",
                 err.code,
                 err.message
             );

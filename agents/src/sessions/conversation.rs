@@ -16,6 +16,17 @@ pub struct ConversationFile {
     pub session_id: String,
     pub messages: Vec<ConversationMessage>,
     pub summary: Option<String>,
+    /// Structured recent-tail messages preserved verbatim across a
+    /// compaction. Mirrors opencode's `tail_start_id` / `recent`:
+    /// after compaction, the runner replays these as real
+    /// conversation messages between the synthetic summary user
+    /// message and any post-tail user input. Default `[]` for
+    /// sessions that have never been compacted and for older
+    /// conversation files written before this field existed; the
+    /// runner falls back to the legacy `<recent-context>` system
+    /// block when this is empty but `messages` contains one.
+    #[serde(default)]
+    pub recent_messages: Vec<ConversationMessage>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -48,6 +59,7 @@ impl ConversationService {
             session_id: session_id.to_string(),
             messages: Vec::new(),
             summary: None,
+            recent_messages: Vec::new(),
         };
         self.write_ai_conversation(session_id, &conv)?;
         self.write_ui_conversation(session_id, &conv)
@@ -72,6 +84,27 @@ impl ConversationService {
         ai_conv.messages.push(message.clone());
         self.write_ai_conversation(session_id, &ai_conv)?;
 
+        let mut ui_conv = self.read_ui_conversation(session_id)?;
+        ui_conv.messages.push(message);
+        self.write_ui_conversation(session_id, &ui_conv)?;
+
+        Ok(message_id)
+    }
+
+    pub fn append_ui_message(
+        &self,
+        session_id: &str,
+        role: MessageRole,
+        content: String,
+    ) -> Result<String, String> {
+        let session_lock = self.get_lock(session_id);
+        let _session_guard = session_lock.lock();
+        let lock_path = self.lock_file_path(session_id);
+        let _file_guard = self.acquire_lock(&lock_path)?;
+
+        let message =
+            ConversationMessage::from(Message::new(session_id.to_string(), role, content));
+        let message_id = message.id.clone();
         let mut ui_conv = self.read_ui_conversation(session_id)?;
         ui_conv.messages.push(message);
         self.write_ui_conversation(session_id, &ui_conv)?;
@@ -152,23 +185,53 @@ impl ConversationService {
     }
 
     pub fn compact_conversation(&self, session_id: &str, summary: String) -> Result<(), String> {
-        self.compact_conversation_with_recent(session_id, &summary, "")
+        self.compact_conversation_with_recent_messages(session_id, &summary, &[])
     }
 
     /// Replace the persisted AI conversation with a summary and a
-    /// "recent" tail (preserved verbatim). The recent tail is the
-    /// structured equivalent of opencode's `tail_start_id` /
-    /// `recent` selection. The UI conversation file is left intact
-    /// (existing transcript messages preserved) and gets a new
-    /// system-role entry appended that records the compaction
-    /// summary so the chat panel can render the checkpoint.
-    /// Tauri callers that drive compaction from the UI can leave
-    /// `recent` empty to wipe the AI context.
+    /// "recent" tail (preserved verbatim) carried as a string. The
+    /// string is wrapped in a single `<recent-context>` system
+    /// message inside `messages`. Kept for back-compat with callers
+    /// that already have a serialized tail. New callers should
+    /// prefer `compact_conversation_with_recent_messages` so the
+    /// tail is replayed as real conversation messages on the next
+    /// turn instead of a JSON blob in a system message.
     pub fn compact_conversation_with_recent(
         &self,
         session_id: &str,
         summary: &str,
         recent: &str,
+    ) -> Result<(), String> {
+        let recent_messages: Vec<ConversationMessage> = if recent.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![ConversationMessage {
+                id: format!("recent-{}", uuid::Uuid::new_v4()),
+                role: "system".to_string(),
+                content: format!("<recent-context>\n{recent}\n</recent-context>"),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            }]
+        };
+        self.compact_conversation_with_recent_messages(session_id, summary, &recent_messages)
+    }
+
+    /// Replace the persisted AI conversation with a summary and a
+    /// structured list of recent-tail messages. Mirrors opencode's
+    /// `tail_start_id` / `recent` selection: after compaction, the
+    /// runner replays the `recent_messages` between a synthetic
+    /// summary user-message and any post-tail user input, so the
+    /// model sees the recent turn verbatim rather than as a JSON
+    /// blob in a system message. The UI conversation file is left
+    /// intact (existing transcript messages preserved) and gets a
+    /// new system-role entry appended that records the compaction
+    /// summary so the chat panel can render the checkpoint.
+    /// Tauri callers that drive compaction from the UI can pass
+    /// an empty `recent_messages` to wipe the AI context.
+    pub fn compact_conversation_with_recent_messages(
+        &self,
+        session_id: &str,
+        summary: &str,
+        recent_messages: &[ConversationMessage],
     ) -> Result<(), String> {
         let session_lock = self.get_lock(session_id);
         let _session_guard = session_lock.lock();
@@ -177,17 +240,8 @@ impl ConversationService {
 
         let mut ai_conv = self.read_ai_conversation(session_id)?;
         ai_conv.summary = Some(summary.to_string());
+        ai_conv.recent_messages = recent_messages.to_vec();
         ai_conv.messages.clear();
-
-        if !recent.trim().is_empty() {
-            let recent_message = ConversationMessage {
-                id: format!("recent-{}", uuid::Uuid::new_v4()),
-                role: "system".to_string(),
-                content: format!("<recent-context>\n{recent}\n</recent-context>"),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-            };
-            ai_conv.messages.push(recent_message);
-        }
 
         // Append a checkpoint entry to the UI conversation so the
         // chat panel can render the new summary. Existing messages
@@ -255,6 +309,7 @@ impl ConversationService {
                 session_id: session_id.to_string(),
                 messages: Vec::new(),
                 summary: None,
+                recent_messages: Vec::new(),
             });
         }
 

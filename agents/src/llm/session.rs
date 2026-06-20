@@ -5,17 +5,18 @@ use tokio_stream::StreamExt;
 
 use crate::domain::ToolCall;
 use crate::llm::events::{FinishReason, LlmEvent, ToolResultValue};
-use crate::llm::providers::xml_tool_call::{InvalidToolCallHit, XmlToolCallScanner};
 use crate::llm::providers::LlmProvider;
 use crate::llm::request::{ContentPart, LlmMessage, LlmRequest};
 use crate::llm::subagent_registry::SubagentRegistry;
+use crate::llm::xml_tool_call::{InvalidToolCallHit, XmlToolCallScanner};
 use crate::model_spec::ModelRegistry;
 use crate::permission::PermissionService;
 use crate::sessions::conversation::{ConversationMessage, ConversationService};
 use crate::sessions::service::SessionService;
 use crate::tools::{
-    bound_tool_output, estimate_tokens, run_tool_async, run_tool_with_context, ToolContext,
-    ToolRuntime, MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_OUTPUT_LINES,
+    bound_tool_output, run_tool_async, run_tool_async_sandboxed, run_tool_sandboxed,
+    run_tool_with_context, SandboxedContext, ToolContext, ToolRuntime, MAX_TOOL_OUTPUT_BYTES,
+    MAX_TOOL_OUTPUT_LINES,
 };
 
 use crate::sessions::conversation::ConversationFile;
@@ -71,6 +72,17 @@ pub struct SessionRunner {
     /// surfaces as `SessionError::ContextOverflow` so the UI can
     /// trigger manual compaction.
     compactor: Option<Arc<crate::sessions::CompactionService>>,
+    /// Sandboxed tool dispatch context. When set, every tool
+    /// call goes through `run_tool_sandboxed`, which enforces
+    /// path containment (the `path` argument must resolve
+    /// inside the session's `project_root` or an allowlisted
+    /// `external_roots`), env-scrubbed shell, SSRF-guarded
+    /// network, and the v2 permission service. When unset,
+    /// the runner falls back to the v1 `run_tool_with_context`
+    /// path (no containment, no v2 service). Always set in
+    /// production via `AgentService::build_runner`; tests that
+    /// want the v1 behavior build a runner without this field.
+    sandboxed_ctx: Option<Arc<crate::tools::SandboxedContext>>,
 }
 
 impl SessionRunner {
@@ -110,6 +122,7 @@ impl SessionRunner {
             permissions: None,
             model_registry,
             compactor: None,
+            sandboxed_ctx: None,
         }
     }
 
@@ -119,15 +132,14 @@ impl SessionRunner {
     }
 
     /// Cap the number of LLM turns a single `run` invocation may take.
-    /// Used by the `task` and `ask_peer` tools to bound child sessions.
+    /// Used by the `task` tool to bound child sessions.
     pub fn with_max_turns(mut self, max_turns: u32) -> Self {
         self.max_steps = max_turns;
         self
     }
 
-    /// Restrict this runner's tools to the read-only subset used by
-    /// `ask_peer` children. The runner drops `write`, `edit`,
-    /// `apply_patch`, `shell`, `task`, and `ask_peer` from the tool
+    /// Restrict this runner's tools to the read-only subset. The runner drops
+    /// `write`, `edit`, `apply_patch`, `shell`, and `task` from the tool
     /// definitions it advertises to the LLM.
     pub fn with_readonly_tools(mut self, readonly: bool) -> Self {
         self.readonly_tools = readonly;
@@ -151,10 +163,8 @@ impl SessionRunner {
         self
     }
 
-    /// Wire the SubagentRegistry into the runner so the `task` and
-    /// `ask_peer` tools have access. The agent service calls this on
-    /// its top-level runner; the `task`/`ask_peer` tools build their
-    /// own runners without it.
+    /// Wire the SubagentRegistry into the runner so the `task` tool and
+    /// peer-targeted plan-mode tool calls have access.
     pub fn with_subagent_registry(mut self, registry: Arc<SubagentRegistry>) -> Self {
         self.subagent_registry = Some(registry);
         self
@@ -199,6 +209,12 @@ impl SessionRunner {
         self
     }
 
+    /// Route tool dispatch through the v2 sandboxed execution path.
+    pub fn with_sandboxed_context(mut self, ctx: Arc<SandboxedContext>) -> Self {
+        self.sandboxed_ctx = Some(ctx);
+        self
+    }
+
     /// Wire a `CompactionService` so the runner auto-compacts when
     /// the assembled request would exceed the model context window.
     /// Mirrors opencode's `runner.runTurn` -> `compaction.compactIfNeeded`
@@ -235,9 +251,41 @@ impl SessionRunner {
         }
     }
 
+    /// Decide whether a `SessionError` from `run_turn` should trigger
+    /// an auto-compaction attempt. The runner decides purely from the
+    /// typed `SessionError::ContextOverflow` that the pre-dispatch
+    /// check returns when the assembled request would exceed the
+    /// model's `context_window` minus the configured output budget.
+    ///
+    /// Provider-side 4xx/5xx responses (auth, rate limit, bad
+    /// gateway, etc.) are not treated as overflow triggers. The
+    /// runner only auto-compacts when it can prove the request is
+    /// over the model's hard limit by looking at the body it is
+    /// about to send.
+    fn should_attempt_compaction(&self, error: &SessionError) -> bool {
+        if self.compactor.is_none() {
+            return false;
+        }
+        matches!(error, SessionError::ContextOverflow { .. })
+    }
+
+    fn compaction_trigger_label(&self, error: &SessionError) -> &'static str {
+        match error {
+            SessionError::ContextOverflow { .. } => "pre_dispatch_estimate",
+            _ => "unknown",
+        }
+    }
+
     pub async fn run(&self, session_id: &str) -> Result<RunResult, SessionError> {
         let mut step = 0u32;
-        let mut attempted_compaction = false;
+        // Auto-compaction can be tried up to this many times per
+        // `run()` call. The first attempt covers the proactive
+        // estimate; a second attempt covers a provider-side
+        // 4xx/5xx that looks like a context overflow. Two is
+        // enough: if the conversation still does not fit, the
+        // error is surfaced so the user can compact manually.
+        const MAX_COMPACTION_ATTEMPTS: u32 = 2;
+        let mut compaction_attempts: u32 = 0;
 
         // Opencode-style loop: re-query the persisted conversation
         // history on each iteration. The runner decides whether to
@@ -255,20 +303,25 @@ impl SessionRunner {
                         break;
                     }
                 }
-                Err(SessionError::ContextOverflow { .. }) if !attempted_compaction => {
+                Err(error)
+                    if self.should_attempt_compaction(&error)
+                        && compaction_attempts < MAX_COMPACTION_ATTEMPTS =>
+                {
                     // Mirror opencode's `compaction.compactIfNeeded`
                     // + `compactAfterOverflow`: ask the LLM to
                     // summarize the conversation, then retry the
-                    // turn. We attempt auto-compaction at most once
-                    // per `run` call to avoid loops when compaction
-                    // itself cannot shrink the conversation enough.
+                    // turn. We attempt auto-compaction up to
+                    // `MAX_COMPACTION_ATTEMPTS` times per `run` call
+                    // to recover from both the proactive estimate
+                    // and provider-side 4xx/5xx responses that look
+                    // like context overflow.
                     if let Some(compactor) = &self.compactor {
                         let session = self
                             .session_service
                             .get_session(session_id)
                             .map_err(|e| SessionError::Conversation(e))?
                             .ok_or_else(|| SessionError::SessionNotFound(session_id.to_string()))?;
-                        attempted_compaction = true;
+                        compaction_attempts += 1;
                         match compactor
                             .compact_now(crate::sessions::CompactionRequest {
                                 session_id: session_id.to_string(),
@@ -281,6 +334,9 @@ impl SessionRunner {
                                 tracing::info!(
                                     session_id = %session_id,
                                     step = step,
+                                    attempt = compaction_attempts,
+                                    max_attempts = MAX_COMPACTION_ATTEMPTS,
+                                    triggered_by = self.compaction_trigger_label(&error),
                                     "auto-compaction succeeded; retrying turn"
                                 );
                                 continue;
@@ -289,22 +345,16 @@ impl SessionRunner {
                                 tracing::warn!(
                                     session_id = %session_id,
                                     step = step,
+                                    attempt = compaction_attempts,
+                                    max_attempts = MAX_COMPACTION_ATTEMPTS,
                                     outcome = ?outcome,
-                                    "auto-compaction did not shrink the conversation; returning ContextOverflow"
+                                    "auto-compaction did not shrink the conversation; surfacing error"
                                 );
-                                return Err(SessionError::ContextOverflow {
-                                    session_id: session_id.to_string(),
-                                    estimated_tokens: 0,
-                                    context_window: 0,
-                                });
+                                return Err(error);
                             }
                         }
                     } else {
-                        return Err(SessionError::ContextOverflow {
-                            session_id: session_id.to_string(),
-                            estimated_tokens: 0,
-                            context_window: 0,
-                        });
+                        return Err(error);
                     }
                 }
                 Err(other) => return Err(other),
@@ -377,7 +427,6 @@ impl SessionRunner {
             for c in completions {
                 let prefix = match c.kind {
                     crate::llm::subagent_registry::ChildKind::Task => "task_result",
-                    crate::llm::subagent_registry::ChildKind::AskPeer => "peer_answer",
                 };
                 let block = format!(
                     "<{prefix} id=\"{cid}\" state=\"{st}\">\n{text}\n</{prefix}>",
@@ -412,13 +461,80 @@ impl SessionRunner {
 
         let mut messages = history_to_llm_messages(&history);
 
+        // Inject the prior compaction summary (if any) as a
+        // synthetic user message and then replay the structured
+        // recent-tail messages verbatim. This mirrors opencode's
+        // message-v2 → model-messages converter: a `<compaction>`
+        // part is rendered as a user message carrying the prior
+        // summary, then the kept tail is replayed as real
+        // conversation messages between that summary and the
+        // post-tail user input. The runner never re-emits a
+        // prior `<recent-context>` system block as model input —
+        // that was the previous behavior, and it produced a JSON
+        // blob the model could not reason over.
         if let Some(summary) = conversation.summary.as_deref() {
             if !summary.trim().is_empty() {
-                messages.push(LlmMessage::system(&format!(
-                    "Conversation summary:\n\n{summary}"
-                )));
+                messages.insert(
+                    0,
+                    LlmMessage::user(&format!(
+                        "<conversation-summary>\n{summary}\n</conversation-summary>"
+                    )),
+                );
             }
         }
+        if !conversation.recent_messages.is_empty() {
+            // Place the recent-tail messages between the synthetic
+            // summary (if any) and the live history. `get_messages`
+            // returned only the post-compaction messages, so the
+            // tail is the bridge from summary → current turn.
+            let tail = history_to_llm_messages(&conversation.recent_messages);
+            let insert_at = if !conversation
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .map(str::is_empty)
+                .unwrap_or(true)
+            {
+                1
+            } else {
+                0
+            };
+            let tail_len = tail.len();
+            messages.splice(insert_at..insert_at, tail);
+            // `insert_at` and `tail_len` are kept to make the splice
+            // self-documenting; the `_ =` suppresses any unused-warning
+            // if a future refactor moves the computation.
+            let _ = tail_len;
+        } else if let Some(legacy) = history
+            .iter()
+            .find(|msg| msg.role == "system" && msg.content.starts_with("<recent-context>"))
+        {
+            // Back-compat: a session compacted by the old code path
+            // stored a single `<recent-context>` system message in
+            // `messages`. The runner surfaces that text as a user
+            // message so the model at least sees the recent turn
+            // content. Subsequent compactions will rewrite the file
+            // into the new structured shape.
+            let body = legacy
+                .content
+                .trim_start_matches("<recent-context>")
+                .trim_end_matches("</recent-context>")
+                .trim();
+            if !body.is_empty() {
+                messages.insert(
+                    0,
+                    LlmMessage::user(&format!("<recent-context>\n{body}\n</recent-context>")),
+                );
+            }
+        }
+
+        let peer_context = if let Ok(block) =
+            crate::routing::resolver::build_context_block(session_id, &self.session_service)
+        {
+            block.render()
+        } else {
+            None
+        };
 
         // Inject the active permission mode as a synthetic user message
         // so the LLM knows what behaviour to follow. The mode is set
@@ -441,37 +557,54 @@ impl SessionRunner {
              runtime; plan accordingly.",
         )));
 
-        let system_prompt = system_prompt_for_session(&session.provider, &[]);
+        let mut system_prompt = system_prompt_for_session(&session.provider, &[]);
+        if let Some(peer_context) = peer_context {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&peer_context);
+        }
 
-        // Pre-check the assembled request against the model context
-        // window. Opencode estimates the same way and refuses to
-        // dispatch when input+output would exceed the budget. We
-        // surface a typed error so the UI can trigger compaction.
+        // Pre-check the assembled request body against the model's
+        // hard context window. We inspect the *outgoing* request
+        // (system + history + tools), not the provider response, so
+        // this is the only place that decides "the request is too
+        // big" — provider-side 4xx/5xx (auth, rate limit, bad
+        // gateway, etc.) never trigger compaction.
+        //
+        // The compactor is the single source of truth for the
+        // estimate: when present, both `should_compact` (which adds
+        // the configured `buffer_tokens` for the compactor's
+        // summary headroom) and `request_fits` (the bare
+        // `context_window - max_output` check used when the
+        // compactor is configured but `auto` is off, or when the
+        // runner is built without an auto-compactor at all) live on
+        // the compactor and inspect the same assembled request the
+        // provider is about to receive.
+        let tools = tools_for_model(&session.model, self.readonly_tools);
+        let precheck_request = LlmRequest::new(&session.model, &session.provider)
+            .with_system(system_prompt.clone())
+            .with_messages(messages.clone())
+            .with_tools(tools.clone())
+            .with_session_id(session_id.to_string());
         let spec = self
             .model_registry
             .lookup(&session.provider, &session.model);
-        let estimated_tokens: usize = messages
-            .iter()
-            .map(|m| {
-                let chars: usize = m
-                    .content
-                    .iter()
-                    .map(|p| match p {
-                        ContentPart::Text { text } => text.len(),
-                        ContentPart::Reasoning { text } => text.len(),
-                        ContentPart::ToolCall { input, .. } => {
-                            serde_json::to_string(input).map(|s| s.len()).unwrap_or(0)
-                        }
-                        ContentPart::ToolResult { result, .. } => {
-                            serde_json::to_string(result).map(|s| s.len()).unwrap_or(0)
-                        }
-                    })
-                    .sum();
-                estimate_tokens(&" ".repeat(chars))
-            })
-            .sum();
-        let token_budget = spec.context_window.saturating_sub(spec.max_output);
-        if spec.context_window > 0 && estimated_tokens > token_budget {
+        let overflow = match &self.compactor {
+            Some(compactor) => compactor
+                .should_compact(&precheck_request)
+                .map(|estimated| (estimated, "compactor_should_compact")),
+            None => {
+                let estimator = crate::sessions::compaction::RequestFitsEstimator::new(Arc::clone(
+                    &self.model_registry,
+                ));
+                if !estimator.request_fits(&precheck_request) {
+                    let estimated = estimator.estimate_request_tokens(&precheck_request);
+                    Some((estimated, "request_fits"))
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some((estimated_tokens, source)) = overflow {
             tracing::warn!(
                 session_id = %session_id,
                 provider = %session.provider,
@@ -479,7 +612,8 @@ impl SessionRunner {
                 estimated_tokens,
                 context_window = spec.context_window,
                 max_output = spec.max_output,
-                "estimated request exceeds model context window; refusing to dispatch"
+                source = source,
+                "assembled request body exceeds model context window; refusing to dispatch"
             );
             return Err(SessionError::ContextOverflow {
                 session_id: session_id.to_string(),
@@ -487,8 +621,6 @@ impl SessionRunner {
                 context_window: spec.context_window,
             });
         }
-
-        let tools = tools_for_model(&session.model, self.readonly_tools);
 
         // The LLM is told about tools via the request body's
         // structured `tools` field. Providers return tool calls as
@@ -515,6 +647,8 @@ impl SessionRunner {
             tools = ?tool_names,
             system_prompt_bytes = system_prompt.len(),
             message_count = messages.len(),
+            has_compaction_summary = conversation.summary.is_some(),
+            recent_tail_messages = conversation.recent_messages.len(),
             system_prompt_preview = %system_prompt.chars().take(2048).collect::<String>(),
             "llm request assembled: sending to provider"
         );
@@ -540,6 +674,8 @@ impl SessionRunner {
             session_id = %session_id,
             step = step,
             provider = %session.provider,
+            provider_backend = %provider.backend_name(),
+            provider_base_url = ?provider.model_base_url(),
             model = %session.model,
             history_messages = history.len(),
             "llm stream opened"
@@ -655,7 +791,7 @@ impl SessionRunner {
                         text_buffer.push_str(&outcome.text);
                     }
                     for hit in outcome.hits {
-                        let id = crate::llm::providers::xml_tool_call::next_invalid_tool_call_id();
+                        let id = crate::llm::xml_tool_call::next_invalid_tool_call_id();
                         let (name, raw) = (hit.name.clone(), hit.raw.clone());
                         let event = LlmEvent::InvalidToolCall {
                             id: id.clone(),
@@ -764,7 +900,7 @@ impl SessionRunner {
             flush_text_buffer(&mut text_buffer, &mut in_think_block, &mut assistant_parts);
         }
         for hit in tail.hits {
-            let id = crate::llm::providers::xml_tool_call::next_invalid_tool_call_id();
+            let id = crate::llm::xml_tool_call::next_invalid_tool_call_id();
             let (name, _) = (hit.name.clone(), hit.raw.clone());
             let event = LlmEvent::InvalidToolCall {
                 id: id.clone(),
@@ -786,16 +922,13 @@ impl SessionRunner {
         // detected XML tool call block. These ride along with the
         // persisted assistant message and reach the model on the
         // next turn through the standard tool-result channel so it
-        // can self-correct. We do NOT set `needs_continuation` here:
-        // the next turn's `run_turn` will be triggered by a real
-        // `ToolCall` event (or by the user) — synthetic feedback
-        // alone is not a reason to loop.
+        // can self-correct.
         for hit in &invalid_tool_call_hits {
-            let id = crate::llm::providers::xml_tool_call::next_invalid_tool_call_id();
+            let id = crate::llm::xml_tool_call::next_invalid_tool_call_id();
             let preview: String = hit.raw.chars().take(120).collect();
             let message = format!(
-                "do not emit tool calls as XML, markdown, code blocks, or plain text. \
-                 The XML tool call block you emitted for `{}` was discarded. \
+                "invalid tool call: do not emit tool calls as XML, markdown, code blocks, or plain text. \
+                 The invalid XML tool call block you emitted for `{}` was discarded. \
                  Use the provider's native tool-calling API (the structured `tools` field on the request). \
                  Detected body: {}",
                 hit.name,
@@ -808,11 +941,16 @@ impl SessionRunner {
             ));
         }
         if !invalid_tool_call_hits.is_empty() {
+            if pending_tool_calls.is_empty() {
+                needs_continuation = true;
+            }
             tracing::info!(
                 session_id = %session_id,
                 step = step,
                 count = invalid_tool_call_hits.len(),
-                "appended XML-tool-call feedback tool_results to assistant parts"
+                needs_continuation = needs_continuation,
+                pending_tool_calls = pending_tool_calls.len(),
+                "appended invalid XML-tool-call feedback tool_results to assistant parts"
             );
             let _ = flush_parts(&assistant_parts);
         }
@@ -834,10 +972,11 @@ impl SessionRunner {
                 session_directory = %session.directory,
                 project_root = %project_root.display(),
                 project_root_is_empty = project_root.as_os_str().is_empty(),
-                cwd = %std::env::current_dir()
+                process_cwd = %std::env::current_dir()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| "<unknown>".to_string()),
-                "dispatching tool calls: built ToolContext with project_root from session"
+                "dispatching tool calls: built ToolContext with project_root from session; \
+                 per-tool path resolution is logged by tools/mod.rs::resolve_session_path"
             );
 
             for (id, name, input_str) in pending_tool_calls {
@@ -879,7 +1018,7 @@ impl SessionRunner {
                 // permission service) whether to continue. The v2
                 // default ruleset has `doom_loop: ask`, so this
                 // surfaces a real prompt in the Tauri UI.
-                if self.doom.record(&name, &input_str) {
+                if self.sandboxed_ctx.is_none() && self.doom.record(&name, &input_str) {
                     tracing::warn!(
                         session_id = %session_id,
                         step = step,
@@ -981,16 +1120,18 @@ impl SessionRunner {
                     continue;
                 }
 
-                // Dispatch through the async path so the `task` and
-                // `ask_peer` tools can drive child sessions, and so
-                // `webfetch` can await HTTP without blocking the
-                // executor. For read-only runs (e.g. an `ask_peer`
-                // child), the runner has no ToolRuntime; the async
-                // path is still used for `webfetch` (which doesn't
-                // need a runtime), and other tools fall back to the
-                // sync path inside `run_tool_async`.
-                let needs_async_runtime = matches!(name.as_str(), "task" | "ask_peer");
+                // Dispatch through the async path so `task` can drive child
+                // sessions, peer-targeted plan-mode tools can create/reuse
+                // subsessions, and `webfetch` can await HTTP without blocking
+                // the executor.
+                let has_peer_session_id = tool_call
+                    .arguments
+                    .get("peer_session_id")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|value| !value.trim().is_empty());
+                let needs_async_runtime = name == "task" || has_peer_session_id;
                 let needs_async_dispatch = needs_async_runtime || name == "webfetch";
+                let sandboxed = self.sandboxed_ctx.as_deref();
                 let result = if let Some(registry) = &self.subagent_registry {
                     let runtime = ToolRuntime {
                         caller_session_id: session_id.to_string(),
@@ -998,6 +1139,8 @@ impl SessionRunner {
                         conversation_service: Arc::clone(&self.conversation_service),
                         providers: Arc::clone(&self.providers),
                         subagent_registry: Arc::clone(registry),
+                        mode: self.mode,
+                        turn_id: step as u64,
                         project_root: project_root.clone(),
                     };
                     if needs_async_dispatch {
@@ -1008,7 +1151,11 @@ impl SessionRunner {
                             project_root = %project_root.display(),
                             "dispatching via async path (subagent registry present)"
                         );
-                        run_tool_async(&tool_call, &runtime).await
+                        if let Some(sandboxed) = sandboxed {
+                            run_tool_async_sandboxed(&tool_call, &runtime, sandboxed).await
+                        } else {
+                            run_tool_async(&tool_call, &runtime).await
+                        }
                     } else {
                         tracing::debug!(
                             session_id = %session_id,
@@ -1017,7 +1164,11 @@ impl SessionRunner {
                             project_root = %project_root.display(),
                             "dispatching via sync path (subagent registry present, tool doesn't need it)"
                         );
-                        run_tool_with_context(&tool_call, &ctx)
+                        if let Some(sandboxed) = sandboxed {
+                            run_tool_sandboxed(&tool_call, sandboxed).await
+                        } else {
+                            run_tool_with_context(&tool_call, &ctx)
+                        }
                     }
                 } else if needs_async_dispatch && name == "webfetch" {
                     tracing::debug!(
@@ -1041,9 +1192,15 @@ impl SessionRunner {
                         conversation_service: Arc::clone(&self.conversation_service),
                         providers: Arc::clone(&self.providers),
                         subagent_registry: self.subagent_registry_noop(),
+                        mode: self.mode,
+                        turn_id: step as u64,
                         project_root: project_root.clone(),
                     };
-                    run_tool_async(&tool_call, &runtime).await
+                    if let Some(sandboxed) = sandboxed {
+                        run_tool_async_sandboxed(&tool_call, &runtime, sandboxed).await
+                    } else {
+                        run_tool_async(&tool_call, &runtime).await
+                    }
                 } else {
                     tracing::debug!(
                         session_id = %session_id,
@@ -1052,7 +1209,11 @@ impl SessionRunner {
                         project_root = %project_root.display(),
                         "dispatching via sync path"
                     );
-                    run_tool_with_context(&tool_call, &ctx)
+                    if let Some(sandboxed) = sandboxed {
+                        run_tool_sandboxed(&tool_call, sandboxed).await
+                    } else {
+                        run_tool_with_context(&tool_call, &ctx)
+                    }
                 };
 
                 let (result_value, output) = if result.success {
@@ -1160,6 +1321,9 @@ impl SessionRunner {
                 needs_continuation = needs_continuation,
                 "llm turn produced no assistant output; skipping assistant message persist"
             );
+            if let Some(registry) = &self.subagent_registry {
+                registry.complete_peer_subsessions(session_id, step as u64);
+            }
             return Ok(needs_continuation);
         }
 
@@ -1201,6 +1365,10 @@ impl SessionRunner {
         // LLM turn can see the persisted call/result transcript.
         let continue_loop = needs_continuation;
 
+        if let Some(registry) = &self.subagent_registry {
+            registry.complete_peer_subsessions(session_id, step as u64);
+        }
+
         Ok(continue_loop)
     }
 }
@@ -1222,6 +1390,26 @@ fn history_to_llm_messages(history: &[ConversationMessage]) -> Vec<LlmMessage> {
                 }
             }
             "system" => LlmMessage::system(&msg.content),
+            "tool" => {
+                // Persisted tool results are stored as
+                // `Vec<ContentPart>` with a single `ToolResult`
+                // part. Re-emit them with the proper `role: "tool"`
+                // shape so both the HTTP backend and the SDK path
+                // can render the structured `tool_call_id` and
+                // `name` on the next turn.
+                if let Ok(parts) = serde_json::from_str::<Vec<ContentPart>>(&msg.content) {
+                    if let Some(ContentPart::ToolResult { id, name, result }) = parts
+                        .into_iter()
+                        .find(|p| matches!(p, ContentPart::ToolResult { .. }))
+                    {
+                        LlmMessage::tool(&id, &name, result)
+                    } else {
+                        LlmMessage::user(&msg.content)
+                    }
+                } else {
+                    LlmMessage::user(&msg.content)
+                }
+            }
             _ => LlmMessage::user(&msg.content),
         })
         .collect()
@@ -1334,140 +1522,159 @@ fn default_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
         crate::llm::events::ToolDefinition::new(
             "apply_patch",
             "Apply a file-oriented patch",
-            object_schema(serde_json::json!({
-                "patchText": { "type": "string", "description": "Full patch text describing file operations" }
-            }), &["patchText"]),
-        ),
-        crate::llm::events::ToolDefinition::new(
-            "ask_peer",
-            "Ask a question of a peer session in a different project. The peer runs \
-             read-only (read/glob/grep/webfetch), so this is for consulting another \
-             session's analysis without risking writes. Cross-repo only — the caller \
-             and peer must live in different directories.",
-            object_schema(serde_json::json!({
-                "peer_session_id": {
-                    "type": "string",
-                    "description": "ID of the peer session to consult"
-                },
-                "question": {
-                    "type": "string",
-                    "description": "The question to ask the peer"
-                },
-                "max_turns": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 5,
-                    "description": "Maximum number of model turns the peer is allowed to take (1-5, default 3)"
-                }
-            }), &["peer_session_id", "question"]),
+            object_schema(
+                serde_json::json!({
+                    "patchText": { "type": "string", "description": "Full patch text describing file operations" }
+                }),
+                &["patchText"],
+            ),
         ),
         crate::llm::events::ToolDefinition::new(
             "edit",
             "Replace text in an existing file",
-            object_schema(serde_json::json!({
-                "path": { "type": "string", "description": "Path to the file to edit" },
-                "old_string": { "type": "string", "description": "Text to find and replace" },
-                "new_string": { "type": "string", "description": "Replacement text" }
-            }), &["path", "old_string", "new_string"]),
+            object_schema(
+                serde_json::json!({
+                    "path": { "type": "string", "description": "Path to the file to edit" },
+                    "old_string": { "type": "string", "description": "Text to find and replace" },
+                    "new_string": { "type": "string", "description": "Replacement text" }
+                }),
+                &["path", "old_string", "new_string"],
+            ),
         ),
         crate::llm::events::ToolDefinition::new(
             "glob",
             "Find files by glob pattern",
-            object_schema(serde_json::json!({
-                "path": { "type": "string", "description": "Root directory to search from" },
-                "pattern": { "type": "string", "description": "Glob pattern to match files against" }
-            }), &["path"]),
+            object_schema(
+                serde_json::json!({
+                    "path": { "type": "string", "description": "Root directory to search from" },
+                    "pattern": { "type": "string", "description": "Glob pattern to match files against" }
+                }),
+                &["path"],
+            ),
         ),
         crate::llm::events::ToolDefinition::new(
             "grep",
             "Search file contents",
-            object_schema(serde_json::json!({
-                "path": { "type": "string", "description": "Root directory to search from" },
-                "pattern": { "type": "string", "description": "Text pattern to search for" },
-                "include": { "type": "string", "description": "File name pattern to filter by" }
-            }), &["path", "pattern"]),
+            object_schema(
+                serde_json::json!({
+                    "path": { "type": "string", "description": "Root directory to search from" },
+                    "pattern": { "type": "string", "description": "Text pattern to search for" },
+                    "include": { "type": "string", "description": "File name pattern to filter by" }
+                }),
+                &["path", "pattern"],
+            ),
         ),
         crate::llm::events::ToolDefinition::new(
             "read",
             "Read a file from disk",
-            object_schema(serde_json::json!({
-                "path": { "type": "string", "description": "Path to the file to read" },
-                "offset": { "type": "integer", "description": "Line offset to start reading from", "minimum": 1 },
-                "limit": { "type": "integer", "description": "Maximum number of lines to read" }
-            }), &["path"]),
+            object_schema(
+                serde_json::json!({
+                    "path": { "type": "string", "description": "Path to the file to read" },
+                    "offset": { "type": "integer", "description": "Line offset to start reading from", "minimum": 1 },
+                    "limit": { "type": "integer", "description": "Maximum number of lines to read" }
+                }),
+                &["path"],
+            ),
         ),
         crate::llm::events::ToolDefinition::new(
             "shell",
             "Run a shell command",
-            object_schema(serde_json::json!({
-                "command": { "type": "string", "description": "Shell command to execute" },
-                "workdir": { "type": "string", "description": "Working directory for the command" }
-            }), &["command"]),
+            object_schema(
+                serde_json::json!({
+                    "command": { "type": "string", "description": "Shell command to execute" },
+                    "workdir": { "type": "string", "description": "Working directory for the command" }
+                }),
+                &["command"],
+            ),
         ),
         crate::llm::events::ToolDefinition::new(
             "todo",
             "Update the session todo list",
-            object_schema(serde_json::json!({
-                "content": { "type": "string", "description": "Todo content to set" }
-            }), &["content"]),
+            object_schema(
+                serde_json::json!({
+                    "content": { "type": "string", "description": "Todo content to set" }
+                }),
+                &["content"],
+            ),
         ),
         crate::llm::events::ToolDefinition::new(
             "write",
             "Write content to a file",
-            object_schema(serde_json::json!({
-                "path": { "type": "string", "description": "Path to the file to write" },
-                "content": { "type": "string", "description": "Content to write" }
-            }), &["path", "content"]),
+            object_schema(
+                serde_json::json!({
+                    "path": { "type": "string", "description": "Path to the file to write" },
+                    "content": { "type": "string", "description": "Content to write" }
+                }),
+                &["path", "content"],
+            ),
         ),
     ];
     sort_tools_by_name(&mut tools);
     tools
 }
 
-/// Read-only tool subset used by `ask_peer` child sessions. Excludes
-/// `write`, `edit`, `apply_patch`, `shell`, `task`, and `ask_peer`
-/// itself. The peer can read files, search, and fetch the web.
+/// Read-only tool subset used by Plan mode. Excludes `write`, `edit`,
+/// `apply_patch`, `shell`, and `task`. Read/glob/grep can target connected
+/// peers by passing `peer_session_id` from the `<peers>` system context.
 pub fn readonly_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
     let mut tools = vec![
         crate::llm::events::ToolDefinition::new(
             "glob",
             "Find files by glob pattern",
-            object_schema(serde_json::json!({
-                "path": { "type": "string", "description": "Root directory" },
-                "pattern": { "type": "string", "description": "Glob pattern" }
-            }), &["path"]),
+            object_schema(
+                serde_json::json!({
+                    "path": { "type": "string", "description": "Root directory" },
+                    "pattern": { "type": "string", "description": "Glob pattern" },
+                    "peer_session_id": { "type": "string", "description": "Optional. Use ONLY to search a different connected session listed in <peers>. Omit for local/current-repo work." }
+                }),
+                &["path"],
+            ),
         ),
         crate::llm::events::ToolDefinition::new(
             "grep",
             "Search file contents",
-            object_schema(serde_json::json!({
-                "path": { "type": "string" },
-                "pattern": { "type": "string" },
-                "include": { "type": "string" }
-            }), &["path", "pattern"]),
+            object_schema(
+                serde_json::json!({
+                    "path": { "type": "string" },
+                    "pattern": { "type": "string" },
+                    "include": { "type": "string" },
+                    "peer_session_id": { "type": "string", "description": "Optional. Use ONLY to search a different connected session listed in <peers>. Omit for local/current-repo work." }
+                }),
+                &["path", "pattern"],
+            ),
         ),
         crate::llm::events::ToolDefinition::new(
             "read",
             "Read a file from disk",
-            object_schema(serde_json::json!({
-                "path": { "type": "string", "description": "Path to a file to read" },
-                "offset": { "type": "integer", "minimum": 1 },
-                "limit": { "type": "integer", "minimum": 1 }
-            }), &["path"]),
+            object_schema(
+                serde_json::json!({
+                    "path": { "type": "string", "description": "Path to a file to read" },
+                    "offset": { "type": "integer", "minimum": 1 },
+                    "limit": { "type": "integer", "minimum": 1 },
+                    "peer_session_id": { "type": "string", "description": "Optional. Use ONLY to read a file from a different connected session listed in <peers>. Omit for local/current-repo work." }
+                }),
+                &["path"],
+            ),
         ),
         crate::llm::events::ToolDefinition::new(
             "webfetch",
             "Fetch a web URL",
-            object_schema(serde_json::json!({
-                "url": { "type": "string" }
-            }), &["url"]),
+            object_schema(
+                serde_json::json!({
+                    "url": { "type": "string" }
+                }),
+                &["url"],
+            ),
         ),
         crate::llm::events::ToolDefinition::new(
             "websearch",
             "Search the web",
-            object_schema(serde_json::json!({
-                "query": { "type": "string" }
-            }), &["query"]),
+            object_schema(
+                serde_json::json!({
+                    "query": { "type": "string" }
+                }),
+                &["query"],
+            ),
         ),
     ];
     sort_tools_by_name(&mut tools);
@@ -1480,10 +1687,7 @@ pub fn readonly_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
 /// OpenAI strict-mode tools and a useful hint everywhere else: it
 /// stops the model from inventing field names that aren't in the
 /// schema, which would otherwise round-trip as parse errors.
-fn object_schema(
-    properties: serde_json::Value,
-    required: &[&str],
-) -> serde_json::Value {
+fn object_schema(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": properties,
@@ -1520,7 +1724,7 @@ fn model_uses_apply_patch(model_id: &str) -> bool {
 /// Return the tool list to advertise to the model for this turn.
 ///
 /// The filter is layered:
-/// 1. If `readonly` is set (Plan mode or `ask_peer` child session),
+/// 1. If `readonly` is set (Plan mode),
 ///    return the read-only subset regardless of model. Plan mode
 ///    is a safety gate and must win over the GPT/preferred-edit-tool
 ///    heuristic — a Plan-mode GPT-5 still can't write.
@@ -1638,12 +1842,22 @@ impl ProviderRegistry {
     }
 
     pub fn register_defaults_sync(&self) {
-        let openai = Arc::new(crate::llm::providers::OpenAiProvider::new(None, None))
-            as Arc<dyn LlmProvider>;
-        let anthropic = Arc::new(crate::llm::providers::AnthropicProvider::new(None, None))
-            as Arc<dyn LlmProvider>;
+        let openai_config = crate::ProviderConfig::new(
+            "openai".to_string(),
+            "gpt-4o".to_string(),
+            crate::ProviderProtocol::OpenAI,
+        );
+        let anthropic_config = crate::ProviderConfig::new(
+            "anthropic".to_string(),
+            "claude-sonnet-4-20250514".to_string(),
+            crate::ProviderProtocol::Anthropic,
+        );
+        let openai = crate::llm::providers::aisdk_provider_from_config(&openai_config)
+            .expect("default openai provider must be supported by AISDK");
+        let anthropic = crate::llm::providers::aisdk_provider_from_config(&anthropic_config)
+            .expect("default anthropic provider must be supported by AISDK");
         let minimax = Arc::new(crate::llm::providers::MiniMaxTokenPlanProvider::new(
-            None, None,
+            None, None, false,
         )) as Arc<dyn LlmProvider>;
 
         // Note: using blocking insert since we're in a sync context
@@ -1652,6 +1866,43 @@ impl ProviderRegistry {
         guard.insert("openai".to_string(), openai);
         guard.insert("anthropic".to_string(), anthropic);
         guard.insert("minimax".to_string(), minimax);
+
+        for provider_name in crate::llm::providers::aisdk_supported_provider_names() {
+            if guard.contains_key(*provider_name) {
+                continue;
+            }
+
+            let mut config = crate::ProviderConfig::new(
+                provider_name.to_string(),
+                default_aisdk_registry_model(provider_name),
+                aisdk_registry_protocol(provider_name),
+            );
+            config.base_url = std::env::var(crate::llm::providers::aisdk_provider_base_url_env(
+                provider_name,
+            ))
+            .ok();
+
+            if let Some(provider) = crate::llm::providers::aisdk_provider_from_config(&config) {
+                guard.insert(provider_name.to_string(), provider);
+            }
+        }
+    }
+}
+
+fn default_aisdk_registry_model(provider_name: &str) -> String {
+    std::env::var(crate::llm::providers::aisdk_provider_model_env(
+        provider_name,
+    ))
+    .ok()
+    .filter(|model| !model.trim().is_empty())
+    .unwrap_or_else(|| "default".to_string())
+}
+
+fn aisdk_registry_protocol(provider_name: &str) -> crate::ProviderProtocol {
+    if provider_name == "anthropic" {
+        crate::ProviderProtocol::Anthropic
+    } else {
+        crate::ProviderProtocol::OpenAI
     }
 }
 
@@ -1738,14 +1989,26 @@ mod tests {
     fn tools_for_model_gpt5_gets_apply_patch_and_no_edit_or_write() {
         let tools = tools_for_model("gpt-5", false);
         let names = tool_names(&tools);
-        assert!(names.contains(&"apply_patch"), "apply_patch missing: {names:?}");
-        assert!(!names.contains(&"edit"), "edit should be dropped: {names:?}");
-        assert!(!names.contains(&"write"), "write should be dropped: {names:?}");
+        assert!(
+            names.contains(&"apply_patch"),
+            "apply_patch missing: {names:?}"
+        );
+        assert!(
+            !names.contains(&"edit"),
+            "edit should be dropped: {names:?}"
+        );
+        assert!(
+            !names.contains(&"write"),
+            "write should be dropped: {names:?}"
+        );
         // All other tools still present.
-        for name in ["glob", "grep", "read", "shell", "todo", "ask_peer"] {
+        for name in ["glob", "grep", "read", "shell", "todo"] {
             assert!(names.contains(&name), "{name} missing: {names:?}");
         }
-        assert!(is_sorted_by_name(&tools), "tools must be sorted by name: {tools:#?}");
+        assert!(
+            is_sorted_by_name(&tools),
+            "tools must be sorted by name: {tools:#?}"
+        );
     }
 
     #[test]
@@ -1768,7 +2031,10 @@ mod tests {
         let names = tool_names(&tools);
         assert!(names.contains(&"edit"));
         assert!(names.contains(&"write"));
-        assert!(!names.contains(&"apply_patch"), "gpt-4 should not get apply_patch: {names:?}");
+        assert!(
+            !names.contains(&"apply_patch"),
+            "gpt-4 should not get apply_patch: {names:?}"
+        );
     }
 
     #[test]
@@ -1789,9 +2055,8 @@ mod tests {
 
     #[test]
     fn tools_for_model_readonly_overrides_gpt_apply_patch() {
-        // Plan mode and ask_peer children are read-only regardless
-        // of model. Even gpt-5 must not see write tools when the
-        // permission mode is Plan.
+        // Plan mode is read-only regardless of model. Even gpt-5 must not see
+        // write tools when the permission mode is Plan.
         let tools = tools_for_model("gpt-5", true);
         let names = tool_names(&tools);
         assert_eq!(
@@ -1832,17 +2097,25 @@ mod tests {
         // non-GPT branch keeps `edit`/`write`. Tuple shape is
         // (model_id, has_apply_patch, has_edit, has_write).
         let cases = [
-            ("gpt-5", true, false, false),    // GPT branch: apply_patch only
-            ("gpt-4o", false, true, true),    // non-GPT: edit + write
+            ("gpt-5", true, false, false), // GPT branch: apply_patch only
+            ("gpt-4o", false, true, true), // non-GPT: edit + write
             ("claude", false, true, true),
             ("MiniMax-M3", false, true, true),
         ];
         for (id, has_patch, has_edit, has_write) in cases {
             let tools = tools_for_model(id, false);
             let names = tool_names(&tools);
-            assert_eq!(names.contains(&"apply_patch"), has_patch, "apply_patch in {id}: {names:?}");
+            assert_eq!(
+                names.contains(&"apply_patch"),
+                has_patch,
+                "apply_patch in {id}: {names:?}"
+            );
             assert_eq!(names.contains(&"edit"), has_edit, "edit in {id}: {names:?}");
-            assert_eq!(names.contains(&"write"), has_write, "write in {id}: {names:?}");
+            assert_eq!(
+                names.contains(&"write"),
+                has_write,
+                "write in {id}: {names:?}"
+            );
         }
     }
 
@@ -2001,6 +2274,23 @@ mod tests {
                 .with_test_writer()
                 .try_init();
         });
+    }
+
+    #[test]
+    fn flush_text_buffer_preserves_system_reminder_as_text() {
+        let parts = flush_for_test("before <system-reminder>secret</system-reminder> after");
+        let visible: String = parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(visible.contains("<system-reminder>secret</system-reminder>"));
+        assert!(parts
+            .iter()
+            .all(|p| !matches!(p, ContentPart::Reasoning { .. })));
     }
 
     fn build_runner_with_db() -> (SessionRunner, TempDir, String) {
@@ -2206,13 +2496,7 @@ mod tests {
         scripts: Vec<Vec<LlmEvent>>,
         session_directory: &str,
     ) -> (SessionRunner, TempDir, String) {
-        run_with_scripted_model(
-            provider_name,
-            scripts,
-            session_directory,
-            "scripted-model",
-        )
-        .await
+        run_with_scripted_model(provider_name, scripts, session_directory, "scripted-model").await
     }
 
     async fn run_with_scripted_model(
@@ -2341,8 +2625,11 @@ mod tests {
         )
         .await;
 
-        let result = runner.run(&session_id).await;
-        assert!(result.is_ok(), "run failed: {:?}", result.err());
+        let result = runner.run(&session_id).await.expect("run failed");
+        assert_eq!(
+            result.steps, 1,
+            "finish-only turn should stop after the single provider call"
+        );
 
         let msgs = runner
             .conversation_service
@@ -2782,7 +3069,10 @@ mod tests {
         );
         match invalid[0] {
             LlmEvent::InvalidToolCall { name, raw, .. } => {
-                assert_eq!(name, "read", "invalid_tool_call.name should be the inner tool name");
+                assert_eq!(
+                    name, "read",
+                    "invalid_tool_call.name should be the inner tool name"
+                );
                 assert!(
                     raw.contains("/etc/hostname"),
                     "raw body should contain the inner JSON, got: {raw:?}"
@@ -2829,7 +3119,8 @@ mod tests {
                 assert_eq!(name, "read", "feedback name should be the inner tool name");
                 let serialized = serde_json::to_string(result).unwrap_or_default();
                 assert!(
-                    serialized.contains("do not emit tool calls as XML"),
+                    serialized.contains("invalid tool call")
+                        && serialized.contains("do not emit tool calls as XML"),
                     "feedback message should tell the model to use the native tool-calling API, got: {serialized}"
                 );
             }
@@ -2913,7 +3204,10 @@ mod tests {
             s.sort();
             s
         };
-        assert_eq!(names, sorted, "tool list must be sorted alphabetically: {names:?}");
+        assert_eq!(
+            names, sorted,
+            "tool list must be sorted alphabetically: {names:?}"
+        );
     }
 
     /// End-to-end counterpart: a Claude session gets `edit` and
@@ -2939,8 +3233,14 @@ mod tests {
         assert_eq!(captured.len(), 1);
         let request = &captured[0];
         let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"edit"), "edit missing for claude: {names:?}");
-        assert!(names.contains(&"write"), "write missing for claude: {names:?}");
+        assert!(
+            names.contains(&"edit"),
+            "edit missing for claude: {names:?}"
+        );
+        assert!(
+            names.contains(&"write"),
+            "write missing for claude: {names:?}"
+        );
         assert!(
             !names.contains(&"apply_patch"),
             "apply_patch should be dropped for claude: {names:?}"
@@ -3088,12 +3388,8 @@ mod tests {
             },
         ];
 
-        let (runner, _tmp, session_id) = run_with_scripted(
-            "scripted",
-            vec![turn1, turn2],
-            "/tmp",
-        )
-        .await;
+        let (runner, _tmp, session_id) =
+            run_with_scripted("scripted", vec![turn1, turn2], "/tmp").await;
         // Plan mode is the runner default; it would deny shell.
         // Build mode allows it.
         let runner = runner.with_mode(crate::permission::PermissionMode::Build);
@@ -3132,7 +3428,11 @@ mod tests {
             .iter()
             .filter(|p| matches!(p, ContentPart::ToolResult { .. }))
             .collect();
-        assert_eq!(result_parts.len(), 1, "expected one ToolResult, got: {parts:#?}");
+        assert_eq!(
+            result_parts.len(),
+            1,
+            "expected one ToolResult, got: {parts:#?}"
+        );
 
         // The bounded text should:
         //  1. NOT contain the first 50 dropped lines.

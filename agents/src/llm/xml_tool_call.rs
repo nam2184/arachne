@@ -109,6 +109,10 @@ impl XmlToolCallScanner {
     /// Feed a chunk of assistant text. Returns the visible text and
     /// any complete blocks detected.
     pub fn feed(&mut self, chunk: &str) -> XmlFeedOutcome {
+        self.feed_xml(chunk)
+    }
+
+    fn feed_xml(&mut self, chunk: &str) -> XmlFeedOutcome {
         let mut outcome = XmlFeedOutcome::default();
 
         if self.in_block {
@@ -245,15 +249,19 @@ impl XmlToolCallScanner {
                 )
             };
             outcome.hits.push(InvalidToolCallHit {
-                name: if hit_name.is_empty() { "xml".to_string() } else { hit_name },
+                name: if hit_name.is_empty() {
+                    "xml".to_string()
+                } else {
+                    hit_name
+                },
                 raw,
             });
             self.in_block = false;
         }
 
         if !self.held.is_empty() {
-            outcome.text.push_str(&self.held);
-            self.held.clear();
+            let held = std::mem::take(&mut self.held);
+            outcome.text.push_str(&held);
         }
 
         outcome
@@ -313,10 +321,7 @@ impl XmlToolCallScanner {
             }
         }
         let name = std::mem::take(&mut self.hit_name);
-        outcome.hits.push(InvalidToolCallHit {
-            name,
-            raw,
-        });
+        outcome.hits.push(InvalidToolCallHit { name, raw });
 
         // If the inner close we matched is NOT the outer's close,
         // also skip the outer's close so the caller doesn't see
@@ -567,10 +572,7 @@ mod tests {
     #[test]
     fn captures_double_quote_name() {
         let mut s = XmlToolCallScanner::new();
-        let (text, hits) = feed_all(
-            &mut s,
-            &[r#"<tool name="read">{"path":"/tmp/x"}</tool>"#],
-        );
+        let (text, hits) = feed_all(&mut s, &[r#"<tool name="read">{"path":"/tmp/x"}</tool>"#]);
         assert_eq!(text, "");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "read");
@@ -604,7 +606,10 @@ mod tests {
     #[test]
     fn captures_function_calls() {
         let mut s = XmlToolCallScanner::new();
-        let (_, hits) = feed_all(&mut s, &[r#"<function_calls>{"name":"read"}</function_calls>"#]);
+        let (_, hits) = feed_all(
+            &mut s,
+            &[r#"<function_calls>{"name":"read"}</function_calls>"#],
+        );
         assert_eq!(hits.len(), 1);
         // The `<function_calls>` form has no outer `name="…"`
         // attribute — the tool name lives inside the body. The
@@ -651,12 +656,7 @@ mod tests {
     #[test]
     fn keeps_surrounding_text() {
         let mut s = XmlToolCallScanner::new();
-        let (text, hits) = feed_all(
-            &mut s,
-            &[
-                r#"before <tool name="x">body</tool> after"#,
-            ],
-        );
+        let (text, hits) = feed_all(&mut s, &[r#"before <tool name="x">body</tool> after"#]);
         assert_eq!(text, "before  after");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].name, "x");
@@ -666,11 +666,7 @@ mod tests {
     #[test]
     fn reassembles_block_split_across_chunks() {
         let mut s = XmlToolCallScanner::new();
-        let chunks = [
-            r#"<tool name="re"#,
-            r#"ad">{"pat"#,
-            r#"h":"/x"}</tool>"#,
-        ];
+        let chunks = [r#"<tool name="re"#, r#"ad">{"pat"#, r#"h":"/x"}</tool>"#];
         let (text, hits) = feed_all(&mut s, &chunks);
         assert_eq!(text, "");
         assert_eq!(hits.len(), 1);
@@ -724,9 +720,7 @@ mod tests {
         let mut s = XmlToolCallScanner::new();
         let (text, hits) = feed_all(
             &mut s,
-            &[
-                r#"<tool name="a">1</tool> mid <tool name="b">2</tool>"#,
-            ],
+            &[r#"<tool name="a">1</tool> mid <tool name="b">2</tool>"#],
         );
         assert_eq!(text, " mid ");
         assert_eq!(hits.len(), 2);

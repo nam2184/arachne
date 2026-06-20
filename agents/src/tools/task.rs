@@ -21,7 +21,9 @@ use std::sync::Arc;
 
 use crate::llm::session::SessionRunner;
 use crate::llm::{ChildCompletion, ChildKind, ProviderRegistry};
-use crate::tools::{string_arg, ToolRuntime};
+use crate::permission_v2::{default_ruleset, PermissionService};
+use crate::sandbox::SandboxPolicy;
+use crate::tools::{string_arg, SandboxedContext, ToolRuntime};
 
 use super::{failure, not_implemented, success, ToolCall, ToolResult};
 
@@ -87,7 +89,8 @@ pub async fn run_async(call: &ToolCall, runtime: ToolRuntime) -> ToolResult {
 
     // Build a child session. The child inherits the caller's project,
     // provider, and model. The directory is the caller's directory by
-    // default; `ask_peer` overrides this when it wants to use a peer's.
+    // default; peer-tool subsessions use a separate lightweight path when
+    // they need to execute against a peer directory.
     let child_id = match runtime.session_service.create_session_with_parent(
         caller.project_id.clone(),
         caller.directory.clone(),
@@ -120,8 +123,8 @@ pub async fn run_async(call: &ToolCall, runtime: ToolRuntime) -> ToolResult {
 
     // Foreground: run a bounded SessionRunner for the child, then return
     // its final assistant text. The runner uses a one-shot runtime
-    // (Arc<SubagentRegistry> + a fresh ProviderRegistry copy) so the
-    // child's tools are restricted: no `task` and no `ask_peer`.
+    // (Arc<SubagentRegistry> + a fresh ProviderRegistry copy) so the child
+    // stays bounded.
     let registry = runtime.subagent_registry.clone();
     let parent_id = caller.id.clone();
     let child_prompt = prompt.clone();
@@ -194,12 +197,19 @@ async fn run_child_foreground(
     //    the caller's event sink — the child's events are not surfaced
     //    to the UI as primary-session activity.
     let runner = match runtime.session_service.get_session(&child_id) {
-        Ok(Some(_child)) => SessionRunner::new(
-            Arc::clone(&runtime.session_service),
-            Arc::clone(&runtime.conversation_service),
-            child_provider_registry(&runtime),
-        )
-        .with_max_turns(DEFAULT_FOREGROUND_MAX_TURNS),
+        Ok(Some(child)) => {
+            let (permissions, _rx) = PermissionService::new(child.id.clone(), default_ruleset());
+            let sandbox = SandboxPolicy::new(std::path::PathBuf::from(&child.directory));
+            let sandboxed_ctx = Arc::new(SandboxedContext::new(sandbox, Arc::clone(&permissions)));
+            SessionRunner::new(
+                Arc::clone(&runtime.session_service),
+                Arc::clone(&runtime.conversation_service),
+                child_provider_registry(&runtime),
+            )
+            .with_permissions(permissions)
+            .with_sandboxed_context(sandboxed_ctx)
+            .with_max_turns(DEFAULT_FOREGROUND_MAX_TURNS)
+        }
         _ => {
             return ChildOutcome {
                 success: false,

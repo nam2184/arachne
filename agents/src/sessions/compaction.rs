@@ -162,46 +162,7 @@ impl CompactionService {
     /// would exceed `context - max_output`, return the estimated
     /// token count so the caller can trigger compaction.
     pub fn estimate_request_tokens(&self, request: &LlmRequest) -> usize {
-        let spec = self
-            .model_registry
-            .lookup(&request.provider, &request.model);
-        let system_chars: usize = request.system.iter().map(|s| s.len()).sum();
-        let system_tokens = estimate_tokens(&" ".repeat(system_chars));
-        let message_tokens: usize = request
-            .messages
-            .iter()
-            .map(|m| {
-                let chars: usize = m
-                    .content
-                    .iter()
-                    .map(|p| match p {
-                        ContentPart::Text { text } => text.len(),
-                        ContentPart::Reasoning { text } => text.len(),
-                        ContentPart::ToolCall { input, .. } => {
-                            serde_json::to_string(input).map(|s| s.len()).unwrap_or(0)
-                        }
-                        ContentPart::ToolResult { result, .. } => {
-                            serde_json::to_string(result).map(|s| s.len()).unwrap_or(0)
-                        }
-                    })
-                    .sum();
-                estimate_tokens(&" ".repeat(chars))
-            })
-            .sum();
-        let tool_tokens: usize = request
-            .tools
-            .iter()
-            .map(|t| {
-                estimate_tokens(&t.name)
-                    + estimate_tokens(&t.description)
-                    + serde_json::to_string(&t.parameters)
-                        .map(|s| estimate_tokens(&s))
-                        .unwrap_or(0)
-            })
-            .sum();
-        let total = system_tokens + message_tokens + tool_tokens;
-        let _ = spec;
-        total
+        RequestFitsEstimator::new(Arc::clone(&self.model_registry)).estimate_request_tokens(request)
     }
 
     /// Pre-dispatch check used by the runner. Returns
@@ -225,6 +186,33 @@ impl CompactionService {
         } else {
             None
         }
+    }
+
+    /// Pre-dispatch check that does **not** depend on `auto`. This
+    /// is the canonical "does the request body fit the model?"
+    /// gate the runner uses to decide whether to send the request
+    /// at all. It always inspects the assembled request body
+    /// (system + history + tools) against the model's hard
+    /// `context_window - max_output` budget — the same budget the
+    /// compactor uses to pick its `head`/`recent` split, so a
+    /// successful compaction is guaranteed to drop the request
+    /// back under the limit.
+    ///
+    /// Unlike `should_compact`, this method does **not** account
+    /// for the configured `buffer_tokens` (which is the compactor's
+    /// own headroom for the summary output). It is the "is this
+    /// request physically too big?" check; the compactor then
+    /// layers its own headroom on top when `auto` is enabled.
+    pub fn request_fits(&self, request: &LlmRequest) -> bool {
+        let spec = self
+            .model_registry
+            .lookup(&request.provider, &request.model);
+        if spec.context_window == 0 {
+            return true;
+        }
+        let estimated = self.estimate_request_tokens(request);
+        let budget = spec.context_window.saturating_sub(spec.max_output);
+        estimated <= budget
     }
 
     /// Run the compaction flow: select, prompt, stream, persist.
@@ -277,7 +265,7 @@ impl CompactionService {
         }
         synthesized_messages.extend(conv.messages.iter().cloned());
 
-        let (head, recent) = match self.select_from_persisted(&synthesized_messages) {
+        let (head, recent_messages) = match self.select_from_persisted(&synthesized_messages) {
             Some(selected) => selected,
             None => {
                 info!(
@@ -324,11 +312,10 @@ impl CompactionService {
             };
         }
 
-        if let Err(error) = self.conversation_service.compact_conversation_with_recent(
-            &session_id,
-            trimmed,
-            &recent,
-        ) {
+        if let Err(error) = self
+            .conversation_service
+            .compact_conversation_with_recent_messages(&session_id, trimmed, &recent_messages)
+        {
             warn!(session_id = %session_id, error = %error, "compact_now: failed to persist summary");
             return CompactionOutcome::Failed {
                 reason: format!("persist: {error}"),
@@ -351,20 +338,25 @@ impl CompactionService {
     /// Pick which persisted messages to keep verbatim and which to
     /// send for summarization. Mirrors opencode's `select`:
     ///
-    /// - The conversation is serialized into a single string per
-    ///   message.
     /// - We walk backwards from the most recent message, keeping
     ///   the most recent turns verbatim until we hit the
     ///   `keep_recent_tokens` budget.
     /// - Everything older is concatenated into `head` (and ends up
     ///   in the LLM summarization prompt).
-    /// - If a single message itself exceeds the budget, we split
-    ///   it: keep the tail of the message and summarize the head.
-    /// - If after that split the `head` is empty, we fall back to
-    ///   keeping the most recent message in `head` and pushing the
-    ///   rest to `recent` so the compactor always has *something*
-    ///   to summarize when the runner reports overflow.
-    fn select_from_persisted(&self, messages: &[ConversationMessage]) -> Option<(String, String)> {
+    /// - The recent tail is returned as a list of structured
+    ///   `ConversationMessage`s so the runner can replay them as
+    ///   real conversation messages on the next turn — never as a
+    ///   JSON blob in a system message.
+    /// - If a single message itself exceeds the budget, we keep it
+    ///   whole in the recent tail; the next compaction pass will
+    ///   shrink it.
+    /// - If the recent tail would be empty, fall back to keeping
+    ///   the most recent message in `head` so the compactor still
+    ///   has something to summarize.
+    fn select_from_persisted(
+        &self,
+        messages: &[ConversationMessage],
+    ) -> Option<(String, Vec<ConversationMessage>)> {
         if messages.is_empty() {
             return None;
         }
@@ -373,7 +365,7 @@ impl CompactionService {
             .map(serialize_message)
             .filter(|s| !s.trim().is_empty())
             .collect();
-        let result = self.select_from_serialized(&serialized);
+        let result = self.select_from_serialized(messages, &serialized);
         if result.is_some() {
             return result;
         }
@@ -383,45 +375,38 @@ impl CompactionService {
         if let Some(last) = messages.last() {
             let head = serialize_message(last);
             if !head.trim().is_empty() {
-                return Some((head, String::new()));
+                return Some((head, Vec::new()));
             }
         }
         None
     }
 
-    fn select_from_serialized(&self, serialized: &[String]) -> Option<(String, String)> {
-        let serialized: Vec<&str> = serialized
+    fn select_from_serialized(
+        &self,
+        original: &[ConversationMessage],
+        serialized: &[String],
+    ) -> Option<(String, Vec<ConversationMessage>)> {
+        // Align the original and serialized slices. `serialize_message`
+        // returns an empty string for messages with no body
+        // (e.g. assistant messages whose only part is a tool call);
+        // we drop those from `serialized` and skip the same
+        // indices in `original` so the indices line up.
+        let aligned: Vec<(&ConversationMessage, &str)> = original
             .iter()
-            .map(String::as_str)
-            .filter(|s| !s.trim().is_empty())
+            .zip(serialized.iter().map(String::as_str))
+            .filter(|(_, s)| !s.trim().is_empty())
             .collect();
-        if serialized.is_empty() {
+        if aligned.is_empty() {
             return None;
         }
 
         let mut total = 0usize;
-        let mut split = serialized.len();
-        let mut split_prefix = String::new();
-        let mut split_suffix = String::new();
+        let mut split = aligned.len();
 
-        for index in (0..serialized.len()).rev() {
-            let entry = serialized[index];
+        for index in (0..aligned.len()).rev() {
+            let entry = aligned[index].1;
             let next = total + estimate_tokens(entry);
             if next > self.config.keep_recent_tokens {
-                let remaining_chars = self
-                    .config
-                    .keep_recent_tokens
-                    .saturating_sub(total)
-                    .saturating_mul(4);
-                if remaining_chars > 0 && entry.chars().count() > remaining_chars {
-                    let keep = entry
-                        .char_indices()
-                        .nth(entry.chars().count() - remaining_chars)
-                        .map(|(idx, _)| idx)
-                        .unwrap_or(entry.len());
-                    split_prefix = entry[..keep].to_string();
-                    split_suffix = entry[keep..].to_string();
-                }
                 split = index + 1;
                 break;
             }
@@ -429,23 +414,19 @@ impl CompactionService {
             split = index;
         }
 
-        let mut head_parts: Vec<String> =
-            serialized[..split].iter().map(|s| s.to_string()).collect();
-        if !split_prefix.is_empty() {
-            head_parts.push(split_prefix);
-        }
-        let mut recent_parts: Vec<String> = Vec::new();
-        if !split_suffix.is_empty() {
-            recent_parts.push(split_suffix);
-        }
-        recent_parts.extend(serialized[split..].iter().map(|s| s.to_string()));
-
+        let head_parts: Vec<String> = aligned[..split]
+            .iter()
+            .map(|(_, s)| s.to_string())
+            .collect();
         let head = head_parts.join("\n\n");
-        let recent = recent_parts.join("\n\n");
         if head.trim().is_empty() {
             return None;
         }
-        Some((head, recent))
+        let recent_messages: Vec<ConversationMessage> = aligned[split..]
+            .iter()
+            .map(|(msg, _)| (*msg).clone())
+            .collect();
+        Some((head, recent_messages))
     }
 }
 
@@ -564,6 +545,93 @@ async fn stream_summary(provider: &dyn LlmProvider, request: LlmRequest) -> Resu
     Ok(chunks.join(""))
 }
 
+/// Inspects the assembled request body the runner is about to send
+/// (system prompt + history + tool definitions) and answers two
+/// questions:
+///
+/// 1. How many tokens does this request body consume?
+/// 2. Does it fit in the model's `context_window - max_output`
+///    budget?
+///
+/// This is the canonical "does this request body fit the model?"
+/// gate. The runner calls it on every turn before opening a
+/// provider stream, so the model is never asked to ingest a body
+/// that is physically too large for its context window. It is
+/// also the estimator the compactor uses internally for the same
+/// job, so both layers of the runner agree on the same numbers.
+///
+/// Lives in the compactor module because the compactor is the
+/// authoritative source of the "context window vs. request body"
+/// accounting. The runner treats it as a request-body check,
+/// not a compactor-policy check.
+pub struct RequestFitsEstimator {
+    model_registry: Arc<ModelRegistry>,
+}
+
+impl RequestFitsEstimator {
+    pub fn new(model_registry: Arc<ModelRegistry>) -> Self {
+        Self { model_registry }
+    }
+
+    /// Total tokens the assembled request body would consume.
+    /// Counts the system prompt, every message (text, reasoning,
+    /// tool-call input, tool-result), and every tool definition
+    /// (name, description, JSON-Schema parameters).
+    pub fn estimate_request_tokens(&self, request: &LlmRequest) -> usize {
+        let system_chars: usize = request.system.iter().map(|s| s.len()).sum();
+        let system_tokens = estimate_tokens(&" ".repeat(system_chars));
+        let message_tokens: usize = request
+            .messages
+            .iter()
+            .map(|m| {
+                let chars: usize = m
+                    .content
+                    .iter()
+                    .map(|p| match p {
+                        ContentPart::Text { text } => text.len(),
+                        ContentPart::Reasoning { text } => text.len(),
+                        ContentPart::ToolCall { input, .. } => {
+                            serde_json::to_string(input).map(|s| s.len()).unwrap_or(0)
+                        }
+                        ContentPart::ToolResult { result, .. } => {
+                            serde_json::to_string(result).map(|s| s.len()).unwrap_or(0)
+                        }
+                    })
+                    .sum();
+                estimate_tokens(&" ".repeat(chars))
+            })
+            .sum();
+        let tool_tokens: usize = request
+            .tools
+            .iter()
+            .map(|t| {
+                let params = serde_json::to_string(&t.parameters)
+                    .map(|s| estimate_tokens(&s))
+                    .unwrap_or(0);
+                estimate_tokens(&t.name) + estimate_tokens(&t.description) + params
+            })
+            .sum();
+        system_tokens + message_tokens + tool_tokens
+    }
+
+    /// `true` when the assembled request body fits the model's
+    /// hard `context_window - max_output` budget. Returns `true`
+    /// for unknown models (zero context window) so the runner
+    /// dispatches the request; the compactor's own `auto` policy
+    /// can still kick in if needed.
+    pub fn request_fits(&self, request: &LlmRequest) -> bool {
+        let spec = self
+            .model_registry
+            .lookup(&request.provider, &request.model);
+        if spec.context_window == 0 {
+            return true;
+        }
+        let estimated = self.estimate_request_tokens(request);
+        let budget = spec.context_window.saturating_sub(spec.max_output);
+        estimated <= budget
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -623,6 +691,7 @@ mod tests {
                 assistant("a2", &"d".repeat(1024)),
             ],
             summary: None,
+            recent_messages: Vec::new(),
         };
         let (head, recent) = service
             .select_from_persisted(&conv.messages)
@@ -630,7 +699,53 @@ mod tests {
         assert!(!head.is_empty());
         assert!(!recent.is_empty());
         // The most recent message stays verbatim in `recent`.
-        assert!(recent.contains("d"));
+        assert!(recent
+            .last()
+            .map(|m| m.content.contains("d"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn select_recent_preserves_role_and_id() {
+        let service = CompactionService::new(
+            test_conversation_service(),
+            Arc::new(ProviderRegistry::new()),
+            Arc::new(ModelRegistry::from_embedded_json()),
+            CompactionConfig {
+                auto: true,
+                buffer_tokens: DEFAULT_COMPACTION_BUFFER,
+                keep_recent_tokens: 1,
+            },
+        );
+        let conv = ConversationFile {
+            session_id: "s1".to_string(),
+            messages: vec![
+                user("u1", "first turn"),
+                assistant("a1", "[{\"type\":\"text\",\"text\":\"ok\"}]"),
+                user("u2", "second turn"),
+                assistant("a2", "[{\"type\":\"text\",\"text\":\"done\"}]"),
+            ],
+            summary: None,
+            recent_messages: Vec::new(),
+        };
+        let (_head, recent) = service
+            .select_from_persisted(&conv.messages)
+            .expect("selection");
+        // The recent tail must be a structured list of
+        // ConversationMessages, not a serialized string. The
+        // runner uses these directly to replay the recent turn
+        // as real model messages on the next turn.
+        assert!(!recent.is_empty());
+        let last = recent.last().expect("non-empty");
+        assert_eq!(last.role, "assistant");
+        assert_eq!(last.id, "a2");
+        assert!(last.content.contains("done"));
+        // The recent tail must be in the same order as the
+        // original messages (most-recent-last).
+        if recent.len() > 1 {
+            let first = recent.first().expect("non-empty");
+            assert!(matches!(first.role.as_str(), "user" | "assistant"));
+        }
     }
 
     #[test]
@@ -645,6 +760,7 @@ mod tests {
             session_id: "s1".to_string(),
             messages: vec![],
             summary: None,
+            recent_messages: Vec::new(),
         };
         assert!(service.select_from_persisted(&conv.messages).is_none());
     }
@@ -674,6 +790,7 @@ mod tests {
                 timestamp: "2024-01-01T00:00:00Z".to_string(),
             }],
             summary: None,
+            recent_messages: Vec::new(),
         };
         let (head, recent) = service
             .select_from_persisted(&recent_only.messages)
@@ -688,6 +805,48 @@ mod tests {
         let assistant_msg = assistant("a1", r#"[{"type":"text","text":"hi there"}]"#);
         assert_eq!(serialize_message(&user_msg), "[User]: hello");
         assert!(serialize_message(&assistant_msg).contains("[Assistant]: hi there"));
+    }
+
+    #[test]
+    fn request_fits_estimator_counts_system_tools_and_messages() {
+        use crate::llm::events::ToolDefinition;
+        use crate::llm::request::LlmMessage;
+        let estimator = RequestFitsEstimator::new(Arc::new(ModelRegistry::from_embedded_json()));
+        let request = LlmRequest::new("gpt-4o-mini", "openai")
+            .with_system("You are a coding assistant.")
+            .with_message(LlmMessage::user("hi"))
+            .with_tools(vec![ToolDefinition::new(
+                "read",
+                "Read a file",
+                serde_json::json!({"type": "object", "properties": {"path": {"type":"string"}}}),
+            )]);
+        // gpt-4o-mini is registered in the embedded JSON with a
+        // generous context window, so a one-line request fits.
+        assert!(estimator.request_fits(&request));
+        // The estimate is larger when tools are present.
+        let without_tools = LlmRequest::new("gpt-4o-mini", "openai")
+            .with_system("You are a coding assistant.")
+            .with_message(LlmMessage::user("hi"));
+        let with_tools = estimator.estimate_request_tokens(&request);
+        let without = estimator.estimate_request_tokens(&without_tools);
+        assert!(with_tools > without, "tools should add tokens");
+    }
+
+    #[test]
+    fn request_fits_estimator_rejects_oversize_request() {
+        let estimator = RequestFitsEstimator::new(Arc::new(ModelRegistry::from_embedded_json()));
+        // Build a request that is clearly too large for any
+        // 128k model: a 1 MiB system prompt.
+        let oversized_system = "a".repeat(1_024 * 1_024);
+        let request = LlmRequest::new("gpt-4o-mini", "openai").with_system(oversized_system);
+        assert!(!estimator.request_fits(&request));
+    }
+
+    #[test]
+    fn request_fits_estimator_returns_true_for_unknown_model() {
+        let estimator = RequestFitsEstimator::new(Arc::new(ModelRegistry::from_embedded_json()));
+        let request = LlmRequest::new("no-such-model", "openai");
+        assert!(estimator.request_fits(&request));
     }
 
     // Test helpers

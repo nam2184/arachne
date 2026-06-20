@@ -3,21 +3,16 @@ use std::path::Path;
 use crate::file_mutation::FileMutationService;
 use crate::{ToolCall, ToolResult};
 
-use super::{failure, string_arg, success};
+use super::{failure, resolve_session_path, string_arg, success, ToolContext};
 
 pub fn run(call: &ToolCall) -> ToolResult {
-    let path = string_arg(call, "path");
-    let content = string_arg(call, "content");
-    let mutation = FileMutationService::new();
-    let target = match mutation.target(Path::new(&path)) {
-        Ok(target) => target,
-        Err(error) => return failure("write", error.to_string()),
-    };
+    run_with_context(call, &ToolContext::default())
+}
 
-    match mutation.write_text_preserving_bom(&target, &content) {
-        Ok(_) => success("write", format!("Wrote {path}")),
-        Err(error) => failure("write", error.to_string()),
-    }
+pub fn run_with_context(call: &ToolCall, ctx: &ToolContext) -> ToolResult {
+    let requested = string_arg(call, "path");
+    let path = resolve_session_path(&requested, ctx, "write");
+    run_with_path(call, &path)
 }
 
 pub fn run_with_path(call: &ToolCall, path: &Path) -> ToolResult {

@@ -78,6 +78,19 @@ impl FileMutationService {
         FileTarget::resolve(path.as_ref())
     }
 
+    /// Resolve a path with an explicit session cwd. Relative
+    /// paths are anchored to `cwd` instead of the process cwd.
+    /// This is what the v1 tool runner uses so file mutations
+    /// in a session land in the session's directory, not the
+    /// Tauri install dir.
+    pub fn target_in(
+        &self,
+        path: impl AsRef<Path>,
+        cwd: &Path,
+    ) -> Result<FileTarget, FileMutationError> {
+        FileTarget::resolve_with_cwd(path.as_ref(), cwd)
+    }
+
     pub fn create(
         &self,
         target: &FileTarget,
@@ -186,6 +199,15 @@ impl FileMutationService {
 
 impl FileTarget {
     pub fn resolve(path: &Path) -> Result<Self, FileMutationError> {
+        Self::resolve_with_cwd(path, Path::new(""))
+    }
+
+    /// Like `resolve` but anchors relative paths to `cwd`
+    /// instead of the process cwd. An empty `cwd` preserves the
+    /// legacy behavior (process-cwd fallback for relative
+    /// paths). The `cwd` is expected to be a session
+    /// `project_root` set by the runner.
+    pub fn resolve_with_cwd(path: &Path, cwd: &Path) -> Result<Self, FileMutationError> {
         let resource = path.to_string_lossy().to_string();
         if resource.trim().is_empty() {
             return Err(FileMutationError::Io {
@@ -193,8 +215,18 @@ impl FileTarget {
                 message: "path is required".to_string(),
             });
         }
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else if !cwd.as_os_str().is_empty() {
+            cwd.join(path)
+        } else {
+            // No cwd available: fall back to the canonical
+            // process-cwd behavior, which is what older code
+            // did.
+            path.to_path_buf()
+        };
         Ok(Self {
-            canonical: canonical_path(path)?,
+            canonical: canonical_path(&absolute)?,
             resource,
         })
     }

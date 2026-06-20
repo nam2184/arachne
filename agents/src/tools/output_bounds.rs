@@ -23,7 +23,8 @@ pub const READ_DEFAULT_LIMIT: usize = 2_000;
 
 const MARKER: &str = "... output truncated; full content suppressed to fit context ...";
 const MARKER_SPILL_PREFIX: &str = "... output truncated; full content saved to: ";
-const MARKER_SPILL_SUFFIX: &str = " (use `read` with offset/limit or `grep` on the file to dig deeper) ...";
+const MARKER_SPILL_SUFFIX: &str =
+    " (use `read` with offset/limit or `grep` on the file to dig deeper) ...";
 const LINE_SUFFIX: &str = "... (line truncated to 2000 chars)";
 
 /// Append the truncation marker to `kept`. When `spill_path` is
@@ -56,11 +57,7 @@ static SPILL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 ///
 /// The filename pattern is `<hint>-<seq>.txt` so a directory
 /// listing reveals the tool the spillover came from.
-fn spill_to_disk(
-    text: &str,
-    spill_dir: Option<&std::path::Path>,
-    hint: &str,
-) -> Option<String> {
+fn spill_to_disk(text: &str, spill_dir: Option<&std::path::Path>, hint: &str) -> Option<String> {
     let dir = spill_dir?;
     if let Err(error) = std::fs::create_dir_all(dir) {
         tracing::warn!(?error, ?dir, "spill_to_disk: create_dir_all failed");
@@ -110,11 +107,7 @@ fn clip_line(line: &str) -> (String, bool) {
     if chars.len() <= MAX_LINE_LENGTH {
         return (line.to_string(), false);
     }
-    let mut out: String = chars
-        .iter()
-        .take(MAX_LINE_LENGTH)
-        .copied()
-        .collect();
+    let mut out: String = chars.iter().take(MAX_LINE_LENGTH).copied().collect();
     out.push_str(LINE_SUFFIX);
     (out, true)
 }
@@ -133,7 +126,11 @@ fn clip_line(line: &str) -> (String, bool) {
 /// marker uses the legacy "suppressed" phrasing. `hint` is a
 /// short string (e.g. "shell" or "webfetch") used as the file
 /// prefix to make the spillover directory browsable.
-pub fn bound_tool_output(text: &str, spill_dir: Option<&std::path::Path>, hint: &str) -> BoundedOutput {
+pub fn bound_tool_output(
+    text: &str,
+    spill_dir: Option<&std::path::Path>,
+    hint: &str,
+) -> BoundedOutput {
     bound_tool_output_with(text, spill_dir, hint)
 }
 
@@ -437,7 +434,11 @@ mod tests {
             .lines()
             .filter(|line| !line.is_empty() && !line.contains("output truncated"))
             .collect();
-        assert_eq!(data_lines.len(), 1, "expected exactly one data line, got: {data_lines:?}");
+        assert_eq!(
+            data_lines.len(),
+            1,
+            "expected exactly one data line, got: {data_lines:?}"
+        );
         assert!(data_lines[0].contains("(line truncated to 2000 chars)"));
     }
 
@@ -447,7 +448,10 @@ mod tests {
         // reflect how many were dropped. The runner uses this
         // to render a "(showing first N of M lines)" hint.
         let total = MAX_TOOL_OUTPUT_LINES + 50;
-        let text: String = (0..total).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let text: String = (0..total)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let out = bound_tool_output(&text, None, "test");
         assert!(out.truncated);
         assert_eq!(out.dropped_lines, total - MAX_TOOL_OUTPUT_LINES);
@@ -492,7 +496,10 @@ mod tests {
 
     #[test]
     fn tail_under_cap_does_not_truncate() {
-        let text: String = (0..100).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let text: String = (0..100)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let out = tail_bound_output(&text, None, "test");
         assert!(!out.truncated);
         assert_eq!(out.text, text);
@@ -517,11 +524,7 @@ mod tests {
         // The kept text (before the marker) is at most the byte
         // cap plus the line cap's worth of delimiters + the
         // marker. Allow generous headroom.
-        let without_marker = out
-            .text
-            .split(MARKER)
-            .next()
-            .unwrap_or("");
+        let without_marker = out.text.split(MARKER).next().unwrap_or("");
         assert!(without_marker.len() <= MAX_TOOL_OUTPUT_BYTES + 200);
     }
 
@@ -566,7 +569,9 @@ mod tests {
             .join("\n");
         let out = bound_tool_output(&text, Some(tmp.path()), "read");
         assert!(out.truncated);
-        let path = out.spill_path.expect("spill_path set when spill_dir is Some");
+        let path = out
+            .spill_path
+            .expect("spill_path set when spill_dir is Some");
         assert!(path.starts_with(tmp.path().to_str().unwrap()));
         assert!(path.ends_with(".txt"));
         // Filename uses the hint ("read") for grep-ability.
@@ -575,7 +580,10 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(filename.starts_with("read-"), "filename should start with hint, got: {filename}");
+        assert!(
+            filename.starts_with("read-"),
+            "filename should start with hint, got: {filename}"
+        );
         // Marker references the path.
         assert!(out.text.contains(&path));
         assert!(out.text.contains("saved to:"));

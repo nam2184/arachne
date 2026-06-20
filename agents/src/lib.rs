@@ -11,6 +11,7 @@ pub mod patch;
 pub mod permission;
 pub mod permission_v2;
 pub mod provider_service;
+pub mod routing;
 pub mod sandbox;
 pub mod sessions;
 pub mod tools;

@@ -6,20 +6,25 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
-use super::{log_sse_event_body, LlmError, LlmProvider, LlmStream};
+use super::{log_sse_event_body, openai_compatible_endpoint_url, LlmError, LlmProvider, LlmStream};
 use crate::llm::events::{FinishReason, LlmEvent, ToolDefinition};
 use crate::llm::request::{ContentPart, LlmRequest};
 
-pub struct OpenAiCompatibleChatProvider {
+pub struct OpenAiCompatibleHttpProvider {
     provider_name: String,
     api_key_env: String,
     api_key: Option<String>,
     base_url: String,
     supported_models: Vec<String>,
     http_client: reqwest::Client,
+    /// When `true`, tool results are emitted as `<system-reminder>`
+    /// user-role entries instead of structured `role: "tool"`
+    /// messages. Default depends on the provider name; see
+    /// `OpenAiCompatibleHttpProvider::new`.
+    wrap_tool_results: bool,
 }
 
-impl OpenAiCompatibleChatProvider {
+impl OpenAiCompatibleHttpProvider {
     pub fn new(
         provider_name: &str,
         api_key: Option<String>,
@@ -28,6 +33,12 @@ impl OpenAiCompatibleChatProvider {
         api_key_env: &str,
         supported_models: &[&str],
     ) -> Self {
+        // Default to `<system-reminder>` wrapping for any
+        // non-OpenAI provider — Minimax, OpenRouter, Together, etc.
+        // — because their tool-call correlation is more reliable
+        // when the result is a tagged user-role entry. OpenAI
+        // itself uses the structured `role: "tool"` form.
+        let wrap_tool_results = !provider_name.trim().eq_ignore_ascii_case("openai");
         Self {
             provider_name: provider_name.to_string(),
             api_key_env: api_key_env.to_string(),
@@ -38,6 +49,7 @@ impl OpenAiCompatibleChatProvider {
                 .map(|model| model.to_string())
                 .collect(),
             http_client: reqwest::Client::new(),
+            wrap_tool_results,
         }
     }
 
@@ -46,8 +58,22 @@ impl OpenAiCompatibleChatProvider {
         self
     }
 
+    /// Override the wire renderer. When `true`, tool results are
+    /// emitted as `<system-reminder>` user-role entries instead of
+    /// structured `role: "tool"` messages. Defaults to `true` for
+    /// non-OpenAI providers, `false` for OpenAI itself.
+    #[allow(dead_code)]
+    pub fn with_wrap_tool_results(mut self, wrap: bool) -> Self {
+        self.wrap_tool_results = wrap;
+        self
+    }
+
+    fn wrap_tool_results(&self) -> bool {
+        self.wrap_tool_results
+    }
+
     pub fn chat_completions_url(&self) -> String {
-        format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+        openai_compatible_endpoint_url(&self.base_url, "chat/completions")
     }
 
     pub async fn endpoint_status(&self, model: &str) -> Result<reqwest::StatusCode, LlmError> {
@@ -87,13 +113,17 @@ impl OpenAiCompatibleChatProvider {
 }
 
 #[async_trait]
-impl LlmProvider for OpenAiCompatibleChatProvider {
+impl LlmProvider for OpenAiCompatibleHttpProvider {
     fn provider_name(&self) -> &str {
         &self.provider_name
     }
 
     fn supported_models(&self) -> Vec<String> {
         self.supported_models.clone()
+    }
+
+    fn backend_name(&self) -> &str {
+        "http"
     }
 
     fn model_base_url(&self) -> Option<&str> {
@@ -106,7 +136,18 @@ impl LlmProvider for OpenAiCompatibleChatProvider {
 
     async fn stream(&self, request: LlmRequest) -> Result<LlmStream, LlmError> {
         let api_key = self.api_key.as_ref().ok_or_else(|| self.auth_error())?;
-        let body = build_request_body(&request, lower_messages);
+        // Per-provider wire-format selection. Some OpenAI-compatible
+        // proxies don't reliably round-trip the structured
+        // `role: "tool"` + `tool_call_id` correlation, so for them
+        // we render tool results as `<system-reminder>` user-role
+        // entries instead. The default is the OpenAI-spec
+        // structured form.
+        let renderer: fn(&LlmRequest) -> Vec<serde_json::Value> = if self.wrap_tool_results() {
+            lower_messages_wrapped
+        } else {
+            lower_messages
+        };
+        let body = build_request_body(&self.provider_name, &request, renderer);
 
         tracing::debug!(
             "llm request: provider={} url={} model={} has_api_key={} tool_count={}",
@@ -123,11 +164,11 @@ impl LlmProvider for OpenAiCompatibleChatProvider {
         let body_bytes = serde_json::to_vec(&body)
             .map(|body| body.len())
             .unwrap_or(0);
-        tracing::info!(
-            "llm request body prepared: provider={} url={} model={} body_bytes={}",
-            self.provider_name,
-            self.chat_completions_url(),
-            request.model,
+        log_http_request_body(
+            &self.provider_name,
+            &self.chat_completions_url(),
+            &request.model,
+            &body,
             body_bytes,
         );
 
@@ -670,28 +711,63 @@ fn parse_openai_usage(value: &Value) -> Option<crate::llm::events::Usage> {
     })
 }
 
+fn log_http_request_body(
+    provider: &str,
+    url: &str,
+    model: &str,
+    body: &serde_json::Value,
+    body_bytes: usize,
+) {
+    let body =
+        serde_json::to_string_pretty(body).unwrap_or_else(|_| "<unserializable>".to_string());
+    const MAX_LOG_BYTES: usize = 64 * 1024;
+    let body_truncated = body.len() > MAX_LOG_BYTES;
+    let body_display = if body_truncated {
+        body.chars().take(MAX_LOG_BYTES).collect::<String>()
+    } else {
+        body
+    };
+
+    tracing::info!(
+        provider,
+        url,
+        model,
+        body_bytes,
+        body_truncated,
+        body = %body_display,
+        "llm http request body prepared"
+    );
+}
+
 fn build_request_body(
+    provider_name: &str,
     request: &LlmRequest,
     lower_messages: impl Fn(&LlmRequest) -> Vec<serde_json::Value>,
 ) -> serde_json::Value {
     let messages = lower_messages(request);
+    let minimax = is_minimax_provider(provider_name);
 
     let mut body = serde_json::json!({
         "model": request.model,
         "messages": messages,
         "stream": true,
-        "stream_options": { "include_usage": true },
     });
 
-    if let Some(session_id) = &request.session_id {
-        // `user` on Chat Completions is the documented cache-routing
-        // hint: OpenAI uses it to bucket requests from the same end
-        // user, which keeps the implicit prefix cache hot across
-        // turns. OpenAI Responses uses `prompt_cache_key` instead;
-        // both are passed through by the AI SDK OpenAI provider
-        // when the chat-completions path picks them up. The header
-        // is for upstream gateways that key on it.
-        body["user"] = serde_json::json!(session_id);
+    if !minimax {
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
+
+    if !minimax {
+        if let Some(session_id) = &request.session_id {
+            // `user` on Chat Completions is the documented cache-routing
+            // hint: OpenAI uses it to bucket requests from the same end
+            // user, which keeps the implicit prefix cache hot across
+            // turns. OpenAI Responses uses `prompt_cache_key` instead;
+            // both are passed through by the AI SDK OpenAI provider
+            // when the chat-completions path picks them up. The header
+            // is for upstream gateways that key on it.
+            body["user"] = serde_json::json!(session_id);
+        }
     }
 
     if let Some(temp) = request.temperature {
@@ -715,13 +791,18 @@ fn build_request_body(
     // other models alone.
     let model_lower = request.model.to_lowercase();
     if model_lower.contains("gpt-5") && !model_lower.contains("gpt-5-chat") {
-        if !body.as_object().map_or(true, |o| o.contains_key("reasoning_effort")) {
+        if !body
+            .as_object()
+            .map_or(true, |o| o.contains_key("reasoning_effort"))
+        {
             if !model_lower.contains("gpt-5-pro") {
                 body["reasoning_effort"] = serde_json::json!("medium");
             }
         }
         if model_lower.contains("gpt-5.")
-            && !body.as_object().map_or(true, |o| o.contains_key("verbosity"))
+            && !body
+                .as_object()
+                .map_or(true, |o| o.contains_key("verbosity"))
         {
             body["verbosity"] = serde_json::json!("low");
         }
@@ -738,6 +819,10 @@ fn build_request_body(
     }
 
     body
+}
+
+fn is_minimax_provider(provider_name: &str) -> bool {
+    provider_name.trim().eq_ignore_ascii_case("minimax")
 }
 
 fn lower_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
@@ -796,7 +881,7 @@ mod body_tests {
         // After the opencode-style refactor, tools ARE sent on the
         // wire. The model returns structured `delta.tool_calls`
         // events.
-        let body = build_request_body(&sample_request(), |_req| {
+        let body = build_request_body("openai", &sample_request(), |_req| {
             vec![serde_json::json!({"role": "user", "content": "hi"})]
         });
         let tools = body.get("tools").and_then(|t| t.as_array()).expect("tools");
@@ -808,7 +893,7 @@ mod body_tests {
     #[test]
     fn build_request_body_omits_tools_field_when_empty() {
         let req = LlmRequest::new("gpt-4o-mini", "openai").with_message(LlmMessage::user("hi"));
-        let body = build_request_body(&req, |_| vec![]);
+        let body = build_request_body("openai", &req, |_| vec![]);
         assert!(
             body.get("tools").is_none(),
             "tools must not be sent when none are defined; body was: {body}"
@@ -817,7 +902,7 @@ mod body_tests {
 
     #[test]
     fn build_request_body_includes_messages_model_stream() {
-        let body = build_request_body(&sample_request(), |_req| {
+        let body = build_request_body("openai", &sample_request(), |_req| {
             vec![serde_json::json!({"role": "user", "content": "hi"})]
         });
         assert_eq!(body["model"], "gpt-4o-mini");
@@ -838,12 +923,252 @@ mod body_tests {
         req.max_tokens = Some(256);
         req.top_p = Some(0.9);
         req.stop = Some(vec!["STOP".to_string()]);
-        let body = build_request_body(&req, |_| vec![]);
+        let body = build_request_body("openai", &req, |_| vec![]);
         assert_eq!(body["temperature"].as_f64().unwrap(), 0.5);
         assert_eq!(body["max_tokens"], 256);
         let top_p = body["top_p"].as_f64().unwrap();
         assert!((top_p - 0.9).abs() < 1e-5, "top_p was {top_p}");
         assert_eq!(body["stop"][0], "STOP");
+    }
+
+    #[test]
+    fn minimax_request_body_omits_openai_optional_fields() {
+        let req = LlmRequest::new("MiniMax-M3", "minimax")
+            .with_message(LlmMessage::user("hi"))
+            .with_session_id("session-1".to_string());
+        let body = build_request_body("minimax", &req, |_req| {
+            vec![serde_json::json!({"role": "user", "content": "hi"})]
+        });
+
+        assert!(body.get("stream_options").is_none(), "body was: {body}");
+        assert!(body.get("user").is_none(), "body was: {body}");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn assistant_tool_call_message_renders_structured_tool_calls_field() {
+        // This is the regression test for "after a tool call,
+        // every message returns 400". The previous wire renderer
+        // passed tool calls as text content (XML-shaped) which
+        // strict providers reject; the new renderer emits the
+        // structured `tool_calls` field with canonical JSON
+        // `arguments`.
+        let assistant = LlmMessage {
+            role: "assistant".to_string(),
+            content: vec![ContentPart::ToolCall {
+                id: "call_abc".to_string(),
+                name: "read".to_string(),
+                input: serde_json::json!({"path": "src/lib.rs"}),
+            }],
+        };
+        let entry = lower_assistant_message(&assistant.content);
+        assert_eq!(entry["role"], "assistant");
+        assert!(
+            entry.get("tool_calls").is_some(),
+            "expected structured tool_calls; got: {entry}"
+        );
+        let tool_calls = entry["tool_calls"].as_array().expect("array");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], "call_abc");
+        assert_eq!(tool_calls[0]["type"], "function");
+        assert_eq!(tool_calls[0]["function"]["name"], "read");
+        // Canonical JSON: no whitespace, no escape issues, no
+        // unquoted keys.
+        assert_eq!(
+            tool_calls[0]["function"]["arguments"],
+            r#"{"path":"src/lib.rs"}"#
+        );
+    }
+
+    #[test]
+    fn tool_message_renders_structured_tool_call_id_and_content() {
+        let tool = LlmMessage::tool("call_abc", "read", serde_json::json!({"text": "hello"}));
+        let entry = lower_tool_message(&tool.content);
+        assert_eq!(entry["role"], "tool");
+        assert_eq!(entry["tool_call_id"], "call_abc");
+        assert_eq!(entry["name"], "read");
+        // Tool result content is the canonical JSON of the
+        // result. OpenAI spec allows either a string or an
+        // object here; we always emit the string form.
+        assert_eq!(entry["content"], r#"{"text":"hello"}"#);
+    }
+
+    #[test]
+    fn assistant_message_with_text_and_tool_call_keeps_both() {
+        // The model can interleave text (e.g. a sentence) and a
+        // tool call. The renderer must preserve both, not drop
+        // the text in favor of the tool call.
+        let assistant = LlmMessage {
+            role: "assistant".to_string(),
+            content: vec![
+                ContentPart::Text {
+                    text: "Let me read the file.".to_string(),
+                },
+                ContentPart::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"path": "/tmp/x"}),
+                },
+            ],
+        };
+        let entry = lower_assistant_message(&assistant.content);
+        assert_eq!(entry["role"], "assistant");
+        assert_eq!(entry["content"], "Let me read the file.");
+        let tool_calls = entry["tool_calls"].as_array().expect("array");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0]["function"]["arguments"],
+            r#"{"path":"/tmp/x"}"#
+        );
+    }
+
+    #[test]
+    fn assistant_text_only_message_has_no_tool_calls_field() {
+        // A pure-text assistant message must not carry a
+        // `tool_calls` field — providers may reject the empty
+        // array or the field's presence.
+        let assistant = LlmMessage::assistant("All done.");
+        let entry = lower_assistant_message(&assistant.content);
+        assert_eq!(entry["role"], "assistant");
+        assert_eq!(entry["content"], "All done.");
+        assert!(
+            entry.get("tool_calls").is_none(),
+            "tool_calls must be absent on text-only messages; got: {entry}"
+        );
+    }
+
+    #[test]
+    fn assistant_tool_call_with_complex_input_renders_canonical_json() {
+        // Inputs containing escapes, nested objects, and
+        // unicode must be serialized canonically — the
+        // pre-fix `serde_json::Value::Display` path produced
+        // a value whose `to_string` was *not* valid JSON in
+        // some edge cases.
+        let assistant = LlmMessage {
+            role: "assistant".to_string(),
+            content: vec![ContentPart::ToolCall {
+                id: "call_1".to_string(),
+                name: "shell".to_string(),
+                input: serde_json::json!({
+                    "command": "echo \"hello, 世界\"",
+                    "count": 3,
+                    "nested": {"a": [1, 2, 3]},
+                }),
+            }],
+        };
+        let entry = lower_assistant_message(&assistant.content);
+        let arguments = entry["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("string");
+        // The arguments must parse as valid JSON.
+        let parsed: serde_json::Value =
+            serde_json::from_str(arguments).expect("arguments must be valid JSON");
+        assert_eq!(parsed["command"], "echo \"hello, 世界\"");
+        assert_eq!(parsed["count"], 3);
+        assert_eq!(parsed["nested"]["a"][2], 3);
+    }
+
+    #[test]
+    fn tool_message_wrapped_renders_system_reminder_user_entry() {
+        // The wrapped renderer is the parallel of
+        // `lower_tool_message` for non-OpenAI providers that
+        // don't reliably correlate `tool_call_id`. The result
+        // is a `user`-role entry whose content is wrapped in a
+        // `<system-reminder>...</system-reminder>` block, so
+        // the model treats it as a fresh system-injected
+        // instruction rather than a stale tool result.
+        let tool = LlmMessage::tool("call_abc", "read", serde_json::json!({"text": "hello"}));
+        let entry = lower_tool_message_wrapped(&tool.content);
+        assert_eq!(entry["role"], "user");
+        let content = entry["content"].as_str().expect("string content");
+        assert!(
+            content.starts_with("<system-reminder>\n"),
+            "missing opening tag: {content:?}"
+        );
+        assert!(
+            content.ends_with("</system-reminder>"),
+            "missing closing tag: {content:?}"
+        );
+        assert!(
+            content.contains("call_id=call_abc"),
+            "missing call id: {content:?}"
+        );
+        assert!(
+            content.contains("[Tool result for read"),
+            "missing tool name: {content:?}"
+        );
+        // The body is the canonical JSON of the result.
+        assert!(
+            content.contains(r#"{"text":"hello"}"#),
+            "missing result body: {content:?}"
+        );
+        // The wrapped renderer must NOT carry a `tool_call_id`
+        // field — it's a plain user message.
+        assert!(entry.get("tool_call_id").is_none());
+    }
+
+    #[test]
+    fn lower_messages_wrapped_dispatches_per_role() {
+        // Top-level dispatch: assistant stays structured
+        // (tool_calls field), tool results become user-role
+        // `<system-reminder>` entries, plain user/system
+        // messages pass through unchanged.
+        let request = LlmRequest::new("MiniMax-M3", "minimax")
+            .with_system("You are a helpful assistant.")
+            .with_message(LlmMessage::user("read /etc/hostname"))
+            .with_message(LlmMessage {
+                role: "assistant".to_string(),
+                content: vec![ContentPart::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"path": "/etc/hostname"}),
+                }],
+            })
+            .with_message(LlmMessage::tool(
+                "call_1",
+                "read",
+                serde_json::json!({"text": "host1\n"}),
+            ));
+        let messages = lower_messages_wrapped(&request);
+        assert_eq!(messages.len(), 4);
+        // System message passes through.
+        assert_eq!(messages[0]["role"], "system");
+        // User message passes through.
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "read /etc/hostname");
+        // Assistant tool call is structured.
+        assert_eq!(messages[2]["role"], "assistant");
+        assert!(messages[2].get("tool_calls").is_some());
+        // Tool result is the user-role `<system-reminder>` entry.
+        assert_eq!(messages[3]["role"], "user");
+        let body = messages[3]["content"].as_str().expect("string");
+        assert!(body.starts_with("<system-reminder>"));
+        assert!(body.contains("call_id=call_1"));
+    }
+
+    #[test]
+    fn http_provider_defaults_wrap_tool_results_for_non_openai() {
+        // The default flag mirrors the opencode convention: any
+        // provider that is not "openai" itself defaults to the
+        // wrapped renderer.
+        let minimax = OpenAiCompatibleHttpProvider::new(
+            "minimax",
+            Some("test-key".to_string()),
+            None,
+            "https://api.minimax.io/v1",
+            "MINIMAX_TOKEN_PLAN_KEY",
+            &["MiniMax-M3"],
+        );
+        assert!(minimax.wrap_tool_results());
+        let openai = OpenAiCompatibleHttpProvider::new(
+            "openai",
+            Some("test-key".to_string()),
+            None,
+            "https://api.openai.com/v1",
+            "OPENAI_API_KEY",
+            &["gpt-4o-mini"],
+        );
+        assert!(!openai.wrap_tool_results());
     }
 
     // ---- tool-stream parser ----
@@ -1164,20 +1489,171 @@ fn lower_messages(request: &LlmRequest) -> Vec<serde_json::Value> {
     request
         .messages
         .iter()
-        .map(|msg| {
-            let role = match msg.role.as_str() {
-                "user" => "user",
-                "assistant" => "assistant",
-                "system" => "system",
-                "tool" => "tool",
-                _ => "user",
-            };
-            serde_json::json!({ "role": role, "content": lower_content(&msg.content) })
+        .map(|msg| match msg.role.as_str() {
+            "tool" => lower_tool_message(&msg.content),
+            "assistant" => lower_assistant_message(&msg.content),
+            _ => serde_json::json!({
+                "role": msg.role,
+                "content": lower_text_content(&msg.content),
+            }),
         })
         .collect()
 }
 
-fn lower_content(content: &[ContentPart]) -> serde_json::Value {
+/// Render tool results as `<system-reminder>` user-role entries
+/// instead of structured `role: "tool"` messages. Robust on
+/// providers that don't reliably correlate `tool_call_id`
+/// (e.g. some OpenAI-compatible proxies). Mirrors opencode /
+/// claude-code's `<system-reminder>...</system-reminder>`
+/// injection pattern. The assistant tool-call messages are
+/// still rendered with the structured `tool_calls` field so
+/// providers that DO use `tool_call_id` can correlate the two.
+fn lower_messages_wrapped(request: &LlmRequest) -> Vec<serde_json::Value> {
+    request
+        .messages
+        .iter()
+        .map(|msg| match msg.role.as_str() {
+            "tool" => lower_tool_message_wrapped(&msg.content),
+            "assistant" => lower_assistant_message(&msg.content),
+            _ => serde_json::json!({
+                "role": msg.role,
+                "content": lower_text_content(&msg.content),
+            }),
+        })
+        .collect()
+}
+
+/// Render `role: "tool"` messages wrapped in a `<system-reminder>`
+/// block. The model sees the tool result as a fresh
+/// system-injected user message rather than as a structured
+/// `tool` role entry. This mirrors opencode / claude-code's
+/// `<system-reminder>...</system-reminder>` injection pattern,
+/// which is robust on providers that don't reliably correlate
+/// `tool_call_id` (e.g. some OpenAI-compatible proxies).
+fn lower_tool_message_wrapped(content: &[ContentPart]) -> serde_json::Value {
+    let mut tool_call_id: Option<String> = None;
+    let mut tool_name: Option<String> = None;
+    let mut result_text: Option<String> = None;
+    for part in content {
+        if let ContentPart::ToolResult { id, name, result } = part {
+            tool_call_id = Some(id.clone());
+            tool_name = Some(name.clone());
+            result_text =
+                Some(serde_json::to_string(result).unwrap_or_else(|_| "null".to_string()));
+            break;
+        }
+    }
+    let id = tool_call_id.unwrap_or_default();
+    let name = tool_name.unwrap_or_default();
+    let body = result_text.unwrap_or_default();
+    let wrapped = format!(
+        "<system-reminder>\n[Tool result for {name} (call_id={id})]:\n{body}\n</system-reminder>"
+    );
+    serde_json::json!({
+        "role": "user",
+        "content": wrapped,
+    })
+}
+
+/// Render an assistant message, preserving the structured
+/// `tool_calls` field on the wire. The arguments are serialized
+/// canonically via `serde_json::to_string` — never via
+/// `serde_json::Value::Display`, which is not guaranteed to be
+/// valid JSON and is the root cause of provider 4xx errors on
+/// tool-call continuations.
+fn lower_assistant_message(content: &[ContentPart]) -> serde_json::Value {
+    let mut text_parts: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    for part in content {
+        match part {
+            ContentPart::ToolCall { id, name, input } => {
+                let arguments = serde_json::to_string(input).unwrap_or_else(|_| "null".to_string());
+                tool_calls.push(serde_json::json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                }));
+            }
+            ContentPart::Text { text } => {
+                if !text.is_empty() {
+                    text_parts.push(text.clone());
+                }
+            }
+            // Reasoning and tool-result parts are not part of an
+            // assistant message — they're handled elsewhere.
+            _ => {}
+        }
+    }
+
+    let mut entry = serde_json::Map::new();
+    entry.insert(
+        "role".to_string(),
+        serde_json::Value::String("assistant".to_string()),
+    );
+    let text = text_parts.join("\n");
+    if tool_calls.is_empty() {
+        // Plain assistant text message: emit a string content
+        // for OpenAI chat-completions compatibility.
+        entry.insert("content".to_string(), serde_json::Value::String(text));
+    } else {
+        if text.is_empty() {
+            entry.insert("content".to_string(), serde_json::Value::Null);
+        } else {
+            entry.insert("content".to_string(), serde_json::Value::String(text));
+        }
+        entry.insert(
+            "tool_calls".to_string(),
+            serde_json::Value::Array(tool_calls),
+        );
+    }
+    serde_json::Value::Object(entry)
+}
+
+/// Render a `role: "tool"` message with the structured
+/// `tool_call_id` field. The result's canonical-JSON string is
+/// the `content` field. Both `tool_call_id` and `name` are sent so
+/// strict providers (Minimax, OpenAI strict mode) can correlate
+/// the result back to the original call.
+fn lower_tool_message(content: &[ContentPart]) -> serde_json::Value {
+    let mut tool_call_id: Option<String> = None;
+    let mut tool_name: Option<String> = None;
+    let mut result_text: Option<String> = None;
+    for part in content {
+        if let ContentPart::ToolResult { id, name, result } = part {
+            tool_call_id = Some(id.clone());
+            tool_name = Some(name.clone());
+            result_text =
+                Some(serde_json::to_string(result).unwrap_or_else(|_| "null".to_string()));
+            break;
+        }
+    }
+    let mut entry = serde_json::Map::new();
+    entry.insert(
+        "role".to_string(),
+        serde_json::Value::String("tool".to_string()),
+    );
+    entry.insert(
+        "content".to_string(),
+        serde_json::Value::String(result_text.unwrap_or_default()),
+    );
+    if let Some(id) = tool_call_id {
+        entry.insert("tool_call_id".to_string(), serde_json::Value::String(id));
+    }
+    if let Some(name) = tool_name {
+        entry.insert("name".to_string(), serde_json::Value::String(name));
+    }
+    serde_json::Value::Object(entry)
+}
+
+/// Render plain text content (used for `user`, `system`, and
+/// assistant messages that contain no `ToolCall` parts). The
+/// OpenAI chat-completions API accepts a string `content` for
+/// plain text; we use the string form to avoid the array form's
+/// token overhead.
+fn lower_text_content(content: &[ContentPart]) -> serde_json::Value {
     if content.is_empty() {
         return serde_json::Value::String(String::new());
     }

@@ -127,7 +127,10 @@ impl PermissionService {
                 },
             );
         }
-        let _ = self.request_tx.send(request);
+        if self.request_tx.send(request).is_err() {
+            self.pending.write().remove(&id);
+            return Err(CheckError::Rejected { id });
+        }
         match reply_rx.blocking_recv() {
             Ok(UserReply::Once) | Ok(UserReply::Always) => Ok(CheckOutcome::Allowed),
             Ok(UserReply::Reject) | Err(_) => Err(CheckError::Rejected { id }),
@@ -191,7 +194,10 @@ impl PermissionService {
                 },
             );
         }
-        let _ = self.request_tx.send(request);
+        if self.request_tx.send(request).is_err() {
+            self.pending.write().remove(&id);
+            return Err(CheckError::Rejected { id });
+        }
         match reply_rx.await {
             Ok(UserReply::Once) | Ok(UserReply::Always) => Ok(CheckOutcome::Allowed),
             Ok(UserReply::Reject) | Err(_) => Err(CheckError::Rejected { id }),

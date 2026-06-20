@@ -4,6 +4,9 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::database::{Database, ProviderConfigRepository};
+use crate::llm::providers::{
+    aisdk_provider_base_url_env, aisdk_provider_model_env, aisdk_supported_provider_names,
+};
 use crate::{ProviderConfig, ProviderProtocol};
 
 pub struct ProviderService {
@@ -32,23 +35,31 @@ impl ProviderService {
     }
 
     fn default_configs() -> Vec<ProviderConfig> {
-        vec![
-            ProviderConfig::new(
-                "anthropic".to_string(),
-                "claude-3-5-sonnet-20241022".to_string(),
+        let mut configs = vec![
+            provider_config(
+                "anthropic",
+                "claude-3-5-sonnet-20241022",
                 ProviderProtocol::Anthropic,
+                true,
             ),
-            ProviderConfig::new(
-                "openai".to_string(),
-                "gpt-4o".to_string(),
-                ProviderProtocol::OpenAI,
-            ),
-            ProviderConfig::new(
-                "minimax".to_string(),
-                "MiniMax-M3".to_string(),
-                ProviderProtocol::OpenAI,
-            ),
-        ]
+            provider_config("openai", "gpt-4o", ProviderProtocol::OpenAI, true),
+            provider_config("minimax", "MiniMax-M3", ProviderProtocol::OpenAI, true),
+        ];
+
+        for provider_name in aisdk_supported_provider_names() {
+            if configs.iter().any(|config| config.name == *provider_name) {
+                continue;
+            }
+
+            configs.push(provider_config(
+                provider_name,
+                &default_model_for_provider(provider_name),
+                protocol_for_provider(provider_name),
+                false,
+            ));
+        }
+
+        configs
     }
 
     fn db(&self) -> Result<Database, String> {
@@ -70,6 +81,19 @@ impl ProviderService {
             configs = Self::default_configs();
             for config in &configs {
                 ProviderConfigRepository::upsert(&db, config)?;
+            }
+        } else {
+            for mut default_config in Self::default_configs() {
+                if configs
+                    .iter()
+                    .any(|config| config.name == default_config.name)
+                {
+                    continue;
+                }
+
+                default_config.enabled = false;
+                ProviderConfigRepository::upsert(&db, &default_config)?;
+                configs.push(default_config);
             }
         }
         *self.configs.write() = configs;
@@ -132,6 +156,33 @@ impl ProviderService {
             }
         }
         self.save()
+    }
+}
+
+fn provider_config(
+    name: &str,
+    model: &str,
+    protocol: ProviderProtocol,
+    enabled: bool,
+) -> ProviderConfig {
+    let mut config = ProviderConfig::new(name.to_string(), model.to_string(), protocol);
+    config.enabled = enabled;
+    config.base_url = std::env::var(aisdk_provider_base_url_env(name)).ok();
+    config
+}
+
+fn default_model_for_provider(provider_name: &str) -> String {
+    std::env::var(aisdk_provider_model_env(provider_name))
+        .ok()
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn protocol_for_provider(provider_name: &str) -> ProviderProtocol {
+    if provider_name == "anthropic" {
+        ProviderProtocol::Anthropic
+    } else {
+        ProviderProtocol::OpenAI
     }
 }
 

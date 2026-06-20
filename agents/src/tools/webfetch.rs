@@ -99,10 +99,7 @@ pub async fn run_with_async(call: &ToolCall, client: &reqwest::Client) -> ToolRe
 
     let status = response.status();
     if !status.is_success() {
-        return failure(
-            "webfetch",
-            format!("HTTP {} for {url}", status.as_u16()),
-        );
+        return failure("webfetch", format!("HTTP {} for {url}", status.as_u16()));
     }
 
     // Pre-check Content-Length when the server sends it
@@ -160,7 +157,10 @@ mod tests {
     fn content_length_under_cap_is_ok() {
         assert_eq!(check_content_length(Some(0)), SizeCheck::Ok);
         assert_eq!(check_content_length(Some(1024)), SizeCheck::Ok);
-        assert_eq!(check_content_length(Some(MAX_RESPONSE_BYTES)), SizeCheck::Ok);
+        assert_eq!(
+            check_content_length(Some(MAX_RESPONSE_BYTES)),
+            SizeCheck::Ok
+        );
     }
 
     #[test]
@@ -207,7 +207,11 @@ mod tests {
         };
         let result = run(&call);
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("url is required"));
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("url is required"));
     }
 
     /// End-to-end against a tiny in-memory HTTP server: GET a
