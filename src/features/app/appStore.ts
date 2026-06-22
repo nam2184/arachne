@@ -12,6 +12,8 @@ export interface AppSettings {
   editor_font_size: number;
   editor_tab_size: number;
   node_skin: NodeSkin;
+  searxng_base_url: string | null;
+  websearch_max_results: number;
 }
 
 interface AppState {
@@ -21,6 +23,7 @@ interface AppState {
   loadSettings: () => Promise<void>;
   saveTheme: (theme: "dark" | "light") => Promise<void>;
   saveNodeSkin: (skin: NodeSkin) => Promise<void>;
+  saveWebSearchSettings: (baseUrl: string | null, maxResults: number) => Promise<void>;
 }
 
 function applyTheme(theme: "dark" | "light") {
@@ -36,6 +39,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   editor_font_size: 14,
   editor_tab_size: 2,
   node_skin: "default",
+  searxng_base_url: null,
+  websearch_max_results: 5,
 };
 
 function normalize(settings: Partial<AppSettings> | null | undefined): AppSettings {
@@ -46,7 +51,15 @@ function normalize(settings: Partial<AppSettings> | null | undefined): AppSettin
     node_skin: NODE_SKINS.includes(settings?.node_skin as NodeSkin)
       ? (settings!.node_skin as NodeSkin)
       : "default",
+    searxng_base_url: settings?.searxng_base_url?.trim() || null,
+    websearch_max_results: clampWebSearchMax(settings?.websearch_max_results),
   };
+}
+
+function clampWebSearchMax(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return DEFAULT_SETTINGS.websearch_max_results;
+  return Math.min(20, Math.max(1, Math.trunc(parsed)));
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -76,6 +89,16 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   saveNodeSkin: async (node_skin) => {
     const next = { ...get().settings, node_skin };
+    set({ settings: next });
+    await invoke("save_settings", { settings: next });
+  },
+
+  saveWebSearchSettings: async (baseUrl, maxResults) => {
+    const next = {
+      ...get().settings,
+      searxng_base_url: baseUrl === null ? null : baseUrl.trim(),
+      websearch_max_results: clampWebSearchMax(maxResults),
+    };
     set({ settings: next });
     await invoke("save_settings", { settings: next });
   },

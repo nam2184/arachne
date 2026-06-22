@@ -1122,7 +1122,7 @@ impl SessionRunner {
 
                 // Dispatch through the async path so `task` can drive child
                 // sessions, peer-targeted plan-mode tools can create/reuse
-                // subsessions, and `webfetch` can await HTTP without blocking
+                // subsessions, and network tools can await HTTP without blocking
                 // the executor.
                 let has_peer_session_id = tool_call
                     .arguments
@@ -1130,7 +1130,8 @@ impl SessionRunner {
                     .and_then(|value| value.as_str())
                     .is_some_and(|value| !value.trim().is_empty());
                 let needs_async_runtime = name == "task" || has_peer_session_id;
-                let needs_async_dispatch = needs_async_runtime || name == "webfetch";
+                let needs_async_dispatch =
+                    needs_async_runtime || name == "webfetch" || name == "websearch";
                 let sandboxed = self.sandboxed_ctx.as_deref();
                 let result = if let Some(registry) = &self.subagent_registry {
                     let runtime = ToolRuntime {
@@ -1170,7 +1171,7 @@ impl SessionRunner {
                             run_tool_with_context(&tool_call, &ctx)
                         }
                     }
-                } else if needs_async_dispatch && name == "webfetch" {
+                } else if needs_async_dispatch && (name == "webfetch" || name == "websearch") {
                     tracing::debug!(
                         session_id = %session_id,
                         step = step,
@@ -1178,14 +1179,9 @@ impl SessionRunner {
                         project_root = %project_root.display(),
                         "dispatching via async path (no subagent registry; tool needs async I/O)"
                     );
-                    // For the no-registry case the only async tool
-                    // we route here is `webfetch`, which doesn't
-                    // need a runtime at all. Build a minimal
-                    // `ToolRuntime` whose `subagent_registry` is
-                    // never consulted. We use the session's
-                    // existing providers / services so any future
-                    // tools added to the async-no-runtime set can
-                    // resolve them.
+                    // For the no-registry case the async network tools do not
+                    // need a runtime themselves. Build a minimal `ToolRuntime`
+                    // whose `subagent_registry` is never consulted.
                     let runtime = ToolRuntime {
                         caller_session_id: session_id.to_string(),
                         session_service: Arc::clone(&self.session_service),
@@ -1671,7 +1667,8 @@ pub fn readonly_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
             "Search the web",
             object_schema(
                 serde_json::json!({
-                    "query": { "type": "string" }
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 20 }
                 }),
                 &["query"],
             ),

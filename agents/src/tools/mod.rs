@@ -323,7 +323,7 @@ pub fn run_tool_with_context(call: &ToolCall, context: &ToolContext) -> ToolResu
 /// Async tool dispatch for tools that need the `ToolRuntime` (sub-sessions,
 /// etc.) or that need to await async I/O (HTTP). Falls back to the
 /// sync path for everything else. The agent runner uses this for
-/// any tool whose name is `task` or `webfetch`, plus read-only tools carrying
+/// any tool whose name is `task`, `webfetch`, or `websearch`, plus read-only tools carrying
 /// `peer_session_id`.
 pub async fn run_tool_async(call: &ToolCall, runtime: &ToolRuntime) -> ToolResult {
     if let Some(result) = dispatch_peer_tool_if_requested(call, runtime, None).await {
@@ -336,10 +336,11 @@ pub async fn run_tool_async(call: &ToolCall, runtime: &ToolRuntime) -> ToolResul
 
     match call.name.as_str() {
         "task" => task::run_async(call, runtime.clone()).await,
-        // `webfetch` performs a real HTTP GET. Doing it on the
+        // Network tools perform real HTTP requests. Doing them on the
         // async path keeps the executor unblocked. It doesn't need
         // the `ToolRuntime` (no sub-sessions, no message bus).
         "webfetch" => webfetch::run_async(call).await,
+        "websearch" => websearch::run_async(call).await,
         // Everything else: defer to the sync path. The caller is already
         // running in an async context, but the underlying tool is sync.
         // Thread the caller's project_root through so file-system
@@ -367,6 +368,7 @@ pub async fn run_tool_async_sandboxed(
     match call.name.as_str() {
         "task" => task::run_async(call, runtime.clone()).await,
         "webfetch" => webfetch_async_sandboxed(call, ctx).await,
+        "websearch" => websearch_async_sandboxed(call, ctx).await,
         _ => run_tool_sandboxed(call, ctx).await,
     }
 }
@@ -556,7 +558,7 @@ pub async fn run_tool_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> Tool
         "grep" => grep_sandboxed(call, ctx).await,
         "shell" | "bash" => shell_sandboxed(call, ctx),
         "webfetch" => webfetch_sandboxed(call, ctx),
-        "websearch" => not_implemented_sandboxed("websearch"),
+        "websearch" => websearch_sandboxed(call, ctx),
         "task" => failure(
             "task",
             "task requires the async runtime; the agent runner routes this tool to `run_tool_async`".to_string(),
@@ -736,11 +738,42 @@ async fn webfetch_async_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> To
     webfetch::run_async(call).await
 }
 
-fn not_implemented_sandboxed(tool: &str) -> ToolResult {
-    failure(
-        tool,
-        format!("{tool} sandboxed variant not implemented yet; using legacy path"),
-    )
+fn websearch_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult {
+    let query = string_arg(call, "query");
+    if query.trim().is_empty() {
+        return failure("websearch", "query is required".to_string());
+    }
+    let config = match websearch::config_from_env() {
+        Ok(config) => config,
+        Err(error) => return failure("websearch", error),
+    };
+    let url = match websearch::build_search_url(&config.base_url, &query) {
+        Ok(url) => url,
+        Err(error) => return failure("websearch", error),
+    };
+    if let Err(error) = ctx.network_policy.validate(url.as_str()) {
+        return failure("websearch", format!("{error}"));
+    }
+    websearch::run(call)
+}
+
+async fn websearch_async_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult {
+    let query = string_arg(call, "query");
+    if query.trim().is_empty() {
+        return failure("websearch", "query is required".to_string());
+    }
+    let config = match websearch::config_from_env() {
+        Ok(config) => config,
+        Err(error) => return failure("websearch", error),
+    };
+    let url = match websearch::build_search_url(&config.base_url, &query) {
+        Ok(url) => url,
+        Err(error) => return failure("websearch", error),
+    };
+    if let Err(error) = ctx.network_policy.validate(url.as_str()) {
+        return failure("websearch", format!("{error}"));
+    }
+    websearch::run_with_async(call, &reqwest::Client::new(), &config).await
 }
 
 #[cfg(test)]

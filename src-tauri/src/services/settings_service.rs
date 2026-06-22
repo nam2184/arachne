@@ -13,12 +13,27 @@ pub struct AppSettings {
     pub editor_tab_size: u32,
     #[serde(default = "default_node_skin")]
     pub node_skin: String,
+    #[serde(default)]
+    pub searxng_base_url: Option<String>,
+    #[serde(default = "default_websearch_max_results")]
+    pub websearch_max_results: u32,
 }
 
-fn default_theme() -> String { "dark".to_string() }
-fn default_editor_font_size() -> u32 { 14 }
-fn default_editor_tab_size() -> u32 { 2 }
-fn default_node_skin() -> String { "default".to_string() }
+fn default_theme() -> String {
+    "dark".to_string()
+}
+fn default_editor_font_size() -> u32 {
+    14
+}
+fn default_editor_tab_size() -> u32 {
+    2
+}
+fn default_node_skin() -> String {
+    "default".to_string()
+}
+fn default_websearch_max_results() -> u32 {
+    5
+}
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -27,8 +42,23 @@ impl Default for AppSettings {
             editor_font_size: 14,
             editor_tab_size: 2,
             node_skin: "default".to_string(),
+            searxng_base_url: None,
+            websearch_max_results: default_websearch_max_results(),
         }
     }
+}
+
+fn apply_websearch_env(settings: &AppSettings) {
+    match settings.searxng_base_url.as_deref().map(str::trim) {
+        Some(base_url) if !base_url.is_empty() => std::env::set_var("SEARXNG_BASE_URL", base_url),
+        Some(_) => std::env::remove_var("SEARXNG_BASE_URL"),
+        None => {}
+    }
+
+    std::env::set_var(
+        "SEARXNG_MAX_RESULTS",
+        settings.websearch_max_results.clamp(1, 20).to_string(),
+    );
 }
 
 pub struct SettingsService {
@@ -47,6 +77,7 @@ impl SettingsService {
 
     pub fn load(&self) -> Result<(), String> {
         if !self.config_path.exists() {
+            apply_websearch_env(&self.settings.read());
             return Ok(());
         }
 
@@ -56,6 +87,7 @@ impl SettingsService {
         let settings: AppSettings = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse settings: {}", e))?;
 
+        apply_websearch_env(&settings);
         *self.settings.write() = settings;
         Ok(())
     }
@@ -78,6 +110,7 @@ impl SettingsService {
     }
 
     pub fn update_settings(&self, updates: AppSettings) {
+        apply_websearch_env(&updates);
         *self.settings.write() = updates;
     }
 }

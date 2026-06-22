@@ -33,19 +33,29 @@ const emptyProviderDraft: ProviderDraft = {
 };
 
 export function SettingsPage() {
-  const { settings, saveTheme, saveNodeSkin, setView } = useAppStore();
+  const { settings, saveTheme, saveNodeSkin, saveWebSearchSettings, setView } = useAppStore();
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [selectedProviderName, setSelectedProviderName] = useState("");
   const [providerDraft, setProviderDraft] = useState<ProviderDraft>(emptyProviderDraft);
+  const [searxngBaseUrl, setSearxngBaseUrl] = useState(settings.searxng_base_url ?? "");
+  const [websearchMaxResults, setWebsearchMaxResults] = useState(settings.websearch_max_results);
+  const [websearchStatus, setWebsearchStatus] = useState<string | null>(null);
+  const [websearchError, setWebsearchError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [isSavingWebSearch, setIsSavingWebSearch] = useState(false);
 
   useEffect(() => {
     loadProviders().catch((loadError) => {
       setError(formatError(loadError));
     });
   }, []);
+
+  useEffect(() => {
+    setSearxngBaseUrl(settings.searxng_base_url ?? "");
+    setWebsearchMaxResults(settings.websearch_max_results);
+  }, [settings.searxng_base_url, settings.websearch_max_results]);
 
   async function loadProviders() {
     const configs = await invoke<ProviderConfig[]>("get_provider_configs");
@@ -100,6 +110,38 @@ export function SettingsPage() {
   async function handleThemeToggle() {
     const newTheme = settings.theme === "dark" ? "light" : "dark";
     await saveTheme(newTheme);
+  }
+
+  async function saveWebSearchConfig() {
+    const trimmedBaseUrl = searxngBaseUrl.trim();
+    const maxResults = Math.min(20, Math.max(1, Math.trunc(Number(websearchMaxResults) || 5)));
+
+    if (trimmedBaseUrl) {
+      try {
+        const parsed = new URL(trimmedBaseUrl);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+          setWebsearchError("SearXNG base URL must use http or https.");
+          return;
+        }
+      } catch {
+        setWebsearchError("SearXNG base URL is not valid.");
+        return;
+      }
+    }
+
+    setIsSavingWebSearch(true);
+    setWebsearchError(null);
+    setWebsearchStatus(null);
+
+    try {
+      await saveWebSearchSettings(trimmedBaseUrl, maxResults);
+      setWebsearchMaxResults(maxResults);
+      setWebsearchStatus(trimmedBaseUrl ? "Web search config saved." : "Web search disabled until a SearXNG URL is set.");
+    } catch (saveError) {
+      setWebsearchError(formatError(saveError));
+    } finally {
+      setIsSavingWebSearch(false);
+    }
   }
 
   const modelOptions = getModelOptions(providerDraft.name, providerDraft.model);
@@ -174,6 +216,41 @@ export function SettingsPage() {
               >
                 <NodePreviewTui />
               </NodeSkinCard>
+            </div>
+          </section>
+
+          <section className="space-y-4">
+            <h2 className="text-sm font-medium text-[#d4d4d4]">Web Search</h2>
+            <div className="space-y-4 rounded-none border border-[#1f1f1f] bg-[#0a0a0a] p-4">
+              <div>
+                <p className="text-sm font-medium">SearXNG JSON API</p>
+                <p className="text-xs text-[#8a8a8a]">Used by the agent websearch tool. Leave blank to disable web search.</p>
+              </div>
+              <label className="block space-y-1.5">
+                <span className="text-xs font-medium text-[#d4d4d4]">Base URL</span>
+                <Input
+                  value={searxngBaseUrl}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) => setSearxngBaseUrl(event.target.value)}
+                  placeholder="https://search.example.com"
+                />
+              </label>
+              <label className="block space-y-1.5">
+                <span className="text-xs font-medium text-[#d4d4d4]">Max Results</span>
+                <Input
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={websearchMaxResults}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) => setWebsearchMaxResults(Number(event.target.value))}
+                />
+              </label>
+              <Button className="w-full" onClick={saveWebSearchConfig} disabled={isSavingWebSearch}>
+                <Save className="h-4 w-4" />
+                Save Web Search
+              </Button>
+              {(websearchStatus || websearchError) && (
+                <p className={cn("text-xs", websearchError ? "text-[#ff5f5f]" : "text-[#bdbdbd]")}>{websearchError ?? websearchStatus}</p>
+              )}
             </div>
           </section>
 
