@@ -96,7 +96,7 @@ export function SessionChat({
   // history, the auto-scroll stops, so they can review past
   // turns without the view jumping.
   const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const dragRef = useRef<{
     pointerId: number;
     startX: number;
@@ -108,6 +108,13 @@ export function SessionChat({
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, [input]);
 
   useEffect(() => {
     invoke<ProviderConfig[]>("get_provider_configs")
@@ -178,7 +185,7 @@ export function SessionChat({
     await onSendMessage(content, mode);
   };
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -279,7 +286,7 @@ export function SessionChat({
             </div>
           </div>
           <Button
-            variant="outline"
+            variant="secondary"
             size="sm"
             onPointerDown={(event) => event.stopPropagation()}
             onClick={onCompact}
@@ -474,14 +481,15 @@ export function SessionChat({
         </ScrollArea>
 
         <div className="border-t border-[#1f1f1f] px-6 py-4">
-          <div className="flex gap-2">
-            <Input
+          <div className="flex items-end gap-2">
+            <textarea
               ref={inputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder="Ask about the codebase..."
-              className="flex-1"
+rows={1}
+              className="box-border min-h-[44px] min-w-0 max-h-32 flex-1 resize-none whitespace-pre-wrap break-words break-all overflow-y-auto rounded-none border border-[#1f1f1f] bg-black px-3 py-2.5 font-sans text-sm leading-[1.5] text-white shadow-none transition-colors placeholder:text-[#737373] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white disabled:cursor-not-allowed disabled:opacity-50"
               disabled={isSending}
             />
             <Button onClick={handleSend} disabled={isSending || !input.trim()}>

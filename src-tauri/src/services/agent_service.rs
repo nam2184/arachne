@@ -5,10 +5,9 @@ use arachne_agents::{
     llm::{ContentPart, SubagentRegistry},
     sandbox::SandboxPolicy,
     tools::SandboxedContext,
-    CompactionConfig, CompactionOutcome, CompactionRequest, CompactionService,
-    ConversationService, LlmProvider, MessageRole, ModelRegistry, ProviderProtocol,
-    ProviderRegistry, ProviderService, SessionError, SessionRunEvent, SessionRunner,
-    SessionService,
+    CompactionConfig, CompactionOutcome, CompactionRequest, CompactionService, ConversationService,
+    LlmProvider, MessageRole, ModelRegistry, ProviderProtocol, ProviderRegistry, ProviderService,
+    SessionError, SessionRunEvent, SessionRunner, SessionService,
 };
 use tauri::{AppHandle, Emitter};
 
@@ -103,10 +102,7 @@ impl AgentService {
             .with_sandboxed_context(sandboxed_ctx)
     }
 
-    pub async fn compact_now(
-        &self,
-        session_id: &str,
-    ) -> Result<CompactionOutcome, String> {
+    pub async fn compact_now(&self, session_id: &str) -> Result<CompactionOutcome, String> {
         let session = self
             .session_service
             .get_session(session_id)?

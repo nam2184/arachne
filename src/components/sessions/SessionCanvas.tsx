@@ -1,7 +1,6 @@
 import { useEffect, useMemo } from "react";
 import {
   Background,
-  Controls,
   ReactFlow,
   useNodesState,
   type Edge,
@@ -13,6 +12,7 @@ import type { AgentSession, SessionGroup } from "@/features/sessions/sessionStor
 import { useAppStore } from "@/features/app/appStore";
 
 const nodeTypes = { sessionCard: SessionNode };
+const proOptions = { hideAttribution: true };
 
 interface SessionCanvasProps {
   sessions: Map<string, AgentSession>;
@@ -20,6 +20,7 @@ interface SessionCanvasProps {
   onConnectSessions: (sourceId: string, targetId: string) => void;
   onOpenSessionChat: (id: string) => void;
   onSelectSession: (id: string) => void;
+  onDeleteSession?: (id: string) => void;
 }
 
 export function SessionCanvas({
@@ -28,6 +29,7 @@ export function SessionCanvas({
   onConnectSessions,
   onOpenSessionChat,
   onSelectSession,
+  onDeleteSession,
 }: SessionCanvasProps) {
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const nodeSkin = useAppStore((state) => state.settings.node_skin);
@@ -48,10 +50,11 @@ export function SessionCanvas({
           skin: nodeSkin,
           onOpenChat: onOpenSessionChat,
           onSelect: onSelectSession,
+          onDelete: onDeleteSession,
         },
       }));
     });
-  }, [nodeSkin, onOpenSessionChat, onSelectSession, sessions, setNodes]);
+  }, [nodeSkin, onOpenSessionChat, onSelectSession, onDeleteSession, sessions, setNodes]);
 
   const edges = useMemo<Edge[]>(() => {
     return Array.from(groups.values()).flatMap((group) => {
@@ -86,10 +89,10 @@ export function SessionCanvas({
           }
         }}
         nodeTypes={nodeTypes}
+        proOptions={proOptions}
         fitView
       >
         <Background color="#1f1f1f" gap={24} />
-        <Controls />
       </ReactFlow>
     </div>
   );

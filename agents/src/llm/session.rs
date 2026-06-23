@@ -557,7 +557,7 @@ impl SessionRunner {
              runtime; plan accordingly.",
         )));
 
-        let mut system_prompt = system_prompt_for_session(&session.provider, &[]);
+        let mut system_prompt = system_prompt_for_session(&session.provider, &session.directory, &[]);
         if let Some(peer_context) = peer_context {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&peer_context);
@@ -1411,13 +1411,14 @@ fn history_to_llm_messages(history: &[ConversationMessage]) -> Vec<LlmMessage> {
         .collect()
 }
 
-fn system_prompt_for_session(provider: &str, _extra: &[String]) -> String {
+fn system_prompt_for_session(provider: &str, session_directory: &str, _extra: &[String]) -> String {
     let agent_name = match provider {
         "anthropic" => "Claude",
         "openai" => "GPT",
         "minimax" => "MiniMax",
         _ => "AI Assistant",
     };
+    let project_name = project_name_from_directory(session_directory);
 
     // Mirrors the opencode / claude-code style: short, direct,
     // CLI-oriented. The list of available tools is sent on the
@@ -1447,6 +1448,11 @@ fn system_prompt_for_session(provider: &str, _extra: &[String]) -> String {
          reminders from the system; they are not part of the user input.\n\
          - Prefer small, correct changes over large speculative rewrites.\n\n\
          \
+         # Session project\n\
+         - Main project: {project_name}\n\
+         - Project path: {project_path}\n\
+         - Treat this path as the primary working tree for this session unless the user explicitly points elsewhere.\n\n\
+         \
          # Code references\n\
          - When referencing specific functions or pieces of code, include the pattern \
          `file_path:line_number` so the user can navigate directly to the source.\n\n\
@@ -1461,7 +1467,18 @@ fn system_prompt_for_session(provider: &str, _extra: &[String]) -> String {
          in your text and feed the rejection back as a `tool_result` so you \
          can self-correct on the next turn.",
         name = agent_name,
+        project_name = project_name,
+        project_path = session_directory,
     )
+}
+
+fn project_name_from_directory(directory: &str) -> &str {
+    let trimmed = directory.trim_end_matches(|c| c == '/' || c == '\\');
+    trimmed
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(directory)
 }
 
 /// Flush the text buffer into `assistant_parts`, splitting out any
@@ -1929,9 +1946,17 @@ mod tests {
 
     #[test]
     fn system_prompt_for_session_names() {
-        assert!(system_prompt_for_session("anthropic", &[]).contains("Claude"));
-        assert!(system_prompt_for_session("openai", &[]).contains("GPT"));
-        assert!(system_prompt_for_session("minimax", &[]).contains("MiniMax"));
+        assert!(system_prompt_for_session("anthropic", "/work/openman", &[]).contains("Claude"));
+        assert!(system_prompt_for_session("openai", "/work/openman", &[]).contains("GPT"));
+        assert!(system_prompt_for_session("minimax", "/work/openman", &[]).contains("MiniMax"));
+    }
+
+    #[test]
+    fn system_prompt_for_session_includes_project_context() {
+        let prompt = system_prompt_for_session("openai", "C:\\Users\\mrowe\\Documents\\openman", &[]);
+
+        assert!(prompt.contains("Main project: openman"));
+        assert!(prompt.contains("Project path: C:\\Users\\mrowe\\Documents\\openman"));
     }
 
     fn tool_names(tools: &[crate::llm::events::ToolDefinition]) -> Vec<&str> {

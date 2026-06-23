@@ -16,7 +16,9 @@ pub async fn send_message(
         .map(parse_mode)
         .transpose()?
         .unwrap_or_default();
-    agent_service.send_message(&session_id, message, mode, app).await
+    agent_service
+        .send_message(&session_id, message, mode, app)
+        .await
 }
 
 fn parse_mode(value: &str) -> Result<arachne_agents::permission::PermissionMode, String> {

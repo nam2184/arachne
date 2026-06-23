@@ -11,3 +11,5 @@ export type { SessionListProps } from "./SessionList";
 export { SessionNode } from "./SessionNode";
 export { SessionToolbar } from "./SessionToolbar";
 export { PermissionPromptBar } from "./PermissionPromptBar";
+export { DeleteSessionDialog } from "./DeleteSessionDialog";
+export type { DeleteSessionDialogProps } from "./DeleteSessionDialog";

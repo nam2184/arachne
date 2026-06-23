@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Plus } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { PermissionPromptBar, SessionCanvas, SessionChat } from "@/components/sessions";
+import { PermissionPromptBar, SessionCanvas, SessionChat, DeleteSessionDialog } from "@/components/sessions";
 import { Button } from "@/components/ui/button";
 import { useProjectStore } from "@/features/project/projectStore";
 import { usePermissionStore } from "@/features/permissions/permissionStore";
@@ -16,6 +16,7 @@ export function SessionWorkspace() {
     addSessionToGroup,
     createGroup,
     createSession,
+    deleteSession,
     groups,
     initialize,
     sessions,
@@ -39,6 +40,7 @@ export function SessionWorkspace() {
   const [isChatSending, setIsChatSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [chatSessionId, setChatSessionId] = useState<string | null>(null);
+  const [sessionPendingDelete, setSessionPendingDelete] = useState<string | null>(null);
 
   useEffect(() => {
     initialize().catch((initError) => {
@@ -216,6 +218,32 @@ export function SessionWorkspace() {
     ? activeConversation.messages
     : [];
 
+  const sessionPendingDeleteLabel = sessionPendingDelete
+    ? (sessions.get(sessionPendingDelete)?.directory ?? null)
+    : null;
+
+  const requestDeleteSession = useCallback((id: string) => {
+    setSessionPendingDelete(id);
+  }, []);
+
+  const cancelDeleteSession = useCallback(() => {
+    setSessionPendingDelete(null);
+  }, []);
+
+  const confirmDeleteSession = useCallback(async (id: string) => {
+    try {
+      if (chatSessionId === id) {
+        setChatSessionId(null);
+        clearConversation();
+      }
+      setActiveSession("");
+      await deleteSession(id);
+      setSessionPendingDelete(null);
+    } catch (deleteError) {
+      throw deleteError;
+    }
+  }, [chatSessionId, clearConversation, deleteSession, setActiveSession]);
+
   return (
     <section className="flex h-screen min-w-0 flex-1 flex-col bg-black">
       <div className="relative flex min-h-0 flex-1">
@@ -239,6 +267,7 @@ export function SessionWorkspace() {
             onConnectSessions={connectSessions}
             onOpenSessionChat={openSessionChat}
             onSelectSession={selectSession}
+            onDeleteSession={requestDeleteSession}
           />
         </div>
       </div>
@@ -256,6 +285,13 @@ export function SessionWorkspace() {
         />
       )}
       <PermissionPromptBar sessionId={chatSessionId} />
+      <DeleteSessionDialog
+        open={sessionPendingDelete !== null}
+        sessionId={sessionPendingDelete}
+        sessionLabel={sessionPendingDeleteLabel}
+        onCancel={cancelDeleteSession}
+        onConfirm={confirmDeleteSession}
+      />
     </section>
   );
 }
