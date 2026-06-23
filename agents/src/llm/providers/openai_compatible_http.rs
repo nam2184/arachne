@@ -196,9 +196,11 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
                 "llm http error: provider rejected the request"
             );
             let user_message = format_provider_error(&structured, &text);
-            return Err(LlmError::new(&format!("http_{}", status.as_u16()), &user_message)
-                .provider(&self.provider_name)
-                .model(&request.model));
+            return Err(
+                LlmError::new(&format!("http_{}", status.as_u16()), &user_message)
+                    .provider(&self.provider_name)
+                    .model(&request.model),
+            );
         }
 
         let stream_provider = self.provider_name.clone();
@@ -749,7 +751,9 @@ fn stringify_message_content(value: &serde_json::Value) -> String {
             .iter()
             .filter_map(|part| {
                 if part.get("type").and_then(|value| value.as_str()) == Some("text") {
-                    part.get("text").and_then(|value| value.as_str()).map(str::to_string)
+                    part.get("text")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
                 } else {
                     None
                 }

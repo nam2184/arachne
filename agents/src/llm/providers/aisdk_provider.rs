@@ -716,6 +716,9 @@ fn sdk_assistant_messages(content: &[ContentPart]) -> Vec<Message> {
                     None,
                 )));
             }
+            ContentPart::ToolResult { id, name, result } => {
+                messages.push(Message::Tool(sdk_tool_result_info(id, name, result)));
+            }
             ContentPart::Reasoning { .. } => {}
             _ => {
                 if let Some(text) = part.as_prompt_text() {
@@ -742,16 +745,19 @@ fn sdk_tool_result_messages(content: &[ContentPart]) -> Vec<Message> {
         .iter()
         .filter_map(|part| match part {
             ContentPart::ToolResult { id, name, result } => {
-                let mut tool_result = ToolResultInfo::new(name.clone());
-                tool_result.id(id.clone());
-                let result_text =
-                    serde_json::to_string(result).unwrap_or_else(|_| "null".to_string());
-                tool_result.output(serde_json::Value::String(result_text));
-                Some(Message::Tool(tool_result))
+                Some(Message::Tool(sdk_tool_result_info(id, name, result)))
             }
             _ => None,
         })
         .collect()
+}
+
+fn sdk_tool_result_info(id: &str, name: &str, result: &serde_json::Value) -> ToolResultInfo {
+    let mut tool_result = ToolResultInfo::new(name.to_string());
+    tool_result.id(id.to_string());
+    let result_text = serde_json::to_string(result).unwrap_or_else(|_| "null".to_string());
+    tool_result.output(serde_json::Value::String(result_text));
+    tool_result
 }
 
 fn prompt_text(content: &[ContentPart]) -> String {
@@ -804,7 +810,7 @@ fn sdk_tool_call_events(call: &ToolCallInfo) -> Vec<LlmEvent> {
             id,
             name,
             input,
-            provider_executed: Some(false),
+            provider_executed: Some(true),
         },
     ]
 }

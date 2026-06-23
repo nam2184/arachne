@@ -3,14 +3,11 @@ use std::path::{Component, Path, PathBuf};
 /// Strip the Windows verbatim path prefix (`\\?\` or
 /// `\\?\UNC\…`) that `std::fs::canonicalize` prepends. A
 /// user-supplied path like `C:\Users\Foo` doesn't carry that
-/// prefix, so comparing a `\\?\`-prefixed canonical path against
-/// a literal user path fails component-by-component even when
-/// both refer to the same directory. The component-wise
-/// comparison in `path_starts_with` counts `\\?\` as an extra
-/// component, which makes every literal user path look "shorter
-/// than the prefix". Stripping it once at canonicalization
-/// keeps both sides comparable.
-fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+/// prefix, so any path-prefix comparison (whether component-wise
+/// or via `Path::strip_prefix`) would treat `\\?\` as an extra
+/// segment that the user-supplied path lacks. Stripping it once
+/// at canonicalization keeps both sides comparable.
+pub(crate) fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     let mut components = path.components();
     let mut stripped: PathBuf = PathBuf::new();
     let mut consumed_prefix = false;
@@ -56,28 +53,56 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     stripped
 }
 
-/// Compare two paths component-wise with case-insensitive
-/// matching on Windows. Path equality and prefix matching are
-/// case-sensitive on `Path::starts_with`, but Windows filesystems
-/// are case-insensitive — so a literal `C:\Users\Foo` and the
-/// canonical `C:\Users\foo` (returned by `std::fs::canonicalize`)
-/// compare as different strings even though they refer to the
-/// same directory. That bug rejects paths the user explicitly
-/// passed in by hand when the on-disk casing differs from the
-/// session-stored casing. Normalize both sides to lowercase so
-/// the comparison is filesystem-faithful on every platform.
-pub(crate) fn path_starts_with(candidate: &Path, prefix: &Path) -> bool {
+/// Containment check for the sandbox: does `child` live inside
+/// `parent` (or equal `parent`)? Mirrors opencode's
+/// `FSUtil.contains` (packages/core/src/fs-util.ts), which uses
+/// `path.relative` + escape detection instead of a string-prefix
+/// compare. The Rust analog is `Path::strip_prefix` after `resolve`
+/// has anchored relative paths, collapsed `.`/`..`, and canonicalized
+/// existing candidates.
+///
+/// Both `parent` and `child` are expected to be canonical
+/// (symlinks resolved, on-disk casing, `\\?\` stripped) — that's
+/// the invariant the write-time `canonicalize_directory` chokepoint
+/// in `SessionService::create_session_with_parent` plus the
+/// construction-time canonicalize inside `SandboxPolicy::new`
+/// enforce. With canonical inputs, `strip_prefix` is a reliable
+/// byte-level compare and the previous case-insensitive gymnastics
+/// are unnecessary.
+pub(crate) fn contains_path(parent: &Path, child: &Path) -> bool {
+    match child.strip_prefix(parent) {
+        Ok(remainder) => {
+            // `remainder` is the path-relative form. Empty means
+            // exact match (`child == parent`). A leading `..` would
+            // mean we somehow ended up outside — impossible if
+            // `strip_prefix` returned `Ok`, but defensively reject.
+            remainder.as_os_str().is_empty()
+                || !remainder
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir))
+        }
+        Err(_) => false,
+    }
+}
+
+/// Debug-only variant of the old case-insensitive component
+/// compare. Kept around because the `tracing::debug!` lines in
+/// `SandboxPolicy::resolve` use it to print how a path looks
+/// under both the canonical-byte and case-insensitive lenses, which
+/// is useful when diagnosing a false-positive "outside the
+/// sandbox" rejection on Windows where the LLM produced a path
+/// whose casing differs from the on-disk casing. The
+/// containment *decision* uses `contains_path`; this helper is for
+/// log output only and is not exported from the module.
+#[allow(dead_code)]
+fn debug_only_path_starts_with(candidate: &Path, prefix: &Path) -> bool {
     let candidate_components: Vec<PathBuf> = candidate
         .components()
-        .map(|component| {
-            PathBuf::from(component.as_os_str().to_ascii_lowercase())
-        })
+        .map(|component| PathBuf::from(component.as_os_str().to_ascii_lowercase()))
         .collect();
     let prefix_components: Vec<PathBuf> = prefix
         .components()
-        .map(|component| {
-            PathBuf::from(component.as_os_str().to_ascii_lowercase())
-        })
+        .map(|component| PathBuf::from(component.as_os_str().to_ascii_lowercase()))
         .collect();
     if prefix_components.len() > candidate_components.len() {
         return false;
@@ -138,13 +163,8 @@ pub struct SandboxPolicy {
 
 impl SandboxPolicy {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
-        // Canonicalize the project root at construction time so
-        // the comparison baseline matches the OS-stored casing on
-        // case-insensitive filesystems (Windows NTFS, default
-        // APFS, HFS+, FAT). Without this, a literal
-        // `C:\Users\mrowe\Documents\pytha-runtime` would compare
-        // unequal to canonicalize()'s `C:\Users\mrowe\Documents\Pytha-Runtime`
-        // and trip the post-canonicalize containment check.
+        // Canonicalize the root once so all containment checks use
+        // the OS-resolved path identity.
         let raw: PathBuf = project_root.into();
         let canonical = raw.canonicalize().unwrap_or_else(|_| raw.clone());
         Self {
@@ -154,9 +174,7 @@ impl SandboxPolicy {
     }
 
     pub fn with_external(mut self, path: impl Into<PathBuf>) -> Self {
-        // Same canonicalization as `new`: normalize each
-        // external root to its on-disk casing so the
-        // case-insensitive comparison has a stable baseline.
+        // Same canonicalization as `new` for externally allowed roots.
         let raw: PathBuf = path.into();
         let canonical = raw.canonicalize().unwrap_or_else(|_| raw.clone());
         self.external_roots.push(strip_verbatim_prefix(canonical));
@@ -205,44 +223,30 @@ impl SandboxPolicy {
             absolute = %absolute.display(),
             absolute_eq_input = absolute == path,
             project_root = %self.project_root.display(),
-            starts_with_project_root_case_insensitive = path_starts_with(&absolute, &self.project_root),
+            starts_with_project_root_case_insensitive = debug_only_path_starts_with(&absolute, &self.project_root),
             starts_with_project_root_native = absolute.starts_with(&self.project_root),
             "sandbox resolve: absolute vs project_root"
         );
 
-        // Check containment: does the path fall within the project root or any
-        // external root?
-        if !self.is_allowed(&absolute) {
-            tracing::warn!(
-                input = %path.display(),
-                absolute = %absolute.display(),
-                project_root = %self.project_root.display(),
-                external_roots = ?self.external_roots,
-                "sandbox resolve: REJECTED (pre-canonicalize) — path is outside the policy"
-            );
-            return Err(PathContainmentError::ExternalAccess { path: absolute });
-        }
-
-        // Try to canonicalize. If the file doesn't exist yet (e.g., for a
-        // write), fall back to the normalized path. Strip the
-        // Windows verbatim prefix (`\\?\`) so the canonicalized
-        // path is component-comparable with the literal path the
-        // user supplied.
+        // Normalize the candidate before containment. This mirrors opencode:
+        // resolve against the instance directory, canonicalize/realpath when
+        // possible, then check whether the canonical candidate is contained.
+        // For writes to nonexistent files, canonicalize fails and we fall back
+        // to the lexical absolute path; `contains_path` rejects any remaining
+        // `..` escape in that fallback path.
         let canonical_result = absolute.canonicalize();
         let canonical_exists = canonical_result.is_ok();
-        let canonical = strip_verbatim_prefix(
-            canonical_result.unwrap_or_else(|_| absolute.clone()),
-        );
+        let canonical =
+            strip_verbatim_prefix(canonical_result.unwrap_or_else(|_| absolute.clone()));
         tracing::debug!(
             canonical = %canonical.display(),
             canonical_resolved = canonical_exists,
             canonical_eq_absolute = canonical == absolute,
-            canonical_starts_with_project_root = path_starts_with(&canonical, &self.project_root),
+            canonical_starts_with_project_root = contains_path(&self.project_root, &canonical),
             canonical_starts_with_project_root_native = canonical.starts_with(&self.project_root),
             "sandbox resolve: after canonicalize"
         );
 
-        // Re-check after canonicalization: symlinks could point outside.
         if !self.is_allowed(&canonical) {
             tracing::warn!(
                 input = %path.display(),
@@ -250,7 +254,7 @@ impl SandboxPolicy {
                 absolute = %absolute.display(),
                 project_root = %self.project_root.display(),
                 external_roots = ?self.external_roots,
-                "sandbox resolve: REJECTED (post-canonicalize) — canonical path is outside the policy"
+                "sandbox resolve: REJECTED — path is outside the policy"
             );
             return Err(PathContainmentError::ExternalAccess { path: canonical });
         }
@@ -264,30 +268,20 @@ impl SandboxPolicy {
     }
 
     fn is_allowed(&self, path: &Path) -> bool {
-        let in_project_root = path_starts_with(path, &self.project_root);
+        let in_project_root = contains_path(&self.project_root, path);
         let in_external_root = self
             .external_roots
             .iter()
-            .find(|root| path_starts_with(path, root));
+            .find(|root| contains_path(root, path));
         let allowed = in_project_root || in_external_root.is_some();
         let path_components: Vec<String> = path
             .components()
-            .map(|component| {
-                component
-                    .as_os_str()
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-            })
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
             .collect();
         let project_root_components: Vec<String> = self
             .project_root
             .components()
-            .map(|component| {
-                component
-                    .as_os_str()
-                    .to_string_lossy()
-                    .to_ascii_lowercase()
-            })
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
             .collect();
         tracing::trace!(
             path = %path.display(),
@@ -295,6 +289,12 @@ impl SandboxPolicy {
             project_root = %self.project_root.display(),
             project_root_components = ?project_root_components,
             in_project_root,
+            // The case-insensitive lens is kept for diagnostics: if
+            // `in_project_root` is false on Windows but
+            // `debug_only_path_starts_with` is true, the input
+            // differs from `project_root` only by casing — that's a
+            // signal the LLM is producing non-canonical paths.
+            debug_case_insensitive_starts_with = debug_only_path_starts_with(path, &self.project_root),
             in_external_root = ?in_external_root.map(|root| root.display().to_string()),
             allowed,
             "sandbox is_allowed"
@@ -411,39 +411,34 @@ mod tests {
     }
 
     #[test]
-    fn resolve_accepts_path_with_mismatched_case() {
-        // Regression: on Windows the on-disk casing often differs
-        // from the session-stored casing. `canonicalize` returns
-        // the canonical case, so a literal `C:\Users\Foo` passed
-        // in by the user becomes `C:\Users\foo` after the
-        // canonicalize check. The sandbox policy must compare
-        // case-insensitively, otherwise the user-supplied path
-        // inside the project root gets spuriously rejected as
-        // `ExternalAccess`. Same bug affects POSIX symlinks and
-        // case-insensitive filesystems (HFS+, APFS-default, FAT).
+    fn contains_path_rejects_mismatched_case_but_debug_lens_detects_it() {
+        // After the canonicalization chokepoint, both
+        // `SandboxPolicy.project_root` and the input passed to
+        // `resolve` are canonical (symlinks resolved, on-disk casing,
+        // `\\?\` stripped). The containment check is byte-level via
+        // `Path::strip_prefix`; it does not fold casing.
+        //
+        // The debug-only case-insensitive helper
+        // (`debug_only_path_starts_with`) is still exported via
+        // trace logs so a Windows user diagnosing a "false
+        // positive external directory" can see that the input
+        // differs from project_root only by casing and apply the
+        // canonicalize fix at the source.
         let project = TempDir::new().unwrap();
         let canonical_project = project.path().to_path_buf();
-
-        // Build a path with mixed case by uppercasing the entire
-        // path string. On case-insensitive filesystems
-        // (Windows, default APFS, etc.) this resolves to the
-        // same directory as `canonical_project`.
-        let mixed_case_path = PathBuf::from(
-            canonical_project
-                .to_string_lossy()
-                .to_ascii_uppercase(),
-        );
         let policy = SandboxPolicy::new(canonical_project.clone());
 
-        // The sandbox's own prefix comparison is case-insensitive
-        // even when the filesystem isn't — `path_starts_with`
-        // normalizes both sides to lowercase.
-        assert!(path_starts_with(&mixed_case_path, &canonical_project));
-        assert!(path_starts_with(&canonical_project, &mixed_case_path));
+        let uppercased = PathBuf::from(canonical_project.to_string_lossy().to_ascii_uppercase());
 
-        // And `is_allowed` must accept paths whose casing differs
-        // from the policy's `project_root`.
-        assert!(policy.is_allowed(&mixed_case_path));
+        // The byte-level decision rejects mixed-case input.
+        assert!(!contains_path(&canonical_project, &uppercased));
+
+        // The debug lens shows that the input only differs by
+        // casing — useful log signal, not a containment decision.
+        assert!(debug_only_path_starts_with(&uppercased, &canonical_project));
+
+        // `is_allowed` reflects the same byte-level decision.
+        assert!(!policy.is_allowed(&uppercased));
     }
 
     #[test]
@@ -464,6 +459,59 @@ mod tests {
         let policy = SandboxPolicy::new(dir.path().to_path_buf());
         let resolved = policy.resolve(&new_file).unwrap();
         assert!(resolved.starts_with(dir.path()));
+    }
+
+    #[test]
+    fn contains_path_accepts_forward_slashes() {
+        // A forward-slash absolute path that points inside the
+        // canonical root should be accepted. On Windows this covers
+        // the common `C:/...` tool-call shape.
+        let dir = TempDir::new().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let forward_slash = {
+            let s = canonical.to_string_lossy().replace('\\', "/");
+            PathBuf::from(format!("{}/src/foo.rs", s))
+        };
+        assert!(contains_path(&canonical, &forward_slash));
+    }
+
+    #[test]
+    fn contains_path_accepts_trailing_separator_on_root() {
+        // A trailing separator on the project root must not
+        // poison containment. `Path::strip_prefix` treats an
+        // empty trailing segment as a no-op.
+        let dir = TempDir::new().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        let with_trailing = PathBuf::from(format!("{}{}", canonical.to_string_lossy(), sep));
+        assert!(contains_path(&canonical, &with_trailing));
+    }
+
+    #[test]
+    fn contains_path_rejects_dotdot_escape() {
+        // A sibling directory is not inside `parent`.
+        let dir = TempDir::new().unwrap();
+        let sibling = TempDir::new().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let escape_attempt = sibling.path().canonicalize().unwrap();
+        assert!(!contains_path(&canonical, &escape_attempt));
+    }
+
+    #[test]
+    fn resolve_accepts_forward_slash_child_path() {
+        // End-to-end: an LLM tool call passes a forward-slash absolute path.
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("inside.txt");
+        std::fs::write(&file, "data").unwrap();
+
+        let policy = SandboxPolicy::new(dir.path().to_path_buf());
+        let forward = file
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let resolved = policy.resolve(PathBuf::from(forward)).expect("resolve");
+        assert!(policy.is_allowed(&resolved));
     }
 
     #[test]
@@ -509,14 +557,14 @@ mod tests {
         // device path). When the runner stored that as
         // `project_root`, every literal user-supplied path
         // appeared "shorter than the prefix" to the
-        // component-wise comparison in `path_starts_with`,
-        // and `is_allowed` returned false even for paths
-        // inside the project root. We can't synthesize a
+        // byte-level `Path::strip_prefix` check, and
+        // `is_allowed` returned false even for paths inside
+        // the project root. We can't synthesize a
         // verbatim-prefixed PathBuf portably across platforms
         // (the `Component::Prefix` variants are gated on
         // Windows), so test the helper directly: feed it a
         // path that begins with `\\?\` and verify the prefix
-        // is dropped before `path_starts_with` ever sees it.
+        // is dropped before `contains_path` ever sees it.
         //
         // On non-Windows, the helper is a no-op for paths
         // without a `Component::Prefix`. The runtime guarantee
@@ -532,7 +580,7 @@ mod tests {
         // helper exercises the prefix branch even on
         // non-Windows. We do this by checking that any path
         // the helper returns, when fed back through
-        // `path_starts_with`, contains no leading
+        // `contains_path`, contains no leading
         // `\\?\`-flavored components.
         let dir = TempDir::new().unwrap();
         let stripped = strip_verbatim_prefix(dir.path().to_path_buf());

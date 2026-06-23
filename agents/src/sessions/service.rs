@@ -2,7 +2,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::database::{Database, ProjectRepository, SessionGroupRepository, SessionRepository};
+use crate::sandbox::path::strip_verbatim_prefix;
 use crate::{AgentSession, SessionGroup};
+
+/// Canonicalize session directories at the DB boundary so UI display,
+/// prompts, tool cwd, and sandbox roots use one path identity.
+pub(crate) fn canonicalize_directory(input: &str) -> PathBuf {
+    let raw = PathBuf::from(input);
+    let canonical = raw.canonicalize().unwrap_or_else(|_| raw.clone());
+    strip_verbatim_prefix(canonical)
+}
 
 pub struct SessionService {
     db_path: PathBuf,
@@ -44,12 +53,16 @@ impl SessionService {
             return Err("Project must exist before creating sessions".to_string());
         }
 
-        let directory_path = PathBuf::from(&directory);
-        if !directory_path.exists() || !directory_path.is_dir() {
+        // Validate the raw input first so the error preserves the user's path.
+        let raw_path = PathBuf::from(&directory);
+        if !raw_path.exists() || !raw_path.is_dir() {
             return Err(format!("Session directory does not exist: {directory}"));
         }
 
-        let mut session = AgentSession::new(project_id, directory, provider, model);
+        let canonical = canonicalize_directory(&directory)
+            .to_string_lossy()
+            .to_string();
+        let mut session = AgentSession::new(project_id, canonical, provider, model);
         session.parent_session_id = parent;
         let id = session.id.clone();
         SessionRepository::insert(&db, &session)?;
@@ -254,7 +267,14 @@ mod tests {
         assert_eq!(session.project_id, "p1");
         assert_eq!(session.provider, "anthropic");
         assert_eq!(session.model, "claude-sonnet-4-20250514");
-        assert_eq!(session.directory, work.path().to_string_lossy().to_string());
+        assert_eq!(
+            session.directory,
+            work.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        );
     }
 
     #[test]
@@ -573,7 +593,12 @@ mod tests {
         assert_eq!(child.parent_session_id.as_deref(), Some(parent_id.as_str()));
         assert_eq!(
             child.directory,
-            peer_dir.path().to_string_lossy().to_string()
+            peer_dir
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
         );
     }
 
@@ -593,5 +618,73 @@ mod tests {
 
         let s = service.get_session(&id).unwrap().unwrap();
         assert!(s.parent_session_id.is_none());
+    }
+
+    #[test]
+    fn create_session_canonicalizes_directory() {
+        // The dialog can return a path with mixed casing or a path
+        // that traverses a symlink. The persisted value must be the
+        // canonical form so the sandbox, the system prompt, the UI
+        // display, and `ToolContext.project_root` all see the same
+        // string.
+        let (service, work, _db) = make_service();
+        seed_project(&service, "p1", "arachne");
+
+        let id = service
+            .create_session(
+                "p1".to_string(),
+                work.path().to_string_lossy().to_string(),
+                "anthropic".to_string(),
+                "claude-sonnet-4-20250514".to_string(),
+            )
+            .expect("create_session");
+
+        let session = service.get_session(&id).unwrap().unwrap();
+        let expected = work.path().canonicalize().unwrap();
+        let stored = PathBuf::from(&session.directory);
+
+        // Byte-level equality on the canonical form. On POSIX,
+        // `canonicalize` returns the same path the tempdir gave us.
+        // On Windows it strips the `\\?\` verbatim prefix (handled by
+        // canonicalize_directory's `strip_verbatim_prefix` call).
+        assert_eq!(stored, expected);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn create_session_canonicalizes_through_symlink() {
+        // Regression: if the user's chosen directory is reached via a
+        // symlink, the persisted value must follow the symlink so the
+        // sandbox's project_root matches what `realpath` would return
+        // when the sandbox canonicalizes the LLM's tool-call input.
+        let (service, work_root, _db) = make_service();
+        seed_project(&service, "p1", "arachne");
+
+        let real = work_root.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        let link = work_root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let id = service
+            .create_session(
+                "p1".to_string(),
+                link.to_string_lossy().to_string(),
+                "anthropic".to_string(),
+                "claude-sonnet-4-20250514".to_string(),
+            )
+            .expect("create_session");
+
+        let session = service.get_session(&id).unwrap().unwrap();
+        let stored = PathBuf::from(&session.directory);
+
+        // On POSIX, canonicalize follows the symlink. Windows symlink
+        // tests are gated out — the production code path still uses
+        // `canonicalize`, which Windows supports natively.
+        assert_eq!(stored, real.canonicalize().unwrap());
+        assert_ne!(
+            stored,
+            PathBuf::from(link.to_string_lossy().to_string()),
+            "symlink must not be preserved in the persisted directory"
+        );
     }
 }

@@ -14,8 +14,7 @@ use super::request::{LlmError, LlmRequest, LlmResponse};
 /// JSON-parsed arguments in, a `Result<String, String>` result
 /// out. Returning `Err(message)` is fed back to the model as a
 /// tool error so it can self-correct.
-pub type ToolDispatcherFn =
-    dyn Fn(&str, serde_json::Value) -> Result<String, String> + Send + Sync;
+pub type ToolDispatcherFn = dyn Fn(&str, serde_json::Value) -> Result<String, String> + Send + Sync;
 
 mod aisdk_provider;
 mod aisdk_wrappers;

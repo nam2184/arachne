@@ -172,10 +172,7 @@ pub struct PlanInput {
 /// dispatcher as the executor. Returns `Err(LlmError)` if the
 /// tool name is unknown to the runner, so callers can surface a
 /// useful message instead of silently passing a no-op tool.
-pub fn build_sdk_tool(
-    name: &str,
-    dispatcher: Arc<ToolDispatcherFn>,
-) -> Result<Tool, LlmError> {
+pub fn build_sdk_tool(name: &str, dispatcher: Arc<ToolDispatcherFn>) -> Result<Tool, LlmError> {
     let name_owned: String = name.to_string();
     let executor = ToolExecute::new(Box::new(move |input| {
         // The AISDK's `handle_tool_call` wraps `Err(message)` as
