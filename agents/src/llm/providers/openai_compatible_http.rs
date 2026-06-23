@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+use super::error_parsing::{format_provider_error, parse_provider_error_body};
 use super::{log_sse_event_body, openai_compatible_endpoint_url, LlmError, LlmProvider, LlmStream};
 use crate::llm::events::{FinishReason, LlmEvent, ToolDefinition};
 use crate::llm::request::{ContentPart, LlmRequest};
@@ -17,13 +18,6 @@ pub struct OpenAiCompatibleHttpProvider {
     base_url: String,
     supported_models: Vec<String>,
     http_client: reqwest::Client,
-    /// When `true`, tool results are emitted as `<system-reminder>`
-    /// user-role entries instead of structured `role: "tool"`
-    /// messages. Defaults to `false`; only opt in via
-    /// `with_wrap_tool_results(true)` when a provider's
-    /// OpenAI-compatible proxy refuses to correlate
-    /// `tool_call_id`. Matches the SDK provider's structured form.
-    wrap_tool_results: bool,
 }
 
 impl OpenAiCompatibleHttpProvider {
@@ -35,17 +29,6 @@ impl OpenAiCompatibleHttpProvider {
         api_key_env: &str,
         supported_models: &[&str],
     ) -> Self {
-        // Default to the structured `role: "tool"` form (with
-        // `tool_call_id` and `name` on the wire) — this matches
-        // the SDK provider and the OpenAI spec. The previous
-        // default wrapped results as `<system-reminder>` user-role
-        // text, which leaked the literal `<system-reminder>`
-        // markup into the persisted conversation and tripped 400s
-        // on providers that expect the structured form to
-        // follow the assistant's `tool_calls`. Providers that
-        // genuinely need the wrapped form can opt in with
-        // `with_wrap_tool_results(true)`.
-        let wrap_tool_results = false;
         Self {
             provider_name: provider_name.to_string(),
             api_key_env: api_key_env.to_string(),
@@ -56,28 +39,12 @@ impl OpenAiCompatibleHttpProvider {
                 .map(|model| model.to_string())
                 .collect(),
             http_client: reqwest::Client::new(),
-            wrap_tool_results,
         }
     }
 
     pub fn with_base_url(mut self, url: &str) -> Self {
         self.base_url = url.to_string();
         self
-    }
-
-    /// Override the wire renderer. When `true`, tool results are
-    /// emitted as `<system-reminder>` user-role entries instead of
-    /// structured `role: "tool"` messages. Defaults to `false` to
-    /// match the SDK provider; only opt in when an OpenAI-compatible
-    /// proxy refuses to correlate `tool_call_id`.
-    #[allow(dead_code)]
-    pub fn with_wrap_tool_results(mut self, wrap: bool) -> Self {
-        self.wrap_tool_results = wrap;
-        self
-    }
-
-    fn wrap_tool_results(&self) -> bool {
-        self.wrap_tool_results
     }
 
     pub fn chat_completions_url(&self) -> String {
@@ -145,17 +112,10 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
     async fn stream(&self, request: LlmRequest) -> Result<LlmStream, LlmError> {
         let api_key = self.api_key.as_ref().ok_or_else(|| self.auth_error())?;
         // Default to the OpenAI-spec structured `role: "tool"`
-        // form with `tool_call_id` + `name` on the wire. Some
-        // OpenAI-compatible proxies don't reliably round-trip the
-        // `tool_call_id` correlation, so callers can opt into the
-        // `<system-reminder>` wrapped form via
-        // `with_wrap_tool_results(true)`.
-        let renderer: fn(&LlmRequest) -> Vec<serde_json::Value> = if self.wrap_tool_results() {
-            lower_messages_wrapped
-        } else {
-            lower_messages
-        };
-        let body = build_request_body(&self.provider_name, &request, renderer);
+        // form with `tool_call_id` + `name` on the wire. The
+        // renderer is always the structured form; we never
+        // synthesize `<system-reminder>` markup.
+        let body = build_request_body(&self.provider_name, &request, lower_messages);
 
         tracing::debug!(
             "llm request: provider={} url={} model={} has_api_key={} tool_count={}",
@@ -215,15 +175,28 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            tracing::warn!(
-                "llm http error: provider={} url={} model={} status={} body={}",
-                self.provider_name,
-                self.chat_completions_url(),
-                request.model,
-                status.as_u16(),
-                &text.chars().take(500).collect::<String>(),
+            // Most OpenAI-compatible providers return
+            // `{"error":{"message":"…","type":"…","code":"…","param":"…"}}`
+            // on a 4xx/5xx. Pull the structured fields out so the
+            // user-visible error says exactly what the provider
+            // rejected, instead of a wall-of-JSON. Falls back to
+            // the raw body when the response isn't JSON.
+            let structured = parse_provider_error_body(&text);
+            tracing::error!(
+                provider = %self.provider_name,
+                url = %self.chat_completions_url(),
+                model = %request.model,
+                status = status.as_u16(),
+                error_kind = %structured.kind,
+                error_type = structured.error_type.as_deref().unwrap_or(""),
+                error_code = structured.error_code.as_deref().unwrap_or(""),
+                error_param = structured.error_param.as_deref().unwrap_or(""),
+                error_message = %structured.message,
+                response_body_chars = text.chars().count(),
+                "llm http error: provider rejected the request"
             );
-            return Err(LlmError::new(&format!("http_{}", status.as_u16()), &text)
+            let user_message = format_provider_error(&structured, &text);
+            return Err(LlmError::new(&format!("http_{}", status.as_u16()), &user_message)
                 .provider(&self.provider_name)
                 .model(&request.model));
         }
@@ -1195,119 +1168,6 @@ mod body_tests {
     }
 
     #[test]
-    fn tool_message_wrapped_renders_system_reminder_user_entry() {
-        // The wrapped renderer is the parallel of
-        // `lower_tool_message` for non-OpenAI providers that
-        // don't reliably correlate `tool_call_id`. The result
-        // is a `user`-role entry whose content is wrapped in a
-        // `<system-reminder>...</system-reminder>` block, so
-        // the model treats it as a fresh system-injected
-        // instruction rather than a stale tool result.
-        let tool = LlmMessage::tool("call_abc", "read", serde_json::json!({"text": "hello"}));
-        let entry = lower_tool_message_wrapped(&tool.content);
-        assert_eq!(entry["role"], "user");
-        let content = entry["content"].as_str().expect("string content");
-        assert!(
-            content.starts_with("<system-reminder>\n"),
-            "missing opening tag: {content:?}"
-        );
-        assert!(
-            content.ends_with("</system-reminder>"),
-            "missing closing tag: {content:?}"
-        );
-        assert!(
-            content.contains("call_id=call_abc"),
-            "missing call id: {content:?}"
-        );
-        assert!(
-            content.contains("[Tool result for read"),
-            "missing tool name: {content:?}"
-        );
-        // The body is the canonical JSON of the result.
-        assert!(
-            content.contains(r#"{"text":"hello"}"#),
-            "missing result body: {content:?}"
-        );
-        // The wrapped renderer must NOT carry a `tool_call_id`
-        // field — it's a plain user message.
-        assert!(entry.get("tool_call_id").is_none());
-    }
-
-    #[test]
-    fn lower_messages_wrapped_dispatches_per_role() {
-        // Top-level dispatch: assistant stays structured
-        // (tool_calls field), tool results become user-role
-        // `<system-reminder>` entries, plain user/system
-        // messages pass through unchanged.
-        let request = LlmRequest::new("MiniMax-M3", "minimax")
-            .with_system("You are a helpful assistant.")
-            .with_message(LlmMessage::user("read /etc/hostname"))
-            .with_message(LlmMessage {
-                role: "assistant".to_string(),
-                content: vec![ContentPart::ToolCall {
-                    id: "call_1".to_string(),
-                    name: "read".to_string(),
-                    input: serde_json::json!({"path": "/etc/hostname"}),
-                }],
-            })
-            .with_message(LlmMessage::tool(
-                "call_1",
-                "read",
-                serde_json::json!({"text": "host1\n"}),
-            ));
-        let messages = lower_messages_wrapped(&request);
-        assert_eq!(messages.len(), 4);
-        // System message passes through.
-        assert_eq!(messages[0]["role"], "system");
-        // User message passes through.
-        assert_eq!(messages[1]["role"], "user");
-        assert_eq!(messages[1]["content"], "read /etc/hostname");
-        // Assistant tool call is structured.
-        assert_eq!(messages[2]["role"], "assistant");
-        assert!(messages[2].get("tool_calls").is_some());
-        // Tool result is the user-role `<system-reminder>` entry.
-        assert_eq!(messages[3]["role"], "user");
-        let body = messages[3]["content"].as_str().expect("string");
-        assert!(body.starts_with("<system-reminder>"));
-        assert!(body.contains("call_id=call_1"));
-    }
-
-    #[test]
-    fn http_provider_defaults_to_structured_tool_results() {
-        // Both providers default to the structured `role: "tool"`
-        // form so the wire payload matches the SDK provider and
-        // never leaks `<system-reminder>` text into the
-        // conversation. Only providers that explicitly opt in
-        // via `with_wrap_tool_results(true)` get the wrapped
-        // form.
-        let minimax = OpenAiCompatibleHttpProvider::new(
-            "minimax",
-            Some("test-key".to_string()),
-            None,
-            "https://api.minimax.io/v1",
-            "MINIMAX_TOKEN_PLAN_KEY",
-            &["MiniMax-M3"],
-        );
-        assert!(
-            !minimax.wrap_tool_results(),
-            "minimax must default to structured role:tool; opt-in only via with_wrap_tool_results"
-        );
-        let openai = OpenAiCompatibleHttpProvider::new(
-            "openai",
-            Some("test-key".to_string()),
-            None,
-            "https://api.openai.com/v1",
-            "OPENAI_API_KEY",
-            &["gpt-4o-mini"],
-        );
-        assert!(!openai.wrap_tool_results());
-
-        // And the explicit opt-in works as a one-off override.
-        let wrapped = minimax.with_wrap_tool_results(true);
-        assert!(wrapped.wrap_tool_results());
-    }
-
-    #[test]
     fn tool_message_renders_structured_role_tool() {
         // The default `role: "tool"` rendering must carry the
         // `tool_call_id` and `name` on the wire so providers can
@@ -1321,12 +1181,6 @@ mod body_tests {
         assert_eq!(entry["name"], "read");
         let content = entry["content"].as_str().expect("string content");
         assert_eq!(content, r#"{"text":"hello"}"#);
-        // Must NOT contain any `<system-reminder>` markup —
-        // that would leak the wrap format into the persisted
-        // conversation and trip providers expecting the
-        // structured form.
-        assert!(!content.contains("<system-reminder>"));
-        assert!(!content.contains("</system-reminder>"));
     }
 
     #[test]
@@ -1334,8 +1188,10 @@ mod body_tests {
         // Default dispatch: assistant stays structured (tool_calls
         // field), tool results become `role: "tool"` with
         // `tool_call_id` + `name` on the wire, plain user/system
-        // messages pass through unchanged. No
-        // `<system-reminder>` strings anywhere.
+        // messages pass through unchanged. `lower_messages` only
+        // iterates `request.messages` — the system prompt is
+        // rendered separately as the top-level `system` field
+        // by `build_request_body`.
         let request = LlmRequest::new("MiniMax-M3", "minimax")
             .with_system("You are a helpful assistant.")
             .with_message(LlmMessage::user("read /etc/hostname"))
@@ -1353,33 +1209,16 @@ mod body_tests {
                 serde_json::json!({"text": "host1\n"}),
             ));
         let messages = lower_messages(&request);
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[1]["role"], "user");
-        assert_eq!(messages[1]["content"], "read /etc/hostname");
-        assert_eq!(messages[2]["role"], "assistant");
-        assert!(messages[2].get("tool_calls").is_some());
-        assert_eq!(messages[3]["role"], "tool");
-        assert_eq!(messages[3]["tool_call_id"], "call_1");
-        assert_eq!(messages[3]["name"], "read");
-        let body = messages[3]["content"].as_str().expect("string");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "read /etc/hostname");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert!(messages[1].get("tool_calls").is_some());
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_1");
+        assert_eq!(messages[2]["name"], "read");
+        let body = messages[2]["content"].as_str().expect("string");
         assert_eq!(body, r#"{"text":"host1\n"}"#);
-
-        // Whole-payload invariant: no message contains a
-        // `<system-reminder>` literal — that's the regression
-        // we want to keep out of the wire format and the
-        // persisted conversation.
-        for entry in &messages {
-            let serialized = entry.to_string();
-            assert!(
-                !serialized.contains("<system-reminder>"),
-                "system-reminder literal leaked into wire payload: {serialized}"
-            );
-            assert!(
-                !serialized.contains("</system-reminder>"),
-                "system-reminder close tag leaked into wire payload: {serialized}"
-            );
-        }
     }
 
     // ---- tool-stream parser ----
@@ -1709,60 +1548,6 @@ fn lower_messages(request: &LlmRequest) -> Vec<serde_json::Value> {
             }),
         })
         .collect()
-}
-
-/// Opt-in renderer: emit tool results as `<system-reminder>`
-/// user-role entries instead of structured `role: "tool"`
-/// messages. Only used when `wrap_tool_results = true`; this is
-/// an escape hatch for OpenAI-compatible proxies that refuse to
-/// correlate `tool_call_id`. The default `lower_messages`
-/// renderer uses the structured form, matching the SDK
-/// provider.
-fn lower_messages_wrapped(request: &LlmRequest) -> Vec<serde_json::Value> {
-    request
-        .messages
-        .iter()
-        .map(|msg| match msg.role.as_str() {
-            "tool" => lower_tool_message_wrapped(&msg.content),
-            "assistant" => lower_assistant_message(&msg.content),
-            _ => serde_json::json!({
-                "role": msg.role,
-                "content": lower_text_content(&msg.content),
-            }),
-        })
-        .collect()
-}
-
-/// Render `role: "tool"` messages wrapped in a `<system-reminder>`
-/// block. The model sees the tool result as a fresh
-/// system-injected user message rather than as a structured
-/// `tool` role entry. This mirrors opencode / claude-code's
-/// `<system-reminder>...</system-reminder>` injection pattern,
-/// which is robust on providers that don't reliably correlate
-/// `tool_call_id` (e.g. some OpenAI-compatible proxies).
-fn lower_tool_message_wrapped(content: &[ContentPart]) -> serde_json::Value {
-    let mut tool_call_id: Option<String> = None;
-    let mut tool_name: Option<String> = None;
-    let mut result_text: Option<String> = None;
-    for part in content {
-        if let ContentPart::ToolResult { id, name, result } = part {
-            tool_call_id = Some(id.clone());
-            tool_name = Some(name.clone());
-            result_text =
-                Some(serde_json::to_string(result).unwrap_or_else(|_| "null".to_string()));
-            break;
-        }
-    }
-    let id = tool_call_id.unwrap_or_default();
-    let name = tool_name.unwrap_or_default();
-    let body = result_text.unwrap_or_default();
-    let wrapped = format!(
-        "<system-reminder>\n[Tool result for {name} (call_id={id})]:\n{body}\n</system-reminder>"
-    );
-    serde_json::json!({
-        "role": "user",
-        "content": wrapped,
-    })
 }
 
 /// Render an assistant message, preserving the structured

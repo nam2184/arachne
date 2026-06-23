@@ -86,7 +86,7 @@ fn project_root_contains(root: &std::path::Path, candidate: &std::path::Path) ->
     if root.as_os_str().is_empty() {
         return None;
     }
-    Some(candidate.starts_with(root))
+    Some(crate::sandbox::path::path_starts_with(candidate, root))
 }
 
 async fn resolve_sandbox_path(

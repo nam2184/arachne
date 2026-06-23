@@ -9,6 +9,7 @@ use aisdk::core::{
 };
 use aisdk::providers::OpenAICompatible;
 
+use super::error_parsing::{format_provider_error, parse_provider_error_body};
 use super::{LlmError, LlmProvider, LlmStream, ToolDispatcherFn};
 use super::sdk_tool_registry::build_sdk_tool;
 use crate::llm::events::{FinishReason, LlmEvent, ToolResultValue};
@@ -263,7 +264,25 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
 
         let mut sdk_request = builder.build();
         let response = sdk_request.stream_text().await.map_err(|error| {
-            LlmError::new("sdk_request", &error.to_string())
+            // The SDK wraps provider 4xx/5xx as `Error::ApiError`
+            // with the response body in `details`. Parse the
+            // body so the user sees `[type] message (code, param)`
+            // instead of `Model streaming failed: ApiError { .. }`.
+            let raw = error.to_string();
+            let info = parse_provider_error_body(&raw);
+            tracing::error!(
+                provider = %self.provider_name,
+                model = %request.model,
+                error_kind = %info.kind,
+                error_type = info.error_type.as_deref().unwrap_or(""),
+                error_code = info.error_code.as_deref().unwrap_or(""),
+                error_param = info.error_param.as_deref().unwrap_or(""),
+                error_message = %info.message,
+                response_body_chars = raw.chars().count(),
+                "sdk_request failed: provider rejected the request"
+            );
+            let user_message = format_provider_error(&info, &raw);
+            LlmError::new("sdk_request", &user_message)
                 .provider(&self.provider_name)
                 .model(&request.model)
         })?;
@@ -780,7 +799,13 @@ mod tests {
             ToolResultValue::Error { value } => {
                 assert!(!value.contains("<system-reminder>"));
                 assert!(!value.contains("</system-reminder>"));
-                assert_eq!(value, "Error: denied by v2 permission service");
+                // The AISDK wraps `Err(message)` as
+                // `aisdk::Error::ToolCallError(message)`, which
+                // `Display`s as `"Tool error: {message}"`. Our
+                // translator prefixes that with `"Error: "` so
+                // the runner-side persistence block gets a
+                // clear, structured error string.
+                assert_eq!(value, "Error: Tool error: denied by v2 permission service");
             }
             other => panic!("expected Error variant, got {other:?}"),
         }
@@ -791,10 +816,10 @@ mod tests {
         // The harness dispatcher returns either `Ok(text)` or
         // `Err(message)` — both plain strings. The AISDK wraps
         // `Ok(s)` as `Value::String(s)` and `Err(msg)` as
-        // `Value::String("Error: msg")`. Neither path
+        // `aisdk::Error::ToolCallError(msg)`. Neither path
         // synthesizes `<system-reminder>` markup.
         let dispatcher: Arc<ToolDispatcherFn> = Arc::new(|name, input| {
-            if name == "fail" {
+            if name == "read" && input.get("force_error").is_some() {
                 Err("permission denied".to_string())
             } else {
                 serde_json::to_string(&input).map_err(|err| err.to_string())
@@ -812,11 +837,12 @@ mod tests {
         );
         assert_eq!(output, "{\"path\":\"src/lib.rs\"}");
 
-        let fail_tool = build_sdk_tool("fail", dispatcher).unwrap();
-        let err = fail_tool
+        // Same dispatcher routed through the same `read` tool
+        // but with `force_error` set — exercises the `Err` path.
+        let err = read_tool
             .execute
-            .call(serde_json::json!({}))
-            .expect_err("fail should error");
+            .call(serde_json::json!({"path": "src/lib.rs", "force_error": true}))
+            .expect_err("read should error");
         let err_display = err.to_string();
         assert!(
             !err_display.contains("<system-reminder>"),
@@ -892,6 +918,188 @@ fn log_sdk_request_structure(
         last_tool_result_chars = last_tool_result.as_deref().map(str::len).unwrap_or(0),
         "aisdk request structure + truncated input"
     );
+
+    // Opt-in full wire-shape dump. Set ARACHNE_DUMP_LLM=1 in the
+    // environment (or `arachne_agents::llm=trace` filter) to log
+    // the exact JSON body we hand to the AI SDK builder, which
+    // is what the OpenAI-compatible provider serializes on the
+    // wire. Lets you diff against what the provider expects
+    // when a 4xx lands.
+    if std::env::var_os("ARACHNE_DUMP_LLM").is_some() {
+        let body = build_sdk_wire_shape(request, system);
+        let body_pretty = serde_json::to_string_pretty(&body)
+            .unwrap_or_else(|_| "<unserializable>".to_string());
+        const MAX_BODY_BYTES: usize = 256 * 1024;
+        let body_truncated = body_pretty.len() > MAX_BODY_BYTES;
+        let body_display: String = if body_truncated {
+            body_pretty.chars().take(MAX_BODY_BYTES).collect()
+        } else {
+            body_pretty
+        };
+        tracing::warn!(
+            provider = %provider,
+            model = %model,
+            body_bytes = body_display.len(),
+            body_truncated,
+            env = "ARACHNE_DUMP_LLM=1",
+            body = %body_display,
+            "aisdk wire-shape body (opt-in dump; set ARACHNE_DUMP_LLM=0 to silence)"
+        );
+    }
+}
+
+/// Build the exact JSON shape the AI SDK's OpenAI-compatible
+/// provider serializes on the wire for chat-completions. We
+/// can't read the SDK's internal `options` struct, so we
+/// reconstruct the body from `LlmRequest` plus the system
+/// prompt and tool definitions the SDK builder consumed. The
+/// shape matches `OpenAIChatCompletionsOptions` in
+/// `aisdk-0.5.2/src/providers/openai_chat_completions.rs`.
+fn build_sdk_wire_shape(request: &LlmRequest, system: &str) -> serde_json::Value {
+    let mut out_messages: Vec<serde_json::Value> = Vec::new();
+    for message in &request.messages {
+        match message.role.as_str() {
+            "tool" => {
+                let mut entry = serde_json::Map::new();
+                entry.insert(
+                    "role".to_string(),
+                    serde_json::Value::String("tool".to_string()),
+                );
+                if let Some(ContentPart::ToolResult { id, name, result }) = message
+                    .content
+                    .iter()
+                    .find(|part| matches!(part, ContentPart::ToolResult { .. }))
+                {
+                    entry.insert(
+                        "tool_call_id".to_string(),
+                        serde_json::Value::String(id.clone()),
+                    );
+                    entry.insert(
+                        "name".to_string(),
+                        serde_json::Value::String(name.clone()),
+                    );
+                    entry.insert(
+                        "content".to_string(),
+                        serde_json::Value::String(
+                            serde_json::to_string(result)
+                                .unwrap_or_else(|_| "null".to_string()),
+                        ),
+                    );
+                } else {
+                    entry.insert(
+                        "content".to_string(),
+                        serde_json::Value::String(
+                            message
+                                .content
+                                .iter()
+                                .filter_map(ContentPart::as_prompt_text)
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                    );
+                }
+                out_messages.push(serde_json::Value::Object(entry));
+            }
+            "assistant" => {
+                let mut text_parts: Vec<String> = Vec::new();
+                let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+                for part in &message.content {
+                    match part {
+                        ContentPart::ToolCall { id, name, input } => {
+                            tool_calls.push(serde_json::json!({
+                                "id": id,
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": serde_json::to_string(input)
+                                        .unwrap_or_else(|_| "null".to_string()),
+                                },
+                            }));
+                        }
+                        ContentPart::Text { text } => {
+                            if !text.is_empty() {
+                                text_parts.push(text.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let mut entry = serde_json::Map::new();
+                entry.insert(
+                    "role".to_string(),
+                    serde_json::Value::String("assistant".to_string()),
+                );
+                let text = text_parts.join("\n");
+                let content_value = if text.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(text)
+                };
+                entry.insert("content".to_string(), content_value);
+                if !tool_calls.is_empty() {
+                    entry.insert(
+                        "tool_calls".to_string(),
+                        serde_json::Value::Array(tool_calls),
+                    );
+                }
+                out_messages.push(serde_json::Value::Object(entry));
+            }
+            _ => {
+                let text = prompt_text(&message.content);
+                out_messages.push(serde_json::json!({
+                    "role": message.role,
+                    "content": text,
+                }));
+            }
+        }
+    }
+
+    let tools: Vec<serde_json::Value> = request
+        .tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                }
+            })
+        })
+        .collect();
+
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "model".to_string(),
+        serde_json::Value::String(request.model.clone()),
+    );
+    body.insert("stream".to_string(), serde_json::Value::Bool(true));
+    body.insert(
+        "messages".to_string(),
+        serde_json::Value::Array(out_messages),
+    );
+    body.insert("tools".to_string(), serde_json::Value::Array(tools));
+    if !system.is_empty() {
+        body.insert(
+            "system".to_string(),
+            serde_json::Value::String(system.to_string()),
+        );
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        body.insert(
+            "max_tokens".to_string(),
+            serde_json::Value::Number(max_tokens.into()),
+        );
+    }
+    if let Some(temperature) = request.temperature {
+        body.insert("temperature".to_string(), serde_json::json!(temperature));
+    }
+    if let Some(top_p) = request.top_p {
+        body.insert("top_p".to_string(), serde_json::json!(top_p));
+    }
+
+    serde_json::Value::Object(body)
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {

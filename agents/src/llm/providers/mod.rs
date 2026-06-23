@@ -19,6 +19,7 @@ pub type ToolDispatcherFn =
 
 mod aisdk_provider;
 mod aisdk_wrappers;
+pub(crate) mod error_parsing;
 pub mod minimax_token_plan;
 mod openai_compatible_backend;
 mod openai_compatible_http;
