@@ -1,4 +1,6 @@
-use super::{LlmError, LlmProvider, LlmStream};
+use std::sync::Arc;
+
+use super::{LlmError, LlmProvider, LlmStream, ToolDispatcherFn};
 use crate::llm::request::LlmRequest;
 
 use super::openai_compatible_http::OpenAiCompatibleHttpProvider;
@@ -100,6 +102,19 @@ impl OpenAiCompatibleBackend {
         match self {
             Self::Http(provider) => provider.stream(request).await,
             Self::Sdk(provider) => provider.stream(request).await,
+        }
+    }
+
+    /// Forward the harness-side tool dispatcher to whichever
+    /// backend variant holds the SDK provider. The HTTP variant
+    /// inherits the no-op default from `LlmProvider`.
+    pub fn set_tool_dispatcher(&self, dispatcher: Arc<ToolDispatcherFn>) {
+        match self {
+            Self::Http(_) => {
+                // No-op: HTTP backend dispatches tools from
+                // streamed events itself.
+            }
+            Self::Sdk(provider) => provider.set_tool_dispatcher(dispatcher),
         }
     }
 }

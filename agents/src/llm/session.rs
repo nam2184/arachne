@@ -1,11 +1,13 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 
 use crate::domain::ToolCall;
 use crate::llm::events::{FinishReason, LlmEvent, ToolResultValue};
-use crate::llm::providers::LlmProvider;
+use crate::llm::providers::{LlmProvider, ToolDispatcherFn};
 use crate::llm::request::{ContentPart, LlmMessage, LlmRequest};
 use crate::llm::subagent_registry::SubagentRegistry;
 use crate::llm::xml_tool_call::{InvalidToolCallHit, XmlToolCallScanner};
@@ -413,6 +415,267 @@ impl SessionRunner {
         called.difference(&answered).next().is_some()
     }
 
+    /// Build the harness-side tool dispatcher handed to the
+    /// SDK provider. Every tool call the model issues goes
+    /// through this closure, which runs the same v2 permission
+    /// service check, doom-loop detector, and sandboxed
+    /// `run_tool_*` dispatch the manual dispatcher used to
+    /// apply on the HTTP path. The SDK's `handle_tool_call`
+    /// loop simply hands us the resolved `ToolCallInfo`, gets
+    /// the result string back, and feeds it to the model as
+    /// `Message::Tool`.
+    ///
+    /// The closure is `Fn` (sync) because the AI SDK's
+    /// `ToolExecute::new` accepts `Box<dyn Fn(Value) -> Result<String, String>>`.
+    /// Our `run_tool_*` paths are async; we drive them via
+    /// `Handle::current().block_on(...)` since the SDK already
+    /// invokes the closure from inside its own tokio runtime.
+    fn build_harness_tool_dispatcher(
+        &self,
+        session_id: &str,
+        step: u32,
+        mode: crate::permission::PermissionMode,
+        session_directory: String,
+        project_root: PathBuf,
+    ) -> Arc<ToolDispatcherFn> {
+        let session_id_owned = session_id.to_string();
+        let event_sink = self.event_sink.clone();
+        let permissions = self.permissions.clone();
+        let sandboxed_ctx = self.sandboxed_ctx.clone();
+        let subagent_registry = self.subagent_registry.clone();
+        let providers = Arc::clone(&self.providers);
+        let session_service = Arc::clone(&self.session_service);
+        let conversation_service = Arc::clone(&self.conversation_service);
+        let doom = Arc::clone(&self.doom);
+        let spill_dir = self.spill_dir.clone();
+        let noop_registry = self.subagent_registry_noop();
+
+        Arc::new(move |tool_name: &str, input: serde_json::Value| {
+            // The executor runs synchronously inside the SDK's
+            // tokio task. We `block_on` a small async block that
+            // does the v2 permission check, doom-loop detector,
+            // and sandbox dispatch — i.e. every guard the
+            // hand-rolled dispatcher applied to HTTP-path tool
+            // calls also applies to SDK-path tool calls.
+            let handle = match Handle::try_current() {
+                Ok(handle) => handle,
+                Err(_) => {
+                    return Err(
+                        "tool dispatcher invoked outside a tokio runtime".to_string(),
+                    );
+                }
+            };
+
+            let tool_call_id = format!("sdk-{}", uuid::Uuid::new_v4());
+            let tool_name_owned = tool_name.to_string();
+            let arguments = if let Some(obj) = input.as_object() {
+                obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            } else {
+                std::collections::HashMap::new()
+            };
+            let tool_call = crate::domain::ToolCall {
+                name: tool_name_owned.clone(),
+                arguments: arguments.clone(),
+            };
+
+            // Doom-loop guard. Same threshold the manual
+            // dispatcher used: three identical calls in a row
+            // trips an `Err` that the model sees as a tool
+            // error and self-corrects on the next turn.
+            let args_fingerprint = serde_json::to_string(&arguments)
+                .unwrap_or_else(|_| "{}".to_string());
+            if doom.record(&tool_name_owned, &args_fingerprint) {
+                let message = format!(
+                    "doom loop: the same `{tool_name_owned}` call has been issued 3 times in a row. \
+                     Vary your inputs or take a different approach."
+                );
+                if let Some(sink) = &event_sink {
+                    sink(SessionRunEvent {
+                        session_id: session_id_owned.clone(),
+                        step,
+                        event: LlmEvent::ToolError {
+                            id: tool_call_id.clone(),
+                            name: tool_name_owned.clone(),
+                            message: message.clone(),
+                        },
+                    });
+                }
+                doom.reset();
+                return Err(message);
+            }
+
+            // v2 permission service. Tool calls that violate the
+            // active mode are rejected; the `Err` flows back to
+            // the SDK as a tool error and is wrapped into
+            // `Message::Tool` for the next model turn. We use the
+            // sync `check` entry point because the dispatcher
+            // closure runs synchronously inside the SDK's
+            // tokio task; `ask` (the user-prompt path) blocks
+            // via a `oneshot` channel that the v2 service
+            // exposes internally.
+            if let Some(permission_service) = &permissions {
+                use crate::permission_v2::CheckRequest;
+                let request = CheckRequest {
+                    permission: "tool_use".to_string(),
+                    pattern: tool_name_owned.clone(),
+                    tool: tool_name_owned.clone(),
+                    always: vec![tool_name_owned.clone()],
+                    request_id: None,
+                };
+                if let Err(err) = permission_service.check(request) {
+                    let message = err.to_string();
+                    if let Some(sink) = &event_sink {
+                        sink(SessionRunEvent {
+                            session_id: session_id_owned.clone(),
+                            step,
+                            event: LlmEvent::ToolError {
+                                id: tool_call_id.clone(),
+                                name: tool_name_owned.clone(),
+                                message: message.clone(),
+                            },
+                        });
+                    }
+                    return Err(message);
+                }
+            }
+
+            // Sandbox dispatch — same path the manual dispatcher
+            // took. We branch on async-vs-sync dispatch the same
+            // way `run_turn` did so `task`, peer-targeted plan-mode
+            // tools, and the network tools still get a
+            // `ToolRuntime`.
+            let ctx = ToolContext::new(mode).with_project_root(project_root.clone());
+            let sandboxed = sandboxed_ctx.as_deref();
+            let has_peer_session_id = arguments
+                .get("peer_session_id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty());
+            let needs_async_runtime =
+                tool_name_owned == "task" || has_peer_session_id;
+            let needs_async_dispatch = needs_async_runtime
+                || tool_name_owned == "webfetch"
+                || tool_name_owned == "websearch";
+
+            let result = handle.block_on(async {
+                if let Some(registry) = &subagent_registry {
+                    let runtime = ToolRuntime {
+                        caller_session_id: session_id_owned.clone(),
+                        session_service: Arc::clone(&session_service),
+                        conversation_service: Arc::clone(&conversation_service),
+                        providers: Arc::clone(&providers),
+                        subagent_registry: Arc::clone(registry),
+                        mode,
+                        turn_id: step as u64,
+                        project_root: project_root.clone(),
+                    };
+                    if needs_async_dispatch {
+                        if let Some(sandboxed) = sandboxed {
+                            run_tool_async_sandboxed(&tool_call, &runtime, sandboxed).await
+                        } else {
+                            run_tool_async(&tool_call, &runtime).await
+                        }
+                    } else if let Some(sandboxed) = sandboxed {
+                        run_tool_sandboxed(&tool_call, sandboxed).await
+                    } else {
+                        run_tool_with_context(&tool_call, &ctx)
+                    }
+                } else if needs_async_dispatch
+                    && (tool_name_owned == "webfetch" || tool_name_owned == "websearch")
+                {
+                    let runtime = ToolRuntime {
+                        caller_session_id: session_id_owned.clone(),
+                        session_service: Arc::clone(&session_service),
+                        conversation_service: Arc::clone(&conversation_service),
+                        providers: Arc::clone(&providers),
+                        subagent_registry: Arc::clone(&noop_registry),
+                        mode,
+                        turn_id: step as u64,
+                        project_root: project_root.clone(),
+                    };
+                    if let Some(sandboxed) = sandboxed {
+                        run_tool_async_sandboxed(&tool_call, &runtime, sandboxed).await
+                    } else {
+                        run_tool_async(&tool_call, &runtime).await
+                    }
+                } else if let Some(sandboxed) = sandboxed {
+                    run_tool_sandboxed(&tool_call, sandboxed).await
+                } else {
+                    run_tool_with_context(&tool_call, &ctx)
+                }
+            });
+
+            // Bound the persisted tool result so a single call
+            // can't blow the model context window — same logic
+            // the manual dispatcher used. Emit the
+            // `LlmEvent::ToolResult` so the runner-side
+            // persistence block picks it up.
+            let raw_output = result.output.clone();
+            let bounded = if result.success {
+                let raw = raw_output.as_str();
+                let spill = spill_dir.as_deref();
+                let out = if tool_name_owned == "shell" {
+                    crate::tools::output_bounds::tail_bound_output(raw, spill, &tool_name_owned)
+                } else {
+                    bound_tool_output(raw, spill, &tool_name_owned)
+                };
+                if out.truncated {
+                    crate::tools::output_bounds::note_truncation();
+                }
+                out
+            } else {
+                crate::tools::BoundedOutput {
+                    text: raw_output.clone(),
+                    truncated: false,
+                    dropped_lines: 0,
+                    spill_path: None,
+                }
+            };
+            let persisted_output = if bounded.truncated {
+                Some(bounded.text.clone())
+            } else {
+                Some(raw_output.clone())
+            };
+            let result_value = if !result.success {
+                serde_json::json!({ "error": result.error.unwrap_or_default() })
+            } else if bounded.truncated {
+                let mut value = serde_json::json!({
+                    "text": bounded.text,
+                    "truncated": true,
+                    "max_lines": MAX_TOOL_OUTPUT_LINES,
+                    "max_bytes": MAX_TOOL_OUTPUT_BYTES,
+                });
+                if let Some(path) = &bounded.spill_path {
+                    value["spill_path"] = serde_json::Value::String(path.clone());
+                }
+                value
+            } else {
+                serde_json::json!({ "text": bounded.text })
+            };
+
+            if let Some(sink) = &event_sink {
+                sink(SessionRunEvent {
+                    session_id: session_id_owned.clone(),
+                    step,
+                    event: LlmEvent::ToolResult {
+                        id: tool_call_id.clone(),
+                        name: tool_name_owned.clone(),
+                        result: ToolResultValue::Json {
+                            value: result_value.clone(),
+                        },
+                        output: persisted_output,
+                    },
+                });
+            }
+
+            // The SDK wraps whatever string we return into
+            // `Message::Tool`. We return the canonical JSON the
+            // manual dispatcher would have stored on the
+            // assistant message, so the model sees the same
+            // tool result on the next turn.
+            serde_json::to_string(&result_value).map_err(|err| err.to_string())
+        })
+    }
+
     async fn run_turn(&self, session_id: &str, step: u32) -> Result<bool, SessionError> {
         let session = self
             .session_service
@@ -664,6 +927,30 @@ impl SessionRunner {
             .get(&session.provider)
             .await
             .ok_or(SessionError::NoProviderForSession)?;
+
+        // The harness dispatcher needs the resolved project
+        // root up front so it can pass the same `ToolContext`
+        // into `run_tool_*` that the manual dispatcher uses.
+        // Same construction as the post-stream block below.
+        let dispatcher_project_root = std::path::PathBuf::from(&session.directory);
+
+        // Wire the harness-side tool dispatcher for SDK-backed
+        // providers so the AI SDK's `handle_tool_call` loop
+        // routes through the same v2 permission service,
+        // doom-loop detector, and sandboxed `run_tool_*` paths
+        // the manual dispatcher used. The HTTP backend ignores
+        // this — it does its own tool dispatch from the
+        // streamed `LlmEvent::ToolCall` events. We always wire
+        // it (the HTTP backend no-ops) so the dispatcher is
+        // uniformly available across backends.
+        let dispatcher = self.build_harness_tool_dispatcher(
+            session_id,
+            step,
+            self.mode,
+            session.directory.clone(),
+            dispatcher_project_root,
+        );
+        provider.set_tool_dispatcher(dispatcher);
 
         let stream = provider
             .stream(request)

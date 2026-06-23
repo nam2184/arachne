@@ -19,8 +19,10 @@ pub struct OpenAiCompatibleHttpProvider {
     http_client: reqwest::Client,
     /// When `true`, tool results are emitted as `<system-reminder>`
     /// user-role entries instead of structured `role: "tool"`
-    /// messages. Default depends on the provider name; see
-    /// `OpenAiCompatibleHttpProvider::new`.
+    /// messages. Defaults to `false`; only opt in via
+    /// `with_wrap_tool_results(true)` when a provider's
+    /// OpenAI-compatible proxy refuses to correlate
+    /// `tool_call_id`. Matches the SDK provider's structured form.
     wrap_tool_results: bool,
 }
 
@@ -33,12 +35,17 @@ impl OpenAiCompatibleHttpProvider {
         api_key_env: &str,
         supported_models: &[&str],
     ) -> Self {
-        // Default to `<system-reminder>` wrapping for any
-        // non-OpenAI provider — Minimax, OpenRouter, Together, etc.
-        // — because their tool-call correlation is more reliable
-        // when the result is a tagged user-role entry. OpenAI
-        // itself uses the structured `role: "tool"` form.
-        let wrap_tool_results = !provider_name.trim().eq_ignore_ascii_case("openai");
+        // Default to the structured `role: "tool"` form (with
+        // `tool_call_id` and `name` on the wire) — this matches
+        // the SDK provider and the OpenAI spec. The previous
+        // default wrapped results as `<system-reminder>` user-role
+        // text, which leaked the literal `<system-reminder>`
+        // markup into the persisted conversation and tripped 400s
+        // on providers that expect the structured form to
+        // follow the assistant's `tool_calls`. Providers that
+        // genuinely need the wrapped form can opt in with
+        // `with_wrap_tool_results(true)`.
+        let wrap_tool_results = false;
         Self {
             provider_name: provider_name.to_string(),
             api_key_env: api_key_env.to_string(),
@@ -60,8 +67,9 @@ impl OpenAiCompatibleHttpProvider {
 
     /// Override the wire renderer. When `true`, tool results are
     /// emitted as `<system-reminder>` user-role entries instead of
-    /// structured `role: "tool"` messages. Defaults to `true` for
-    /// non-OpenAI providers, `false` for OpenAI itself.
+    /// structured `role: "tool"` messages. Defaults to `false` to
+    /// match the SDK provider; only opt in when an OpenAI-compatible
+    /// proxy refuses to correlate `tool_call_id`.
     #[allow(dead_code)]
     pub fn with_wrap_tool_results(mut self, wrap: bool) -> Self {
         self.wrap_tool_results = wrap;
@@ -136,12 +144,12 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
 
     async fn stream(&self, request: LlmRequest) -> Result<LlmStream, LlmError> {
         let api_key = self.api_key.as_ref().ok_or_else(|| self.auth_error())?;
-        // Per-provider wire-format selection. Some OpenAI-compatible
-        // proxies don't reliably round-trip the structured
-        // `role: "tool"` + `tool_call_id` correlation, so for them
-        // we render tool results as `<system-reminder>` user-role
-        // entries instead. The default is the OpenAI-spec
-        // structured form.
+        // Default to the OpenAI-spec structured `role: "tool"`
+        // form with `tool_call_id` + `name` on the wire. Some
+        // OpenAI-compatible proxies don't reliably round-trip the
+        // `tool_call_id` correlation, so callers can opt into the
+        // `<system-reminder>` wrapped form via
+        // `with_wrap_tool_results(true)`.
         let renderer: fn(&LlmRequest) -> Vec<serde_json::Value> = if self.wrap_tool_results() {
             lower_messages_wrapped
         } else {
@@ -170,6 +178,12 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
             &request.model,
             &body,
             body_bytes,
+        );
+        log_request_structure_and_input(
+            &self.provider_name,
+            &request.model,
+            &body,
+            extract_last_user_input(&body),
         );
 
         let response = self
@@ -739,6 +753,118 @@ fn log_http_request_body(
     );
 }
 
+/// Pull the most recent user-role entry's content out of the
+/// request body. We log it (truncated) on every send so the
+/// developer can confirm what the model actually sees as the
+/// latest instruction, including any `role: "tool"` results
+/// that the renderer turned into structured entries.
+fn extract_last_user_input(body: &serde_json::Value) -> Option<String> {
+    let messages = body.get("messages")?.as_array()?;
+    for entry in messages.iter().rev() {
+        let role = entry.get("role").and_then(|value| value.as_str());
+        if role == Some("user") {
+            return Some(stringify_message_content(&entry["content"]));
+        }
+    }
+    None
+}
+
+fn stringify_message_content(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                if part.get("type").and_then(|value| value.as_str()) == Some("text") {
+                    part.get("text").and_then(|value| value.as_str()).map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// Debug-level dump of the JSON structure and the latest user
+/// input content, truncated. The shape log is intentionally
+/// cheap (counts of messages and roles + tool-call ids) so the
+/// full payload stays inspectable in the structured `body`
+/// field of the same line; the input log is what the developer
+/// usually wants to inspect first.
+fn log_request_structure_and_input(
+    provider: &str,
+    model: &str,
+    body: &serde_json::Value,
+    last_user_input: Option<String>,
+) {
+    let mut role_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut tool_call_ids: Vec<String> = Vec::new();
+    let mut last_tool_result: Option<String> = None;
+
+    if let Some(messages) = body.get("messages").and_then(|value| value.as_array()) {
+        for entry in messages {
+            let role = entry
+                .get("role")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?")
+                .to_string();
+            *role_counts.entry(role).or_insert(0) += 1;
+            if let Some(tool_calls) = entry.get("tool_calls").and_then(|value| value.as_array()) {
+                for call in tool_calls {
+                    if let Some(id) = call.get("id").and_then(|value| value.as_str()) {
+                        tool_call_ids.push(id.to_string());
+                    }
+                }
+            }
+            if entry.get("role").and_then(|value| value.as_str()) == Some("tool") {
+                last_tool_result = Some(stringify_message_content(&entry["content"]));
+            }
+        }
+    }
+
+    const INPUT_LOG_CHARS: usize = 1024;
+    let last_user_input = last_user_input.map(|text| {
+        if text.chars().count() > INPUT_LOG_CHARS {
+            let mut truncated = text.chars().take(INPUT_LOG_CHARS).collect::<String>();
+            truncated.push_str("…[truncated]");
+            truncated
+        } else {
+            text
+        }
+    });
+    const TOOL_RESULT_LOG_CHARS: usize = 512;
+    let last_tool_result = last_tool_result.map(|text| {
+        if text.chars().count() > TOOL_RESULT_LOG_CHARS {
+            let mut truncated = text.chars().take(TOOL_RESULT_LOG_CHARS).collect::<String>();
+            truncated.push_str("…[truncated]");
+            truncated
+        } else {
+            text
+        }
+    });
+
+    tracing::debug!(
+        provider = %provider,
+        model = %model,
+        role_counts = ?role_counts,
+        tool_call_ids = ?tool_call_ids,
+        message_count = body
+            .get("messages")
+            .and_then(|value| value.as_array())
+            .map(|arr| arr.len())
+            .unwrap_or(0),
+        last_user_input = %last_user_input.as_deref().unwrap_or(""),
+        last_user_input_chars = last_user_input.as_deref().map(str::len).unwrap_or(0),
+        last_tool_result = %last_tool_result.as_deref().unwrap_or(""),
+        last_tool_result_chars = last_tool_result.as_deref().map(str::len).unwrap_or(0),
+        "llm request structure + truncated input"
+    );
+}
+
 fn build_request_body(
     provider_name: &str,
     request: &LlmRequest,
@@ -1147,10 +1273,13 @@ mod body_tests {
     }
 
     #[test]
-    fn http_provider_defaults_wrap_tool_results_for_non_openai() {
-        // The default flag mirrors the opencode convention: any
-        // provider that is not "openai" itself defaults to the
-        // wrapped renderer.
+    fn http_provider_defaults_to_structured_tool_results() {
+        // Both providers default to the structured `role: "tool"`
+        // form so the wire payload matches the SDK provider and
+        // never leaks `<system-reminder>` text into the
+        // conversation. Only providers that explicitly opt in
+        // via `with_wrap_tool_results(true)` get the wrapped
+        // form.
         let minimax = OpenAiCompatibleHttpProvider::new(
             "minimax",
             Some("test-key".to_string()),
@@ -1159,7 +1288,10 @@ mod body_tests {
             "MINIMAX_TOKEN_PLAN_KEY",
             &["MiniMax-M3"],
         );
-        assert!(minimax.wrap_tool_results());
+        assert!(
+            !minimax.wrap_tool_results(),
+            "minimax must default to structured role:tool; opt-in only via with_wrap_tool_results"
+        );
         let openai = OpenAiCompatibleHttpProvider::new(
             "openai",
             Some("test-key".to_string()),
@@ -1169,6 +1301,85 @@ mod body_tests {
             &["gpt-4o-mini"],
         );
         assert!(!openai.wrap_tool_results());
+
+        // And the explicit opt-in works as a one-off override.
+        let wrapped = minimax.with_wrap_tool_results(true);
+        assert!(wrapped.wrap_tool_results());
+    }
+
+    #[test]
+    fn tool_message_renders_structured_role_tool() {
+        // The default `role: "tool"` rendering must carry the
+        // `tool_call_id` and `name` on the wire so providers can
+        // correlate the result with the assistant's
+        // `tool_calls[*].id`. The body is the canonical JSON
+        // string of the result value.
+        let tool = LlmMessage::tool("call_abc", "read", serde_json::json!({"text": "hello"}));
+        let entry = lower_tool_message(&tool.content);
+        assert_eq!(entry["role"], "tool");
+        assert_eq!(entry["tool_call_id"], "call_abc");
+        assert_eq!(entry["name"], "read");
+        let content = entry["content"].as_str().expect("string content");
+        assert_eq!(content, r#"{"text":"hello"}"#);
+        // Must NOT contain any `<system-reminder>` markup —
+        // that would leak the wrap format into the persisted
+        // conversation and trip providers expecting the
+        // structured form.
+        assert!(!content.contains("<system-reminder>"));
+        assert!(!content.contains("</system-reminder>"));
+    }
+
+    #[test]
+    fn lower_messages_dispatches_per_role_with_structured_tool_results() {
+        // Default dispatch: assistant stays structured (tool_calls
+        // field), tool results become `role: "tool"` with
+        // `tool_call_id` + `name` on the wire, plain user/system
+        // messages pass through unchanged. No
+        // `<system-reminder>` strings anywhere.
+        let request = LlmRequest::new("MiniMax-M3", "minimax")
+            .with_system("You are a helpful assistant.")
+            .with_message(LlmMessage::user("read /etc/hostname"))
+            .with_message(LlmMessage {
+                role: "assistant".to_string(),
+                content: vec![ContentPart::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"path": "/etc/hostname"}),
+                }],
+            })
+            .with_message(LlmMessage::tool(
+                "call_1",
+                "read",
+                serde_json::json!({"text": "host1\n"}),
+            ));
+        let messages = lower_messages(&request);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "read /etc/hostname");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert!(messages[2].get("tool_calls").is_some());
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call_1");
+        assert_eq!(messages[3]["name"], "read");
+        let body = messages[3]["content"].as_str().expect("string");
+        assert_eq!(body, r#"{"text":"host1\n"}"#);
+
+        // Whole-payload invariant: no message contains a
+        // `<system-reminder>` literal — that's the regression
+        // we want to keep out of the wire format and the
+        // persisted conversation.
+        for entry in &messages {
+            let serialized = entry.to_string();
+            assert!(
+                !serialized.contains("<system-reminder>"),
+                "system-reminder literal leaked into wire payload: {serialized}"
+            );
+            assert!(
+                !serialized.contains("</system-reminder>"),
+                "system-reminder close tag leaked into wire payload: {serialized}"
+            );
+        }
     }
 
     // ---- tool-stream parser ----
@@ -1500,14 +1711,13 @@ fn lower_messages(request: &LlmRequest) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Render tool results as `<system-reminder>` user-role entries
-/// instead of structured `role: "tool"` messages. Robust on
-/// providers that don't reliably correlate `tool_call_id`
-/// (e.g. some OpenAI-compatible proxies). Mirrors opencode /
-/// claude-code's `<system-reminder>...</system-reminder>`
-/// injection pattern. The assistant tool-call messages are
-/// still rendered with the structured `tool_calls` field so
-/// providers that DO use `tool_call_id` can correlate the two.
+/// Opt-in renderer: emit tool results as `<system-reminder>`
+/// user-role entries instead of structured `role: "tool"`
+/// messages. Only used when `wrap_tool_results = true`; this is
+/// an escape hatch for OpenAI-compatible proxies that refuse to
+/// correlate `tool_call_id`. The default `lower_messages`
+/// renderer uses the structured form, matching the SDK
+/// provider.
 fn lower_messages_wrapped(request: &LlmRequest) -> Vec<serde_json::Value> {
     request
         .messages

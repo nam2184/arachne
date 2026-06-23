@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use super::openai_compatible_backend::OpenAiCompatibleBackend;
-use super::{LlmError, LlmProvider, LlmStream};
+use super::{LlmError, LlmProvider, LlmStream, ToolDispatcherFn};
 use crate::llm::request::LlmRequest;
 use crate::ProviderConfig;
 
@@ -73,6 +75,15 @@ impl LlmProvider for MiniMaxTokenPlanProvider {
 
     fn api_key(&self) -> Option<&str> {
         self.inner.api_key()
+    }
+
+    /// Forward the harness-side tool dispatcher to whichever
+    /// backend variant (HTTP or SDK) the inner wraps. Without
+    /// this, SDK-backed sessions that go through this wrapper
+    /// never see the dispatcher and `OpenAiCompatibleSdkProvider`
+    /// errors with `[sdk_no_dispatcher]`.
+    fn set_tool_dispatcher(&self, dispatcher: Arc<ToolDispatcherFn>) {
+        self.inner.set_tool_dispatcher(dispatcher);
     }
 }
 

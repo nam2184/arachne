@@ -8,12 +8,22 @@ use tokio_stream::Stream;
 use super::events::LlmEvent;
 use super::request::{LlmError, LlmRequest, LlmResponse};
 
+/// Harness-side tool dispatcher invoked by the SDK provider for
+/// every tool call the model issues. The signature matches the
+/// `aisdk::core::tools::ToolFn` shape: a `&str` tool name and
+/// JSON-parsed arguments in, a `Result<String, String>` result
+/// out. Returning `Err(message)` is fed back to the model as a
+/// tool error so it can self-correct.
+pub type ToolDispatcherFn =
+    dyn Fn(&str, serde_json::Value) -> Result<String, String> + Send + Sync;
+
 mod aisdk_provider;
 mod aisdk_wrappers;
 pub mod minimax_token_plan;
 mod openai_compatible_backend;
 mod openai_compatible_http;
 mod openai_compatible_sdk;
+pub(crate) mod sdk_tool_registry;
 
 pub use aisdk_provider::{
     api_key_env as aisdk_api_key_env, docs_url as aisdk_docs_url,
@@ -47,6 +57,14 @@ pub trait LlmProvider: Send + Sync {
 
     fn model_base_url(&self) -> Option<&str>;
     fn api_key(&self) -> Option<&str>;
+
+    /// Set the harness-side tool dispatcher. The SDK provider
+    /// stores this on a per-stream basis so the AI SDK's
+    /// `handle_tool_call` loop routes through our v2 permission
+    /// service, doom-loop detector, and sandboxed `run_tool_*`
+    /// paths. Backends that don't run their own tool-execution
+    /// loop (the HTTP backend) inherit the no-op default.
+    fn set_tool_dispatcher(&self, _dispatcher: Arc<ToolDispatcherFn>) {}
 }
 
 pub struct LlmStream {
