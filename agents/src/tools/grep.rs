@@ -33,11 +33,20 @@ pub fn run_with_root(call: &ToolCall, root: &Path) -> ToolResult {
         return failure("grep", "pattern is required".to_string());
     }
 
+    tracing::info!(
+        root = %root.display(),
+        pattern = %pattern,
+        include = %include,
+        limit,
+        "grep walk started"
+    );
+    let started = std::time::Instant::now();
     let mut matches = Vec::new();
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
         .max_depth(20)
         .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !is_ignored_search_dir(entry.path()))
         .flatten()
     {
         if !entry.file_type().is_file() {
@@ -67,6 +76,15 @@ pub fn run_with_root(call: &ToolCall, root: &Path) -> ToolResult {
         }
     }
 
+    tracing::info!(
+        root = %root.display(),
+        pattern = %pattern,
+        include = %include,
+        matches = matches.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "grep walk finished"
+    );
+
     if matches.is_empty() {
         return failure("grep", "No matches found".to_string());
     }
@@ -77,6 +95,24 @@ pub fn run_with_root(call: &ToolCall, root: &Path) -> ToolResult {
         ));
     }
     success("grep", output)
+}
+
+fn is_ignored_search_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "dist"
+            | "build"
+            | "target"
+            | "coverage"
+            | ".next"
+            | ".nuxt"
+            | ".cache"
+    )
 }
 
 #[cfg(test)]

@@ -51,11 +51,19 @@ pub fn run_with_root(call: &ToolCall, root: &Path) -> ToolResult {
     };
     let limit = usize_arg(call, "limit").unwrap_or(GLOB_DEFAULT_LIMIT);
 
+    tracing::info!(
+        root = %root.display(),
+        pattern = %pattern,
+        limit,
+        "glob walk started"
+    );
+    let started = std::time::Instant::now();
     let mut matches = Vec::new();
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
         .max_depth(20)
         .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || !is_ignored_search_dir(entry.path()))
         .flatten()
     {
         if !entry.file_type().is_file() {
@@ -76,6 +84,14 @@ pub fn run_with_root(call: &ToolCall, root: &Path) -> ToolResult {
         }
     }
 
+    tracing::info!(
+        root = %root.display(),
+        pattern = %pattern,
+        matches = matches.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "glob walk finished"
+    );
+
     if matches.is_empty() {
         return failure("glob", "No files found".to_string());
     }
@@ -86,6 +102,24 @@ pub fn run_with_root(call: &ToolCall, root: &Path) -> ToolResult {
         ));
     }
     success("glob", output)
+}
+
+fn is_ignored_search_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "dist"
+            | "build"
+            | "target"
+            | "coverage"
+            | ".next"
+            | ".nuxt"
+            | ".cache"
+    )
 }
 
 #[cfg(test)]

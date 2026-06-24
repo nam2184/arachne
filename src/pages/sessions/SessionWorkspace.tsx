@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Plus } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PermissionPromptBar, SessionCanvas, SessionChat, DeleteSessionDialog } from "@/components/sessions";
 import { Button } from "@/components/ui/button";
 import { useProjectStore } from "@/features/project/projectStore";
@@ -37,10 +37,18 @@ export function SessionWorkspace() {
   const isCompacting = useConversationStore((state) => state.isCompacting);
   const initializePermissions = usePermissionStore((state) => state.initialize);
   const [isCreating, setIsCreating] = useState(false);
-  const [isChatSending, setIsChatSending] = useState(false);
+  const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set());
+  const [queuedCounts, setQueuedCounts] = useState<Map<string, number>>(() => new Map());
   const [error, setError] = useState<string | null>(null);
   const [chatSessionId, setChatSessionId] = useState<string | null>(null);
   const [sessionPendingDelete, setSessionPendingDelete] = useState<string | null>(null);
+  const sendQueuesRef = useRef(new Map<string, Array<{ content: string; mode: "plan" | "build" }>>());
+  const processingSessionsRef = useRef(new Set<string>());
+  const chatSessionIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    chatSessionIdRef.current = chatSessionId;
+  }, [chatSessionId]);
 
   useEffect(() => {
     initialize().catch((initError) => {
@@ -173,30 +181,88 @@ export function SessionWorkspace() {
     });
   }, [addSessionToGroup, createGroup, groups, sessions]);
 
-  const sendChatMessage = useCallback(async (content: string, mode: "plan" | "build") => {
-    if (!chatSessionId || isChatSending) return;
+  const setSessionRunning = useCallback((sessionId: string, running: boolean) => {
+    setRunningSessionIds((current) => {
+      const next = new Set(current);
+      if (running) {
+        next.add(sessionId);
+      } else {
+        next.delete(sessionId);
+      }
+      return next;
+    });
+  }, []);
 
-    setIsChatSending(true);
-    setError(null);
+  const setSessionQueuedCount = useCallback((sessionId: string, count: number) => {
+    setQueuedCounts((current) => {
+      const next = new Map(current);
+      if (count > 0) {
+        next.set(sessionId, count);
+      } else {
+        next.delete(sessionId);
+      }
+      return next;
+    });
+  }, []);
+
+  const drainSendQueue = useCallback(async (sessionId: string) => {
+    if (processingSessionsRef.current.has(sessionId)) return;
+    processingSessionsRef.current.add(sessionId);
+    setSessionRunning(sessionId, true);
 
     try {
-      beginStreamingMessage(chatSessionId, content);
-      await invoke<string>("send_message", {
-        sessionId: chatSessionId,
-        message: content,
-        mode,
-      });
-      await loadUiConversation(chatSessionId);
-    } catch (chatError) {
-      const message = formatError(chatError);
-      failStreamingMessage(chatSessionId, message);
-      setError(message);
-      console.error("Failed to send chat message:", chatError);
+      while (true) {
+        const queue = sendQueuesRef.current.get(sessionId) ?? [];
+        const next = queue.shift();
+        if (queue.length === 0) {
+          sendQueuesRef.current.delete(sessionId);
+        } else {
+          sendQueuesRef.current.set(sessionId, queue);
+        }
+        setSessionQueuedCount(sessionId, queue.length);
+        if (!next) break;
+
+        setError(null);
+        try {
+          const isVisibleSession = chatSessionIdRef.current === sessionId;
+          if (isVisibleSession) {
+            beginStreamingMessage(sessionId, next.content);
+          }
+          await invoke<string>("send_message", {
+            sessionId,
+            message: next.content,
+            mode: next.mode,
+          });
+          if (chatSessionIdRef.current === sessionId) {
+            await loadUiConversation(sessionId);
+          }
+        } catch (chatError) {
+          const message = formatError(chatError);
+          if (chatSessionIdRef.current === sessionId) {
+            failStreamingMessage(sessionId, message);
+          }
+          setError(message);
+          console.error("Failed to send chat message:", chatError);
+        } finally {
+          if (chatSessionIdRef.current === sessionId) {
+            finishStreamingMessage(sessionId);
+          }
+        }
+      }
     } finally {
-      finishStreamingMessage(chatSessionId);
-      setIsChatSending(false);
+      processingSessionsRef.current.delete(sessionId);
+      setSessionRunning(sessionId, false);
     }
-  }, [beginStreamingMessage, chatSessionId, failStreamingMessage, finishStreamingMessage, isChatSending, loadUiConversation]);
+  }, [beginStreamingMessage, failStreamingMessage, finishStreamingMessage, loadUiConversation, setSessionQueuedCount, setSessionRunning]);
+
+  const sendChatMessage = useCallback((content: string, mode: "plan" | "build") => {
+    if (!chatSessionId) return;
+    const queue = sendQueuesRef.current.get(chatSessionId) ?? [];
+    queue.push({ content, mode });
+    sendQueuesRef.current.set(chatSessionId, queue);
+    setSessionQueuedCount(chatSessionId, queue.length);
+    void drainSendQueue(chatSessionId);
+  }, [chatSessionId, drainSendQueue, setSessionQueuedCount]);
 
   const closeChat = useCallback(() => {
     setChatSessionId(null);
@@ -204,16 +270,18 @@ export function SessionWorkspace() {
   }, [clearConversation]);
 
   const compactChat = useCallback(async () => {
-    if (!chatSessionId || isChatSending || isCompacting) return;
+    if (!chatSessionId || runningSessionIds.has(chatSessionId) || isCompacting) return;
     try {
       await compactNow(chatSessionId);
     } catch (compactError) {
       setError(formatError(compactError));
       console.error("Failed to compact conversation:", compactError);
     }
-  }, [chatSessionId, compactNow, isChatSending, isCompacting]);
+  }, [chatSessionId, compactNow, runningSessionIds, isCompacting]);
 
   const chatSession = chatSessionId ? sessions.get(chatSessionId) ?? null : null;
+  const isChatSending = chatSessionId ? runningSessionIds.has(chatSessionId) : false;
+  const queuedMessageCount = chatSessionId ? queuedCounts.get(chatSessionId) ?? 0 : 0;
   const chatMessages = activeConversation?.session_id === chatSessionId
     ? activeConversation.messages
     : [];
@@ -236,13 +304,16 @@ export function SessionWorkspace() {
         setChatSessionId(null);
         clearConversation();
       }
+      sendQueuesRef.current.delete(id);
+      setSessionQueuedCount(id, 0);
+      setSessionRunning(id, false);
       setActiveSession("");
       await deleteSession(id);
       setSessionPendingDelete(null);
     } catch (deleteError) {
       throw deleteError;
     }
-  }, [chatSessionId, clearConversation, deleteSession, setActiveSession]);
+  }, [chatSessionId, clearConversation, deleteSession, setActiveSession, setSessionQueuedCount, setSessionRunning]);
 
   return (
     <section className="flex h-screen min-w-0 flex-1 flex-col bg-black">
@@ -276,6 +347,7 @@ export function SessionWorkspace() {
           session={chatSession}
           messages={chatMessages}
           isSending={isChatSending}
+          queuedMessageCount={queuedMessageCount}
           isCompacting={isCompacting}
           streamingMessageId={streamingMessageId}
           onSendMessage={sendChatMessage}

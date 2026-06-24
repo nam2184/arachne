@@ -709,22 +709,14 @@ fn log_http_request_body(
 ) {
     let body =
         serde_json::to_string_pretty(body).unwrap_or_else(|_| "<unserializable>".to_string());
-    const MAX_LOG_BYTES: usize = 64 * 1024;
-    let body_truncated = body.len() > MAX_LOG_BYTES;
-    let body_display = if body_truncated {
-        body.chars().take(MAX_LOG_BYTES).collect::<String>()
-    } else {
-        body
-    };
 
     tracing::info!(
         provider,
         url,
         model,
         body_bytes,
-        body_truncated,
-        body = %body_display,
-        "llm http request body prepared"
+        body = %body,
+        "llm http request body prepared (full)"
     );
 }
 

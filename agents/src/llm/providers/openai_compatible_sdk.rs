@@ -256,10 +256,10 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
                 // the AISDK docs.
                 builder = builder.with_tool(build_sdk_tool(&tool.name, dispatcher.clone())?);
             }
-            // Continue the loop while the model keeps emitting
-            // tool calls. The SDK runs each executor and feeds
-            // the result back as `Message::Tool` automatically.
-            builder = builder.stop_when(|options| options.tool_calls().is_some());
+            // Do not stop on tool calls. The SDK owns the internal
+            // tool loop: it executes each tool, appends a `Message::Tool`,
+            // and continues provider requests until the model returns a
+            // normal final response.
         }
 
         let mut sdk_request = builder.build();
@@ -480,6 +480,16 @@ fn sdk_messages(request: &LlmRequest) -> Vec<Message> {
 fn sdk_assistant_messages(content: &[ContentPart]) -> Vec<Message> {
     let mut messages = Vec::new();
     let mut text_parts = Vec::new();
+    let mut pending_tool_calls: Vec<ToolCallInfo> = Vec::new();
+
+    let flush_pending_tool_calls = |messages: &mut Vec<Message>, pending: &mut Vec<ToolCallInfo>| {
+        messages.extend(pending.drain(..).map(|tool_call| {
+            Message::Assistant(AssistantMessage::new(
+                LanguageModelResponseContentType::ToolCall(tool_call),
+                None,
+            ))
+        }));
+    };
 
     for part in content {
         match part {
@@ -487,12 +497,18 @@ fn sdk_assistant_messages(content: &[ContentPart]) -> Vec<Message> {
                 let mut tool_call = ToolCallInfo::new(name.clone());
                 tool_call.id(id.clone());
                 tool_call.input(input.clone());
-                messages.push(Message::Assistant(AssistantMessage::new(
-                    LanguageModelResponseContentType::ToolCall(tool_call),
-                    None,
-                )));
+                pending_tool_calls.push(tool_call);
             }
             ContentPart::ToolResult { id, name, result } => {
+                if let Some(index) = pending_tool_calls.iter().position(|call| call.tool.id == *id) {
+                    let tool_call = pending_tool_calls.remove(index);
+                    messages.push(Message::Assistant(AssistantMessage::new(
+                        LanguageModelResponseContentType::ToolCall(tool_call),
+                        None,
+                    )));
+                } else {
+                    flush_pending_tool_calls(&mut messages, &mut pending_tool_calls);
+                }
                 messages.push(Message::Tool(sdk_tool_result_info(id, name, result)));
             }
             ContentPart::Reasoning { .. } => {}
@@ -505,6 +521,8 @@ fn sdk_assistant_messages(content: &[ContentPart]) -> Vec<Message> {
             }
         }
     }
+
+    flush_pending_tool_calls(&mut messages, &mut pending_tool_calls);
 
     if !text_parts.is_empty() {
         messages.insert(0, Message::Assistant(text_parts.join("\n").into()));
@@ -528,8 +546,7 @@ fn sdk_tool_result_messages(content: &[ContentPart]) -> Vec<Message> {
 fn sdk_tool_result_info(id: &str, name: &str, result: &serde_json::Value) -> ToolResultInfo {
     let mut tool_result = ToolResultInfo::new(name.to_string());
     tool_result.id(id.to_string());
-    let result_text = serde_json::to_string(result).unwrap_or_else(|_| "null".to_string());
-    tool_result.output(serde_json::Value::String(result_text));
+    tool_result.output(result.clone());
     tool_result
 }
 
@@ -588,7 +605,10 @@ fn sdk_tool_result_event(result: &ToolResultInfo) -> Option<LlmEvent> {
     let id = result.tool.id.clone();
     let value = match &result.output {
         Ok(value) => match value {
-            serde_json::Value::String(text) => ToolResultValue::Text { value: text.clone() },
+            serde_json::Value::String(text) => match serde_json::from_str::<serde_json::Value>(text) {
+                Ok(parsed) => ToolResultValue::Json { value: parsed },
+                Err(_) => ToolResultValue::Text { value: text.clone() },
+            },
             other => ToolResultValue::Json { value: other.clone() },
         },
         Err(message) => ToolResultValue::Error {
@@ -735,7 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn sdk_tool_result_message_stringifies_result_for_wire() {
+    fn sdk_tool_result_message_preserves_json_value_for_wire() {
         let content = vec![ContentPart::tool_result(
             "call_1",
             "read",
@@ -749,10 +769,7 @@ mod tests {
             panic!("expected Message::Tool, got {:?}", messages[0]);
         };
         let output = tool_result.output.as_ref().expect("output should be Ok");
-        let output_string = output
-            .as_str()
-            .expect("output should be Value::String, not nested Object");
-        assert_eq!(output_string, "{\"text\":\"hello world\"}");
+        assert_eq!(output, &serde_json::json!({"text": "hello world"}));
     }
 
     #[test]
@@ -779,10 +796,51 @@ mod tests {
         assert_eq!(tool_result.tool.id, "call_1");
         assert_eq!(tool_result.tool.name, "glob");
         let output = tool_result.output.as_ref().expect("tool output");
-        assert_eq!(
-            output.as_str().unwrap_or_default(),
-            "{\"error\":\"user rejected request abc\"}"
-        );
+        assert_eq!(output, &serde_json::json!({"error": "user rejected request abc"}));
+    }
+
+    #[test]
+    fn sdk_assistant_messages_pair_each_tool_call_before_its_result() {
+        let content = vec![
+            ContentPart::tool_call("call_1", "read", serde_json::json!({"path": "README.md"})),
+            ContentPart::tool_call("call_2", "glob", serde_json::json!({"path": "/tmp"})),
+            ContentPart::tool_result("call_1", "read", serde_json::json!({"text": "readme"})),
+            ContentPart::tool_result("call_2", "glob", serde_json::json!({"text": "README.md"})),
+        ];
+
+        let messages = sdk_assistant_messages(&content);
+        assert_eq!(messages.len(), 4);
+        assert_tool_call_message(&messages[0], "call_1");
+        assert_tool_result_message(&messages[1], "call_1");
+        assert_tool_call_message(&messages[2], "call_2");
+        assert_tool_result_message(&messages[3], "call_2");
+    }
+
+    #[test]
+    fn sdk_wire_shape_log_uses_actual_tool_role_messages() {
+        let request = LlmRequest::new("gpt-4o-mini", "openai")
+            .with_message(LlmMessage::user("inspect"))
+            .with_message(LlmMessage {
+                role: "assistant".to_string(),
+                content: vec![
+                    ContentPart::tool_call("call_1", "glob", serde_json::json!({"path": "/tmp"})),
+                    ContentPart::tool_result(
+                        "call_1",
+                        "glob",
+                        serde_json::json!({"text": "Cargo.toml"}),
+                    ),
+                ],
+            });
+        let sdk_messages = sdk_messages(&request);
+        let body = build_sdk_wire_shape(&request, "system", &sdk_messages);
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_1");
+        assert_eq!(messages[2]["name"], "glob");
     }
 
     #[test]
@@ -810,12 +868,10 @@ mod tests {
             panic!("expected ToolResult event");
         };
         match result {
-            ToolResultValue::Text { value } => {
-                assert!(!value.contains("<system-reminder>"));
-                assert!(!value.contains("</system-reminder>"));
-                assert_eq!(value, "{\"text\":\"hello\"}");
+            ToolResultValue::Json { value } => {
+                assert_eq!(value, serde_json::json!({"text": "hello"}));
             }
-            other => panic!("expected Text variant, got {other:?}"),
+            other => panic!("expected Json variant, got {other:?}"),
         }
 
         let err = ToolResultInfo {
@@ -886,15 +942,28 @@ mod tests {
         );
         assert_eq!(err_display, "Tool error: permission denied");
     }
+
+    fn assert_tool_call_message(message: &Message, expected_id: &str) {
+        let Message::Assistant(message) = message else {
+            panic!("expected assistant tool-call message, got: {message:?}");
+        };
+        let LanguageModelResponseContentType::ToolCall(call) = &message.content else {
+            panic!("expected tool-call content, got: {:?}", message.content);
+        };
+        assert_eq!(call.tool.id, expected_id);
+    }
+
+    fn assert_tool_result_message(message: &Message, expected_id: &str) {
+        let Message::Tool(result) = message else {
+            panic!("expected tool result message, got: {message:?}");
+        };
+        assert_eq!(result.tool.id, expected_id);
+    }
 }
 
-/// Debug-level dump of the SDK-bound request structure and the
-/// last user-role input text. Mirrors the HTTP-side
-/// `log_request_structure_and_input` so the developer gets the
-/// same inspection surface on both backends. The full payload
-/// lives on the AI SDK side and isn't serialized here; the
-/// role/id summary is enough to confirm ordering, and the
-/// truncated user input shows what the model actually sees.
+/// Dump of the SDK-bound request structure and the last user-role
+/// input text. Mirrors the HTTP-side `log_request_structure_and_input`
+/// so the developer gets the same inspection surface on both backends.
 ///
 /// We read the user/tool content straight off our own
 /// `LlmRequest` instead of the SDK's `Message` enum so the log
@@ -908,6 +977,8 @@ fn log_sdk_request_structure(
     sdk_messages: &[Message],
 ) {
     let mut role_counts: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    let mut sdk_role_counts: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
     let mut tool_call_ids: Vec<String> = Vec::new();
     let mut last_user_input: Option<String> = None;
@@ -923,6 +994,17 @@ fn log_sdk_request_structure(
                 last_tool_result = Some(serde_json::to_string(result).unwrap_or_default());
             }
         }
+    }
+
+    for message in sdk_messages {
+        let role = match message {
+            Message::System(_) => "system",
+            Message::User(_) => "user",
+            Message::Assistant(_) => "assistant",
+            Message::Tool(_) => "tool",
+            Message::Developer(_) => "developer",
+        };
+        *sdk_role_counts.entry(role).or_insert(0) += 1;
     }
 
     for message in request.messages.iter().rev() {
@@ -945,6 +1027,7 @@ fn log_sdk_request_structure(
         provider = %provider,
         model = %model,
         role_counts = ?role_counts,
+        sdk_role_counts = ?sdk_role_counts,
         tool_call_ids = ?tool_call_ids,
         system_chars = system.chars().count(),
         message_count = sdk_messages.len(),
@@ -955,138 +1038,61 @@ fn log_sdk_request_structure(
         "aisdk request structure + truncated input"
     );
 
-    // Opt-in full wire-shape dump. Set ARACHNE_DUMP_LLM=1 in the
-    // environment (or `arachne_agents::llm=trace` filter) to log
-    // the exact JSON body we hand to the AI SDK builder, which
-    // is what the OpenAI-compatible provider serializes on the
-    // wire. Lets you diff against what the provider expects
-    // when a 4xx lands.
-    if std::env::var_os("ARACHNE_DUMP_LLM").is_some() {
-        let body = build_sdk_wire_shape(request, system);
-        let body_pretty = serde_json::to_string_pretty(&body)
-            .unwrap_or_else(|_| "<unserializable>".to_string());
-        const MAX_BODY_BYTES: usize = 256 * 1024;
-        let body_truncated = body_pretty.len() > MAX_BODY_BYTES;
-        let body_display: String = if body_truncated {
-            body_pretty.chars().take(MAX_BODY_BYTES).collect()
-        } else {
-            body_pretty
-        };
-        tracing::warn!(
-            provider = %provider,
-            model = %model,
-            body_bytes = body_display.len(),
-            body_truncated,
-            env = "ARACHNE_DUMP_LLM=1",
-            body = %body_display,
-            "aisdk wire-shape body (opt-in dump; set ARACHNE_DUMP_LLM=0 to silence)"
-        );
-    }
+    let body = build_sdk_wire_shape(request, system, sdk_messages);
+    let body_pretty =
+        serde_json::to_string_pretty(&body).unwrap_or_else(|_| "<unserializable>".to_string());
+    tracing::info!(
+        provider = %provider,
+        model = %model,
+        body_bytes = body_pretty.len(),
+        body = %body_pretty,
+        "aisdk wire-shape request body prepared (full)"
+    );
 }
 
 /// Build the exact JSON shape the AI SDK's OpenAI-compatible
 /// provider serializes on the wire for chat-completions. We
 /// can't read the SDK's internal `options` struct, so we
-/// reconstruct the body from `LlmRequest` plus the system
-/// prompt and tool definitions the SDK builder consumed. The
+/// reconstruct the body from the same SDK `Message` values,
+/// system prompt, and tool definitions the SDK builder consumed. The
 /// shape matches `OpenAIChatCompletionsOptions` in
 /// `aisdk-0.5.2/src/providers/openai_chat_completions.rs`.
-fn build_sdk_wire_shape(request: &LlmRequest, system: &str) -> serde_json::Value {
+fn build_sdk_wire_shape(
+    request: &LlmRequest,
+    system: &str,
+    sdk_messages: &[Message],
+) -> serde_json::Value {
     let mut out_messages: Vec<serde_json::Value> = Vec::new();
-    for message in &request.messages {
-        match message.role.as_str() {
-            "tool" => {
-                let mut entry = serde_json::Map::new();
-                entry.insert(
-                    "role".to_string(),
-                    serde_json::Value::String("tool".to_string()),
-                );
-                if let Some(ContentPart::ToolResult { id, name, result }) = message
-                    .content
-                    .iter()
-                    .find(|part| matches!(part, ContentPart::ToolResult { .. }))
-                {
-                    entry.insert(
-                        "tool_call_id".to_string(),
-                        serde_json::Value::String(id.clone()),
-                    );
-                    entry.insert(
-                        "name".to_string(),
-                        serde_json::Value::String(name.clone()),
-                    );
-                    entry.insert(
-                        "content".to_string(),
-                        serde_json::Value::String(
-                            serde_json::to_string(result)
-                                .unwrap_or_else(|_| "null".to_string()),
-                        ),
-                    );
-                } else {
-                    entry.insert(
-                        "content".to_string(),
-                        serde_json::Value::String(
-                            message
-                                .content
-                                .iter()
-                                .filter_map(ContentPart::as_prompt_text)
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        ),
-                    );
-                }
-                out_messages.push(serde_json::Value::Object(entry));
+    for message in sdk_messages {
+        match message {
+            Message::System(message) => out_messages.push(serde_json::json!({
+                "role": "system",
+                "content": &message.content,
+            })),
+            Message::User(message) => out_messages.push(serde_json::json!({
+                "role": "user",
+                "content": &message.content,
+            })),
+            Message::Assistant(message) => {
+                out_messages.push(sdk_assistant_wire_message(message));
             }
-            "assistant" => {
-                let mut text_parts: Vec<String> = Vec::new();
-                let mut tool_calls: Vec<serde_json::Value> = Vec::new();
-                for part in &message.content {
-                    match part {
-                        ContentPart::ToolCall { id, name, input } => {
-                            tool_calls.push(serde_json::json!({
-                                "id": id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": serde_json::to_string(input)
-                                        .unwrap_or_else(|_| "null".to_string()),
-                                },
-                            }));
-                        }
-                        ContentPart::Text { text } => {
-                            if !text.is_empty() {
-                                text_parts.push(text.clone());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                let mut entry = serde_json::Map::new();
-                entry.insert(
-                    "role".to_string(),
-                    serde_json::Value::String("assistant".to_string()),
-                );
-                let text = text_parts.join("\n");
-                let content_value = if text.is_empty() {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::Value::String(text)
-                };
-                entry.insert("content".to_string(), content_value);
-                if !tool_calls.is_empty() {
-                    entry.insert(
-                        "tool_calls".to_string(),
-                        serde_json::Value::Array(tool_calls),
-                    );
-                }
-                out_messages.push(serde_json::Value::Object(entry));
-            }
-            _ => {
-                let text = prompt_text(&message.content);
+            Message::Tool(tool_result) => {
+                let content = tool_result
+                    .output
+                    .clone()
+                    .unwrap_or_else(|error| serde_json::Value::String(error.to_string()))
+                    .to_string();
                 out_messages.push(serde_json::json!({
-                    "role": message.role,
-                    "content": text,
+                    "role": "tool",
+                    "content": content,
+                    "name": &tool_result.tool.name,
+                    "tool_call_id": &tool_result.tool.id,
                 }));
             }
+            Message::Developer(content) => out_messages.push(serde_json::json!({
+                "role": "developer",
+                "content": content,
+            })),
         }
     }
 
@@ -1136,6 +1142,35 @@ fn build_sdk_wire_shape(request: &LlmRequest, system: &str) -> serde_json::Value
     }
 
     serde_json::Value::Object(body)
+}
+
+fn sdk_assistant_wire_message(message: &AssistantMessage) -> serde_json::Value {
+    match &message.content {
+        LanguageModelResponseContentType::Text(text) => serde_json::json!({
+            "role": "assistant",
+            "content": text,
+        }),
+        LanguageModelResponseContentType::ToolCall(tool_info) => serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": &tool_info.tool.id,
+                "type": "function",
+                "function": {
+                    "name": &tool_info.tool.name,
+                    "arguments": tool_info.input.to_string(),
+                },
+            }],
+        }),
+        LanguageModelResponseContentType::Reasoning { content, .. } => serde_json::json!({
+            "role": "assistant",
+            "content": format!("[Reasoning]: {content}"),
+        }),
+        LanguageModelResponseContentType::NotSupported(_) => serde_json::json!({
+            "role": "assistant",
+            "content": null,
+        }),
+    }
 }
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {

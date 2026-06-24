@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -29,20 +30,72 @@ pub struct AppState {
 
 fn setup_logging() {
     let default_filter = default_log_filter();
+    let filter = tracing_subscriber::EnvFilter::new(
+        std::env::var("RUST_LOG").unwrap_or_else(|_| default_filter.to_string()),
+    );
+    let log_path = log_file_path();
 
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| default_filter.to_string()),
-        ))
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(std::sync::Mutex::new(file)),
+                )
+                .init();
+            tracing::info!(log_file = %log_path.display(), "logging initialized");
+        }
+        Err(error) => {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(std::io::stderr),
+                )
+                .init();
+            tracing::warn!(
+                log_file = %log_path.display(),
+                error = %error,
+                "failed to open log file; falling back to stderr"
+            );
+        }
+    }
+}
+
+fn log_file_path() -> PathBuf {
+    std::env::var_os("ARACHNE_LOG_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_app_data_dir().join("logs").join("arachne.log"))
+}
+
+fn default_app_data_dir() -> PathBuf {
+    directories::ProjectDirs::from("ai", "arachne", "arachne")
+        .map(|d| d.data_dir().to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap().join("data"))
+}
+
+fn default_app_config_dir() -> PathBuf {
+    directories::ProjectDirs::from("ai", "arachne", "arachne")
+        .map(|d| d.config_dir().to_path_buf())
+        .unwrap_or_else(|| std::env::current_dir().unwrap().join("config"))
 }
 
 fn default_log_filter() -> &'static str {
     if cfg!(feature = "dev-logs") || cfg!(debug_assertions) {
-        "arachne=debug,tauri=info"
+        "arachne=debug,arachne_agents=debug,tauri=info"
     } else if cfg!(feature = "prod-logs") {
-        "arachne=info"
+        "arachne=info,arachne_agents=info"
     } else {
         "warn"
     }
@@ -56,15 +109,8 @@ pub fn run() {
     let stack_detector = StackDetector::new();
     let memory_service = MemoryService::new();
 
-    let app_dirs = directories::ProjectDirs::from("ai", "arachne", "arachne");
-    let app_data_dir = app_dirs
-        .as_ref()
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| std::env::current_dir().unwrap().join("data"));
-    let app_config_dir = app_dirs
-        .as_ref()
-        .map(|d| d.config_dir().to_path_buf())
-        .unwrap_or_else(|| std::env::current_dir().unwrap().join("config"));
+    let app_data_dir = default_app_data_dir();
+    let app_config_dir = default_app_config_dir();
 
     let db_path = app_data_dir.join("arachne.sqlite");
     let project_service = ProjectService::new(db_path.clone(), Arc::clone(&stack_detector));

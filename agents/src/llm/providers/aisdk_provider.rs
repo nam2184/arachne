@@ -548,22 +548,14 @@ fn log_sdk_request_body(
     let body = sdk_request_debug_body(provider_name, base_url, request, resolved_system);
     let body =
         serde_json::to_string_pretty(&body).unwrap_or_else(|_| "<unserializable>".to_string());
-    const MAX_LOG_BYTES: usize = 64 * 1024;
-    let body_truncated = body.len() > MAX_LOG_BYTES;
-    let body_display = if body_truncated {
-        body.chars().take(MAX_LOG_BYTES).collect::<String>()
-    } else {
-        body
-    };
 
     tracing::info!(
         provider = %provider_name,
         model = %request.model,
         base_url = ?base_url,
-        body_bytes = body_display.len(),
-        body_truncated,
-        body = %body_display,
-        "aisdk request body prepared"
+        body_bytes = body.len(),
+        body = %body,
+        "aisdk request body prepared (full)"
     );
 }
 

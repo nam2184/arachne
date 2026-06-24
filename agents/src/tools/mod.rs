@@ -97,16 +97,25 @@ async fn resolve_sandbox_path(
     let process_cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
-    // Fast path: try the policy without an ask.
-    if let Ok(resolved) = ctx.sandbox.lock().resolve(requested) {
+    // Fast path: try the policy without an ask. Keep the guard scoped
+    // outside the logging block; otherwise the `if let` temporary can
+    // hold the mutex while the log fields try to lock it again.
+    let fast_result = {
+        let sandbox = ctx.sandbox.lock();
+        let project_root = sandbox.project_root.clone();
+        sandbox
+            .resolve(requested)
+            .map(|resolved| (resolved, project_root))
+    };
+    if let Ok((resolved, project_root)) = fast_result {
         tracing::info!(
             tool,
             requested = %requested,
-            project_root = %ctx.sandbox.lock().project_root.display(),
+            project_root = %project_root.display(),
             resolved = %resolved.display(),
             process_cwd = %process_cwd,
             inside_project_root = project_root_contains(
-                &ctx.sandbox.lock().project_root,
+                &project_root,
                 &resolved
             ),
             sandbox_allowed = true,
@@ -671,7 +680,24 @@ async fn glob_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult {
             Err(e) => return failure("glob", e),
         }
     };
-    glob::run_with_root(call, &target)
+    tracing::debug!(
+        requested_path = %path,
+        target = %target.display(),
+        arguments = ?call.arguments,
+        "glob sandboxed before run_with_root"
+    );
+    let started = std::time::Instant::now();
+    let result = glob::run_with_root(call, &target);
+    tracing::debug!(
+        requested_path = %path,
+        target = %target.display(),
+        elapsed_ms = started.elapsed().as_millis(),
+        success = result.success,
+        output = %result.output,
+        error = %result.error.as_deref().unwrap_or(""),
+        "glob sandboxed after run_with_root"
+    );
+    result
 }
 
 async fn grep_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult {
@@ -684,7 +710,24 @@ async fn grep_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult {
             Err(e) => return failure("grep", e),
         }
     };
-    grep::run_with_root(call, &target)
+    tracing::debug!(
+        requested_path = %path,
+        target = %target.display(),
+        arguments = ?call.arguments,
+        "grep sandboxed before run_with_root"
+    );
+    let started = std::time::Instant::now();
+    let result = grep::run_with_root(call, &target);
+    tracing::debug!(
+        requested_path = %path,
+        target = %target.display(),
+        elapsed_ms = started.elapsed().as_millis(),
+        success = result.success,
+        output = %result.output,
+        error = %result.error.as_deref().unwrap_or(""),
+        "grep sandboxed after run_with_root"
+    );
+    result
 }
 
 fn shell_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult {

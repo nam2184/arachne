@@ -180,7 +180,28 @@ pub fn build_sdk_tool(name: &str, dispatcher: Arc<ToolDispatcherFn>) -> Result<T
         // back to the model as a tool error. We surface the
         // dispatcher's raw `Result<String, String>` so the model
         // can self-correct.
-        (dispatcher.as_ref())(&name_owned, input)
+        tracing::info!(tool = %name_owned, input = %input, "sdk tool execution started");
+        let started = std::time::Instant::now();
+        let result = (dispatcher.as_ref())(&name_owned, input);
+        match &result {
+            Ok(output) => tracing::debug!(
+                tool = %name_owned,
+                output = %output,
+                "sdk tool execution output"
+            ),
+            Err(error) => tracing::debug!(
+                tool = %name_owned,
+                error = %error,
+                "sdk tool execution error"
+            ),
+        }
+        tracing::info!(
+            tool = %name_owned,
+            elapsed_ms = started.elapsed().as_millis(),
+            success = result.is_ok(),
+            "sdk tool execution finished"
+        );
+        result
     }));
 
     let tool = match name {

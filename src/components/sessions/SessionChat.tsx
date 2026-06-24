@@ -25,6 +25,7 @@ interface SessionChatProps {
   session: AgentSession;
   messages: SessionChatMessage[];
   isSending: boolean;
+  queuedMessageCount: number;
   isCompacting: boolean;
   streamingMessageId: string | null;
   onSendMessage: (content: string, mode: ChatMode) => void | Promise<void>;
@@ -69,6 +70,7 @@ export function SessionChat({
   session,
   messages,
   isSending,
+  queuedMessageCount,
   isCompacting,
   streamingMessageId,
   onSendMessage,
@@ -179,7 +181,7 @@ useEffect(() => {
 
   const handleSend = async () => {
     const content = input.trim();
-    if (!content || isSending) return;
+    if (!content) return;
 
     setInput("");
     await onSendMessage(content, mode);
@@ -437,10 +439,10 @@ useEffect(() => {
                   >
                     <div
                       className={cn(
-                        "max-w-[80%] rounded-none px-4 py-2 text-sm",
+                        "min-w-0 max-w-[80%] rounded-none px-4 py-2 text-sm",
                         message.role === "user"
                           ? "whitespace-pre-wrap break-words bg-white text-black"
-                          : "border border-[#2a2a2a] bg-[#111111] text-[#f5f5f5]",
+                          : "overflow-hidden border border-[#2a2a2a] bg-[#111111] text-[#f5f5f5]",
                       )}
                     >
                       {isAssistant && reasoning && (
@@ -488,14 +490,20 @@ useEffect(() => {
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder="Ask about the codebase..."
-rows={1}
+              rows={1}
               className="box-border min-h-[44px] min-w-0 max-h-32 flex-1 resize-none whitespace-pre-wrap break-words break-all overflow-y-auto rounded-none border border-[#1f1f1f] bg-black px-3 py-2.5 font-sans text-sm leading-[1.5] text-white shadow-none transition-colors placeholder:text-[#737373] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white disabled:cursor-not-allowed disabled:opacity-50"
-              disabled={isSending}
             />
-            <Button onClick={handleSend} disabled={isSending || !input.trim()}>
-              Send
+            <Button onClick={handleSend} disabled={!input.trim()}>
+              {isSending ? "Queue" : "Send"}
             </Button>
           </div>
+          {(isSending || queuedMessageCount > 0) && (
+            <p className="mt-2 text-xs text-[#737373]">
+              {queuedMessageCount > 0
+                ? `${queuedMessageCount} message${queuedMessageCount === 1 ? "" : "s"} queued`
+                : "Running"}
+            </p>
+          )}
         </div>
       </div>
     </div>
@@ -516,7 +524,7 @@ function AssistantMessageParts({ parts, fallbackContent }: { parts: ChatMessageP
   }
 
   return (
-    <div className="space-y-2">
+    <div className="min-w-0 max-w-full space-y-2 overflow-hidden">
       {visibleParts.map((part, index) => {
         if (part.type === "text") {
           return part.text ? (
@@ -550,7 +558,7 @@ function ToolCallBlock({
   const Icon = details.icon;
 
   return (
-    <div className="overflow-hidden rounded-none border border-[#2a2a2a] bg-black font-mono text-xs">
+    <div className="min-w-0 max-w-full overflow-hidden rounded-none border border-[#2a2a2a] bg-black font-mono text-xs">
       <div className="flex items-center justify-between border-b border-[#1f1f1f] bg-[#080808] px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <Icon className="h-3.5 w-3.5 shrink-0 text-[#8a8a8a]" />
@@ -567,9 +575,9 @@ function ToolCallBlock({
         </span>
       </div>
       <div className="space-y-2 px-3 py-2">
-        <pre className="whitespace-pre-wrap break-words text-[#d4d4d4]">{details.command}</pre>
+        <pre className="max-w-full whitespace-pre-wrap break-all text-[#d4d4d4]">{details.command}</pre>
         {resultSummary?.text && (
-          <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words border-t border-[#1f1f1f] pt-2 text-[#8a8a8a]">
+          <pre className="max-h-40 max-w-full overflow-auto whitespace-pre-wrap break-all border-t border-[#1f1f1f] pt-2 text-[#8a8a8a]">
             {resultSummary.text}
           </pre>
         )}
