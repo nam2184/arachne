@@ -5,9 +5,9 @@
 Arachne is an open-source AI coding agent that lets you spin up multiple LLM
 sessions, lay them out on a visual canvas as a graph, and have them share
 context with each other in real time. Sessions can `task` out subtasks to
-children, `ask_peer` a sibling session for a second opinion, and `interject`
-snippets of local context (file contents, search hits, shell output) directly
-into the active conversation. Built with Rust and Tauri.
+children and `interject` snippets of local context (file contents, search hits,
+shell output) directly into the active conversation. Built with Rust and
+Tauri.
 
 An arachnid doesn't think in a straight line — it spins a web. Each strand is
 its own thread of reasoning, anchored at a point but connected to every other
@@ -19,8 +19,12 @@ strand. Arachne applies the same idea to coding sessions:
   group. `parent_session_id` on every strand records the genealogy.
 - **The runner is the spinner** — the central loop that pulls LLM events,
   weaves them into the conversation file, and dispatches tool calls.
-- **Sub-agents are forked threads** — a `task` spawns a child session,
-  `ask_peer` queries a sibling; both return into the parent's web.
+- **Sub-agents are forked threads** — a `task` spawns a child session whose
+  results feed back into the parent's conversation.
+- **Peers are sibling strands** — connected sessions can target each other
+  directly by passing the peer's `peer_session_id` to read/glob/grep/plan
+  tools. There is no `ask_peer` tool; reach a sibling by naming it in the
+  tool call.
 
 
 ## Features
@@ -29,7 +33,8 @@ strand. Arachne applies the same idea to coding sessions:
   coding sessions with drag-and-drop nodes and edges
 - **Peer-to-peer session context** — A `parent_session_id` link records the
   genealogy; child sessions feed results back into the parent's
-  conversation
+  conversation. Connected sibling sessions can be addressed by passing
+  `peer_session_id` to read/glob/grep/plan tools
 - **Snippet interjection** — Pull a file range, a search hit, or shell
   output into the active turn without rewriting the prompt
 - **Real-time streaming** — Live message updates during agent execution,
@@ -44,39 +49,10 @@ strand. Arachne applies the same idea to coding sessions:
 
 ## Providers
 
-Arachne supports multiple LLM providers through a protocol-based
-architecture. Each provider implements one of two API systems:
-
-### OpenAI-Compatible Chat (`Protocol::OpenAI`)
-
-Providers that expose an OpenAI Chat Completions-compatible endpoint at
-`/v1/chat/completions`. These reuse a shared streaming transport and SSE
-parsing implementation.
-
-| Provider | Base URL | Notes |
-|----------|----------|-------|
-| **OpenAI** | `https://api.openai.com/v1` | GPT-4o, GPT-4o-mini, o3, o4-mini |
-| **MiniMax Token Plan** | `https://api.minimax.io/v1` | MiniMax-M3, MiniMax-M2.7, MiniMax-M2.5 |
-
-### Anthropic Messages (`Protocol::Anthropic`)
-
-Providers that implement the Anthropic Messages API at `/v1/messages`,
-with support for streaming, tool use, and extended thinking.
-
-| Provider | Base URL | Notes |
-|----------|----------|-------|
-| **Anthropic** | `https://api.anthropic.com/v1` | Claude Sonnet, Claude Opus, Claude Haiku |
-
-### Provider Configuration
-
-Each provider is configured via `ProviderConfig` which stores:
-
-- `name` — Provider identifier (e.g. `"openai"`, `"anthropic"`, `"minimax"`)
-- `model` — Default model ID (e.g. `"gpt-4o"`, `"MiniMax-M3"`)
-- `api_key` — API key (from config or environment variable)
-- `base_url` — Optional custom endpoint override
-- `protocol` — Which API system to use (`OpenAI` or `Anthropic`)
-- `enabled` — Whether to use as default for new sessions
+Arachne ships with built-in support for OpenAI-compatible, Anthropic, and
+MiniMax Token Plan providers. Anything that exposes an
+`/v1/chat/completions` (OpenAI-compatible), Anthropic Messages, or
+MiniMax-compatible endpoint can be configured as a custom provider.
 
 Environment variable fallbacks:
 
