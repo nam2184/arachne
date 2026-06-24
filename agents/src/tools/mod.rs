@@ -93,10 +93,15 @@ async fn resolve_sandbox_path(
     requested: &str,
     ctx: &SandboxedContext,
     tool: &str,
+    call: Option<&ToolCall>,
 ) -> Result<std::path::PathBuf, String> {
     let process_cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
+    if let Some(peer_session_id) = peer_session_id_for_read_only_call(call, tool) {
+        return resolve_peer_sandbox_path(requested, ctx, tool, &peer_session_id, &process_cwd);
+    }
+
     // Fast path: try the policy without an ask. Keep the guard scoped
     // outside the logging block; otherwise the `if let` temporary can
     // hold the mutex while the log fields try to lock it again.
@@ -179,6 +184,61 @@ async fn resolve_sandbox_path(
     }
 }
 
+fn peer_session_id_for_read_only_call(call: Option<&ToolCall>, tool: &str) -> Option<String> {
+    if !supports_peer_session_id(tool) {
+        return None;
+    }
+    call.and_then(|call| {
+        let peer_session_id = string_arg(call, "peer_session_id");
+        let trimmed = peer_session_id.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn resolve_peer_sandbox_path(
+    requested: &str,
+    ctx: &SandboxedContext,
+    tool: &str,
+    peer_session_id: &str,
+    process_cwd: &str,
+) -> Result<std::path::PathBuf, String> {
+    let (peer_root, peer_policy) = ctx.peer_policy(peer_session_id)?;
+    match peer_policy.resolve(requested) {
+        Ok(canonical) => {
+            tracing::info!(
+                tool,
+                caller_session_id = %ctx.caller_session_id.as_deref().unwrap_or("<unknown>"),
+                peer_session_id = %peer_session_id,
+                peer_root = %peer_root.display(),
+                requested = %requested,
+                canonical = %canonical.display(),
+                process_cwd = %process_cwd,
+                sandbox_allowed = true,
+                "sandbox path resolution allowed via peer"
+            );
+            Ok(canonical)
+        }
+        Err(error) => {
+            tracing::warn!(
+                tool,
+                caller_session_id = %ctx.caller_session_id.as_deref().unwrap_or("<unknown>"),
+                peer_session_id = %peer_session_id,
+                peer_root = %peer_root.display(),
+                requested = %requested,
+                process_cwd = %process_cwd,
+                sandbox_allowed = false,
+                error = %error,
+                "sandbox path resolution rejected by peer containment"
+            );
+            Err(format!(
+                "path '{}' is outside peer session directory '{}'",
+                requested,
+                peer_root.display()
+            ))
+        }
+    }
+}
+
 /// Runtime context passed to every tool invocation that needs to spawn
 /// sub-sessions or write to the parent's conversation. Held behind an
 /// `Arc` so it's cheap to clone into `tokio::task::spawn`.
@@ -246,6 +306,9 @@ impl Default for ToolContext {
 
 /// Bundled context for sandboxed tool execution. Created per-session.
 /// Tools receive this and use its policies to gate their behavior.
+/// Read-only calls may also carry `peer_session_id`; when this context has
+/// caller metadata, those paths resolve against the named connected peer's
+/// directory and must remain contained there.
 ///
 /// The `sandbox` field is wrapped in `Arc<Mutex<_>>` so the policy's
 /// `external_roots` can grow at runtime — specifically, `trigger_access`
@@ -258,6 +321,8 @@ pub struct SandboxedContext {
     pub network_policy: NetworkPolicy,
     pub permissions: Arc<V2PermissionService>,
     pub doom: Arc<DoomLoopDetector>,
+    pub session_service: Option<Arc<crate::SessionService>>,
+    pub caller_session_id: Option<String>,
 }
 
 impl SandboxedContext {
@@ -269,7 +334,19 @@ impl SandboxedContext {
             network_policy: NetworkPolicy::new(),
             permissions,
             doom: Arc::new(DoomLoopDetector::default()),
+            session_service: None,
+            caller_session_id: None,
         }
+    }
+
+    pub fn with_caller_session(
+        mut self,
+        caller_session_id: impl Into<String>,
+        session_service: Arc<crate::SessionService>,
+    ) -> Self {
+        self.caller_session_id = Some(caller_session_id.into());
+        self.session_service = Some(session_service);
+        self
     }
 
     pub fn with_shell_timeout(mut self, timeout: Duration) -> Self {
@@ -285,6 +362,36 @@ impl SandboxedContext {
     /// Snapshot the project root out of the locked policy.
     pub fn project_root(&self) -> PathBuf {
         self.sandbox.lock().project_root.clone()
+    }
+
+    fn peer_policy(&self, peer_session_id: &str) -> Result<(PathBuf, SandboxPolicy), String> {
+        let session_service = self.session_service.as_ref().ok_or_else(|| {
+            "peer_session_id requires sandboxed context to be associated with a caller session"
+                .to_string()
+        })?;
+        let caller_session_id = self.caller_session_id.as_ref().ok_or_else(|| {
+            "peer_session_id requires sandboxed context to be associated with a caller session"
+                .to_string()
+        })?;
+        if peer_session_id == caller_session_id {
+            return Err(
+                "peer_session_id must refer to a different connected session; omit it for local work"
+                    .to_string(),
+            );
+        }
+
+        crate::routing::integration::validate_connected_peer(
+            caller_session_id,
+            peer_session_id,
+            session_service,
+        )?;
+
+        let peer = session_service
+            .get_session(peer_session_id)?
+            .ok_or_else(|| format!("peer session not found: {peer_session_id}"))?;
+        let policy = SandboxPolicy::new(PathBuf::from(&peer.directory));
+        let peer_root = policy.project_root.clone();
+        Ok((peer_root, policy))
     }
 }
 
@@ -370,8 +477,13 @@ pub async fn run_tool_async_sandboxed(
     runtime: &ToolRuntime,
     ctx: &SandboxedContext,
 ) -> ToolResult {
-    if let Some(result) = dispatch_peer_tool_if_requested(call, runtime, Some(ctx)).await {
-        return result;
+    if has_peer_session_id(call) {
+        if let Err(error) = validate_peer_tool_request(call, runtime.mode) {
+            return failure(&call.name, error);
+        }
+        if let Err(error) = resolve_peer_tool_target(runtime, &string_arg(call, "peer_session_id")) {
+            return failure(&call.name, error);
+        }
     }
 
     match call.name.as_str() {
@@ -392,21 +504,8 @@ async fn dispatch_peer_tool_if_requested(
         return None;
     }
 
-    if !supports_peer_session_id(&call.name) {
-        return Some(failure(
-            &call.name,
-            format!(
-                "peer_session_id is only supported for read, glob, and grep plan-mode tool calls; omit peer_session_id for local work with {}",
-                call.name
-            ),
-        ));
-    }
-    if runtime.mode != PermissionMode::Plan {
-        return Some(failure(
-            &call.name,
-            "peer_session_id is only supported in plan mode for read-only context gathering"
-                .to_string(),
-        ));
+    if let Err(error) = validate_peer_tool_request(call, runtime.mode) {
+        return Some(failure(&call.name, error));
     }
 
     let (peer_directory, subsession_id) = match resolve_peer_tool_target(runtime, &peer_session_id)
@@ -526,10 +625,13 @@ fn has_peer_session_id(call: &ToolCall) -> bool {
 /// Async because the sandboxed path can fire a UI ask through
 /// `trigger_access` when the requested path lies outside the project root.
 pub async fn run_tool_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult {
-    if has_peer_session_id(call) {
+    if has_peer_session_id(call) && !supports_peer_session_id(&call.name) {
         return failure(
             &call.name,
-            "peer_session_id requires the agent runner async dispatch".to_string(),
+            format!(
+                "peer_session_id is only supported for read, glob, and grep plan-mode tool calls; omit peer_session_id for local work with {}",
+                call.name
+            ),
         );
     }
 
@@ -626,7 +728,7 @@ async fn read_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult {
     if path.is_empty() {
         return failure("read", "path is required".to_string());
     }
-    match resolve_sandbox_path(&path, ctx, "read").await {
+    match resolve_sandbox_path(&path, ctx, "read", Some(call)).await {
         Ok(canonical) => read::run_with_path(call, &canonical),
         Err(e) => failure("read", e),
     }
@@ -637,7 +739,7 @@ async fn write_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult 
     if path.is_empty() {
         return failure("write", "path is required".to_string());
     }
-    match resolve_sandbox_path(&path, ctx, "write").await {
+    match resolve_sandbox_path(&path, ctx, "write", None).await {
         Ok(canonical) => write::run_with_path(call, &canonical),
         Err(e) => failure("write", e),
     }
@@ -653,7 +755,7 @@ async fn edit_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult {
     if old.is_empty() {
         return failure("edit", "old_string is required".to_string());
     }
-    match resolve_sandbox_path(&path, ctx, "edit").await {
+    match resolve_sandbox_path(&path, ctx, "edit", None).await {
         Ok(canonical) => edit::run_with_path(call, &canonical, &old, &new),
         Err(e) => failure("edit", e),
     }
@@ -673,9 +775,16 @@ async fn apply_patch_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolR
 async fn glob_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult {
     let path = string_arg(call, "path");
     let target = if path.is_empty() {
-        ctx.project_root()
+        if has_peer_session_id(call) {
+            match resolve_sandbox_path(".", ctx, "glob", Some(call)).await {
+                Ok(p) => p,
+                Err(e) => return failure("glob", e),
+            }
+        } else {
+            ctx.project_root()
+        }
     } else {
-        match resolve_sandbox_path(&path, ctx, "glob").await {
+        match resolve_sandbox_path(&path, ctx, "glob", Some(call)).await {
             Ok(p) => p,
             Err(e) => return failure("glob", e),
         }
@@ -700,12 +809,35 @@ async fn glob_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult {
     result
 }
 
+fn validate_peer_tool_request(call: &ToolCall, mode: PermissionMode) -> Result<(), String> {
+    if !supports_peer_session_id(&call.name) {
+        return Err(format!(
+            "peer_session_id is only supported for read, glob, and grep plan-mode tool calls; omit peer_session_id for local work with {}",
+            call.name
+        ));
+    }
+    if mode != PermissionMode::Plan {
+        return Err(
+            "peer_session_id is only supported in plan mode for read-only context gathering"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 async fn grep_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult {
     let path = string_arg(call, "path");
     let target = if path.is_empty() {
-        ctx.project_root()
+        if has_peer_session_id(call) {
+            match resolve_sandbox_path(".", ctx, "grep", Some(call)).await {
+                Ok(p) => p,
+                Err(e) => return failure("grep", e),
+            }
+        } else {
+            ctx.project_root()
+        }
     } else {
-        match resolve_sandbox_path(&path, ctx, "grep").await {
+        match resolve_sandbox_path(&path, ctx, "grep", Some(call)).await {
             Ok(p) => p,
             Err(e) => return failure("grep", e),
         }
@@ -824,6 +956,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
@@ -939,6 +1072,109 @@ mod tests {
         Box::leak(Box::new(_rx));
         let ctx = SandboxedContext::new(sandbox, svc);
         (ctx, dir)
+    }
+
+    struct PeerFixture {
+        _db_dir: tempfile::TempDir,
+        _conv_dir: tempfile::TempDir,
+        caller_dir: tempfile::TempDir,
+        peer_dir: tempfile::TempDir,
+        outsider_dir: tempfile::TempDir,
+        peer_id: String,
+        outsider_id: String,
+        runtime: ToolRuntime,
+        ctx: SandboxedContext,
+    }
+
+    fn insert_project(db: &crate::database::Database, id: &str, dir: &std::path::Path) {
+        crate::database::ProjectRepository::insert(
+            db,
+            &crate::Project {
+                id: id.to_string(),
+                path: dir.display().to_string(),
+                name: id.to_string(),
+                tech_stack: vec![],
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn make_peer_fixture() -> PeerFixture {
+        let db_dir = tempfile::tempdir().unwrap();
+        let conv_dir = tempfile::tempdir().unwrap();
+        let caller_dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let outsider_dir = tempfile::tempdir().unwrap();
+
+        let db_path = db_dir.path().join("sessions.sqlite");
+        let db = crate::database::Database::new(db_path.clone()).unwrap();
+        db.init().unwrap();
+        insert_project(&db, "caller-project", caller_dir.path());
+        insert_project(&db, "peer-project", peer_dir.path());
+        insert_project(&db, "outsider-project", outsider_dir.path());
+        drop(db);
+
+        let session_service = crate::SessionService::new(db_path.clone());
+        let conversation_service = crate::ConversationService::new(conv_dir.path().to_path_buf());
+        let caller_id = session_service
+            .create_session(
+                "caller-project".to_string(),
+                caller_dir.path().display().to_string(),
+                "openai".to_string(),
+                "gpt-5".to_string(),
+            )
+            .unwrap();
+        let peer_id = session_service
+            .create_session(
+                "peer-project".to_string(),
+                peer_dir.path().display().to_string(),
+                "openai".to_string(),
+                "gpt-5".to_string(),
+            )
+            .unwrap();
+        let outsider_id = session_service
+            .create_session(
+                "outsider-project".to_string(),
+                outsider_dir.path().display().to_string(),
+                "openai".to_string(),
+                "gpt-5".to_string(),
+            )
+            .unwrap();
+        session_service
+            .create_group(vec![caller_id.clone(), peer_id.clone()])
+            .unwrap();
+
+        let registry = crate::llm::SubagentRegistry::new(db_path);
+        let runtime = ToolRuntime {
+            caller_session_id: caller_id.clone(),
+            session_service: Arc::clone(&session_service),
+            conversation_service,
+            providers: Arc::new(crate::llm::ProviderRegistry::new()),
+            subagent_registry: registry,
+            mode: PermissionMode::Plan,
+            turn_id: 17,
+            project_root: caller_dir.path().to_path_buf(),
+        };
+        let (permissions, rx) = PermissionService::new("peer-fixture", default_ruleset());
+        Box::leak(Box::new(rx));
+        let ctx = SandboxedContext::new(
+            crate::sandbox::SandboxPolicy::new(caller_dir.path().to_path_buf()),
+            permissions,
+        )
+        .with_caller_session(caller_id.clone(), Arc::clone(&session_service));
+
+        PeerFixture {
+            _db_dir: db_dir,
+            _conv_dir: conv_dir,
+            caller_dir,
+            peer_dir,
+            outsider_dir,
+            peer_id,
+            outsider_id,
+            runtime,
+            ctx,
+        }
     }
 
     #[tokio::test]
@@ -1164,7 +1400,7 @@ mod tests {
         let registry = crate::llm::SubagentRegistry::new(db_path);
         let runtime = ToolRuntime {
             caller_session_id: caller_id.clone(),
-            session_service,
+            session_service: Arc::clone(&session_service),
             conversation_service,
             providers: std::sync::Arc::new(crate::llm::ProviderRegistry::new()),
             subagent_registry: registry.clone(),
@@ -1177,7 +1413,8 @@ mod tests {
         let ctx = SandboxedContext::new(
             crate::sandbox::SandboxPolicy::new(caller_dir.path().to_path_buf()),
             permissions,
-        );
+        )
+        .with_caller_session(caller_id.clone(), Arc::clone(&session_service));
 
         let result = run_tool_async_sandboxed(
             &call(
@@ -1203,6 +1440,110 @@ mod tests {
         .await;
         assert!(second.success, "result: {second:?}");
         assert_eq!(registry.live_children(&caller_id).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sandboxed_peer_read_resolves_relative_path_against_peer_not_caller() {
+        let fixture = make_peer_fixture();
+        std::fs::write(fixture.caller_dir.path().join("note.txt"), "caller").unwrap();
+        std::fs::write(fixture.peer_dir.path().join("note.txt"), "peer").unwrap();
+
+        let result = run_tool_async_sandboxed(
+            &call(
+                "read",
+                &[
+                    ("path", "note.txt"),
+                    ("peer_session_id", fixture.peer_id.as_str()),
+                ],
+            ),
+            &fixture.runtime,
+            &fixture.ctx,
+        )
+        .await;
+
+        assert!(result.success, "result: {result:?}");
+        assert!(result.output.contains("peer"));
+        assert!(!result.output.contains("caller"));
+    }
+
+    #[tokio::test]
+    async fn sandboxed_peer_read_rejects_path_outside_named_peer() {
+        let fixture = make_peer_fixture();
+        let caller_file = fixture.caller_dir.path().join("caller-only.txt");
+        std::fs::write(&caller_file, "caller").unwrap();
+
+        let result = run_tool_async_sandboxed(
+            &call(
+                "read",
+                &[
+                    ("path", caller_file.to_str().unwrap()),
+                    ("peer_session_id", fixture.peer_id.as_str()),
+                ],
+            ),
+            &fixture.runtime,
+            &fixture.ctx,
+        )
+        .await;
+
+        assert!(!result.success, "result: {result:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("outside peer session directory")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandboxed_peer_read_rejects_unconnected_peer_without_ask() {
+        let fixture = make_peer_fixture();
+        std::fs::write(fixture.outsider_dir.path().join("note.txt"), "outsider").unwrap();
+
+        let result = run_tool_async_sandboxed(
+            &call(
+                "read",
+                &[
+                    ("path", "note.txt"),
+                    ("peer_session_id", fixture.outsider_id.as_str()),
+                ],
+            ),
+            &fixture.runtime,
+            &fixture.ctx,
+        )
+        .await;
+
+        assert!(!result.success, "result: {result:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("is not connected to this session")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandboxed_peer_id_on_write_does_not_mutate_peer() {
+        let fixture = make_peer_fixture();
+        let peer_file = fixture.peer_dir.path().join("write.txt");
+
+        let result = run_tool_async_sandboxed(
+            &call(
+                "write",
+                &[
+                    ("path", peer_file.to_str().unwrap()),
+                    ("content", "nope"),
+                    ("peer_session_id", fixture.peer_id.as_str()),
+                ],
+            ),
+            &fixture.runtime,
+            &fixture.ctx,
+        )
+        .await;
+
+        assert!(!result.success, "result: {result:?}");
+        assert!(!peer_file.exists());
     }
 }
 
