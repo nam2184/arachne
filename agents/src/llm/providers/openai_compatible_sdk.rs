@@ -256,14 +256,19 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
                 // the AISDK docs.
                 builder = builder.with_tool(build_sdk_tool(&tool.name, dispatcher.clone())?);
             }
-            // Do not stop on tool calls. The SDK owns the internal
-            // tool loop: it executes each tool, appends a `Message::Tool`,
-            // and continues provider requests until the model returns a
-            // normal final response.
+            // Stop after one tool-call round so the runner drives the
+            // next round-trip. The runner already persists `ToolCall`
+            // and `ToolResult` parts into the assistant message and
+            // re-issues the request with the updated history; letting
+            // the SDK drive its own loop means transient mid-stream
+            // drops inside the SDK's internal follow-up request fail
+            // the whole turn, whereas a per-round runner step can be
+            // retried by the user.
+            builder = builder.stop_when(|options| options.tool_calls().is_some());
         }
 
         let mut sdk_request = builder.build();
-        let response = sdk_request.stream_text().await.map_err(|error| {
+        let response = stream_text_with_retry(&mut sdk_request).await.map_err(|error| {
             // The SDK wraps provider 4xx/5xx as `Error::ApiError`
             // with the response body in `details`. Parse the
             // body so the user sees `[type] message (code, param)`
@@ -1170,6 +1175,29 @@ fn sdk_assistant_wire_message(message: &AssistantMessage) -> serde_json::Value {
             "role": "assistant",
             "content": null,
         }),
+    }
+}
+
+/// Call `stream_text()` with a single retry for transient
+/// mid-stream drops. AISDK surfaces a dropped connection as
+/// `Error::ApiError { status_code: None, details }` (rendered as
+/// `API error: None - Stream ended`); re-issuing the same request
+/// recovers from a flapping gateway without bubbling the error up
+/// to the user. We retry exactly once with a short backoff so a
+/// sustained outage still fails fast.
+async fn stream_text_with_retry(
+    request: &mut LanguageModelRequest<SdkModel>,
+) -> aisdk::error::Result<aisdk::core::language_model::stream_text::StreamTextResponse> {
+    match request.stream_text().await {
+        Ok(response) => Ok(response),
+        Err(aisdk::error::Error::ApiError { status_code: None, .. }) => {
+            tracing::warn!(
+                "sdk stream_text returned ApiError with no status code; retrying once after 250ms"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            request.stream_text().await
+        }
+        Err(other) => Err(other),
     }
 }
 

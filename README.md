@@ -23,8 +23,7 @@ strand. Arachne applies the same idea to coding sessions:
   results feed back into the parent's conversation.
 - **Peers are sibling strands** — connected sessions can target each other
   directly by passing the peer's `peer_session_id` to read/glob/grep/plan
-  tools. There is no `ask_peer` tool; reach a sibling by naming it in the
-  tool call.
+  tools.
 
 
 ## Features
@@ -54,17 +53,10 @@ MiniMax Token Plan providers. Anything that exposes an
 `/v1/chat/completions` (OpenAI-compatible), Anthropic Messages, or
 MiniMax-compatible endpoint can be configured as a custom provider.
 
-Environment variable fallbacks:
-
-| Provider | Environment Variable |
-|----------|----------------------|
-| OpenAI | `OPENAI_API_KEY` |
-| MiniMax Token Plan | `MINIMAX_TOKEN_PLAN_KEY` or `MINIMAX_API_KEY` |
-| Anthropic | `ANTHROPIC_API_KEY` |
-
 ## Architecture
 
 **Frontend** — React + TypeScript + Vite + Zustand + React Flow
+(`desktop/`)
 
 **Backend** — Rust + Tauri (`src-tauri/`) + `arachne-agents` crate
 (`agents/`)
@@ -73,19 +65,6 @@ The Tauri shell owns windows, IPC, and the `arachne` Tauri command surface.
 All LLM, tool, and session logic lives in the `arachne-agents` crate and is
 exposed to the frontend as `#[tauri::command]` functions in
 `src-tauri/src/commands/`.
-
-## Persistence
-
-| What | Where |
-|------|-------|
-| Session / project / message metadata | `arachne.sqlite` in the OS data dir |
-| Per-session AI conversation (the LLM's view) | `<data>/conversations/<session_id>.json` |
-| Per-session UI conversation (the user's view) | `<data>/conversations/<session_id>.ui.json` |
-| User settings (theme, font size, node skin) | `~/.config/arachne/settings.json` |
-| Permission ruleset | `~/.config/arachne/config.json` (or `<cwd>/arachne.json`) |
-
-The data dir is resolved by `directories::ProjectDirs::from("ai",
-"arachne", "arachne")`.
 
 ## Development
 

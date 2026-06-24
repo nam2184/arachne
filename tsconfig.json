@@ -14,12 +14,12 @@
     "strict": true,
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["desktop/*"]
     },
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"],
+  "include": ["desktop"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

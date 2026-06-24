@@ -11,7 +11,7 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "src"),
+      "@": path.resolve(__dirname, "desktop"),
     },
   },
   clearScreen: false,
@@ -23,7 +23,7 @@ export default defineConfig({
       ? {
           protocol: "ws",
           host,
-          port: 1421,
+          port: 1420,
         }
       : undefined,
     watch: {
