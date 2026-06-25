@@ -422,6 +422,7 @@ useEffect(() => {
                 const reasoning = message.reasoning ?? "";
                 const content = message.content ?? "";
                 const parts = message.parts ?? [];
+                const hasReasoningPart = parts.some((part) => part.type === "reasoning");
 
                 if (message.role === "system" && content.includes("<conversation-checkpoint>")) {
                   return (
@@ -445,7 +446,7 @@ useEffect(() => {
                           : "overflow-hidden border border-[#2a2a2a] bg-[#111111] text-[#f5f5f5]",
                       )}
                     >
-                      {isAssistant && reasoning && (
+                      {isAssistant && reasoning && !hasReasoningPart && (
                         <ThinkBlock
                           text={reasoning}
                           defaultOpen={streamingMessageId === message.id}
@@ -453,7 +454,11 @@ useEffect(() => {
                         />
                       )}
                       {isAssistant && parts.length > 0 ? (
-                        <AssistantMessageParts parts={parts} fallbackContent={content} />
+                        <AssistantMessageParts
+                          parts={parts}
+                          fallbackContent={content}
+                          defaultThinkingOpen={streamingMessageId === message.id}
+                        />
                       ) : content ? (
                         <div className="whitespace-pre-wrap break-words">{content}</div>
                       ) : null}
@@ -510,7 +515,15 @@ useEffect(() => {
   );
 }
 
-function AssistantMessageParts({ parts, fallbackContent }: { parts: ChatMessagePart[]; fallbackContent: string }) {
+function AssistantMessageParts({
+  parts,
+  fallbackContent,
+  defaultThinkingOpen,
+}: {
+  parts: ChatMessagePart[];
+  fallbackContent: string;
+  defaultThinkingOpen: boolean;
+}) {
   const results = new Map<string, Extract<ChatMessagePart, { type: "tool_result" }>>();
   for (const part of parts) {
     if (part.type === "tool_result") {
@@ -518,7 +531,7 @@ function AssistantMessageParts({ parts, fallbackContent }: { parts: ChatMessageP
     }
   }
 
-  const visibleParts = parts.filter((part) => part.type !== "reasoning" && part.type !== "tool_result");
+  const visibleParts = parts.filter((part) => part.type !== "tool_result");
   if (visibleParts.length === 0 && fallbackContent) {
     return <div className="whitespace-pre-wrap break-words">{fallbackContent}</div>;
   }
@@ -531,6 +544,15 @@ function AssistantMessageParts({ parts, fallbackContent }: { parts: ChatMessageP
             <div key={`text-${index}`} className="whitespace-pre-wrap break-words">
               {part.text}
             </div>
+          ) : null;
+        }
+        if (part.type === "reasoning") {
+          return part.text ? (
+            <ThinkBlock
+              key={`reasoning-${index}`}
+              text={part.text}
+              defaultOpen={defaultThinkingOpen}
+            />
           ) : null;
         }
         if (part.type === "tool_call") {

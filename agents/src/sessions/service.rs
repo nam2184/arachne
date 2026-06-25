@@ -34,6 +34,17 @@ impl SessionService {
         model: String,
     ) -> Result<String, String> {
         self.create_session_with_parent(project_id, directory, provider, model, None)
+            .map(|(id, _created)| id)
+    }
+
+    pub fn create_top_level_session(
+        &self,
+        project_id: String,
+        directory: String,
+        provider: String,
+        model: String,
+    ) -> Result<(String, bool), String> {
+        self.create_session_with_parent(project_id, directory, provider, model, None)
     }
 
     /// Same as `create_session` but with an optional `parent_session_id` for
@@ -47,7 +58,7 @@ impl SessionService {
         provider: String,
         model: String,
         parent: Option<String>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, bool), String> {
         let db = self.db()?;
         if ProjectRepository::find_by_id(&db, &project_id)?.is_none() {
             return Err("Project must exist before creating sessions".to_string());
@@ -62,6 +73,7 @@ impl SessionService {
         let canonical = canonicalize_directory(&directory)
             .to_string_lossy()
             .to_string();
+
         let mut session = AgentSession::new(project_id, canonical, provider, model);
         session.parent_session_id = parent;
         let id = session.id.clone();
@@ -71,7 +83,7 @@ impl SessionService {
                 tracing::warn!(session_id = %id, error = %error, "failed to generate routing summary");
             }
         }
-        Ok(id)
+        Ok((id, true))
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<AgentSession>, String> {
@@ -281,6 +293,39 @@ mod tests {
     fn get_all_sessions_lists_them() {
         let (service, work, _db) = make_service();
         seed_project(&service, "p1", "arachne");
+        let other = tempfile::tempdir().unwrap();
+        let id_a = service
+            .create_session(
+                "p1".to_string(),
+                work.path().to_string_lossy().to_string(),
+                "anthropic".to_string(),
+                "claude-sonnet-4-20250514".to_string(),
+            )
+            .unwrap();
+        let id_b = service
+            .create_session(
+                "p1".to_string(),
+                other.path().to_string_lossy().to_string(),
+                "openai".to_string(),
+                "gpt-4.1".to_string(),
+            )
+            .unwrap();
+
+        let sessions = service.get_all_sessions().expect("get_all_sessions");
+        log(
+            "get_all_sessions_lists_them",
+            &format!("{} sessions", sessions.len()),
+        );
+        assert_eq!(sessions.len(), 2);
+        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&id_a.as_str()));
+        assert!(ids.contains(&id_b.as_str()));
+    }
+
+    #[test]
+    fn create_session_allows_same_project_directory() {
+        let (service, work, _db) = make_service();
+        seed_project(&service, "p1", "arachne");
         let id_a = service
             .create_session(
                 "p1".to_string(),
@@ -299,14 +344,8 @@ mod tests {
             .unwrap();
 
         let sessions = service.get_all_sessions().expect("get_all_sessions");
-        log(
-            "get_all_sessions_lists_them",
-            &format!("{} sessions", sessions.len()),
-        );
+        assert_ne!(id_a, id_b);
         assert_eq!(sessions.len(), 2);
-        let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&id_a.as_str()));
-        assert!(ids.contains(&id_b.as_str()));
     }
 
     #[test]
@@ -335,6 +374,7 @@ mod tests {
     fn create_group_persists_with_session_links() {
         let (service, work, _db) = make_service();
         seed_project(&service, "p1", "arachne");
+        let other = tempfile::tempdir().unwrap();
         let id_a = service
             .create_session(
                 "p1".to_string(),
@@ -346,7 +386,7 @@ mod tests {
         let id_b = service
             .create_session(
                 "p1".to_string(),
-                work.path().to_string_lossy().to_string(),
+                other.path().to_string_lossy().to_string(),
                 "anthropic".to_string(),
                 "claude-sonnet-4-20250514".to_string(),
             )
@@ -430,6 +470,7 @@ mod tests {
     fn add_session_to_group_links_correctly() {
         let (service, work, _db) = make_service();
         seed_project(&service, "p1", "arachne");
+        let other = tempfile::tempdir().unwrap();
         let id_a = service
             .create_session(
                 "p1".to_string(),
@@ -441,7 +482,7 @@ mod tests {
         let id_b = service
             .create_session(
                 "p1".to_string(),
-                work.path().to_string_lossy().to_string(),
+                other.path().to_string_lossy().to_string(),
                 "anthropic".to_string(),
                 "claude-sonnet-4-20250514".to_string(),
             )
@@ -468,6 +509,7 @@ mod tests {
     fn remove_session_from_group_unlinks() {
         let (service, work, _db) = make_service();
         seed_project(&service, "p1", "arachne");
+        let other = tempfile::tempdir().unwrap();
         let id_a = service
             .create_session(
                 "p1".to_string(),
@@ -479,7 +521,7 @@ mod tests {
         let id_b = service
             .create_session(
                 "p1".to_string(),
-                work.path().to_string_lossy().to_string(),
+                other.path().to_string_lossy().to_string(),
                 "anthropic".to_string(),
                 "claude-sonnet-4-20250514".to_string(),
             )
@@ -575,7 +617,7 @@ mod tests {
         // A different directory for the child (e.g. peer-tool subsession use
         // case).
         let peer_dir = tempfile::tempdir().unwrap();
-        let child_id = service
+        let (child_id, child_created) = service
             .create_session_with_parent(
                 "p1".to_string(),
                 peer_dir.path().to_string_lossy().to_string(),
@@ -584,6 +626,7 @@ mod tests {
                 Some(parent_id.clone()),
             )
             .expect("create child");
+        assert!(child_created);
 
         let child = service.get_session(&child_id).unwrap().unwrap();
         log(
@@ -606,7 +649,7 @@ mod tests {
     fn create_session_with_none_parent_keeps_null() {
         let (service, work, _db) = make_service();
         seed_project(&service, "p1", "arachne");
-        let id = service
+        let (id, created) = service
             .create_session_with_parent(
                 "p1".to_string(),
                 work.path().to_string_lossy().to_string(),
@@ -615,6 +658,7 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert!(created);
 
         let s = service.get_session(&id).unwrap().unwrap();
         assert!(s.parent_session_id.is_none());

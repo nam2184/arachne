@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none" role="img" aria-label="Arachne node web logo">
+  <style>
+    :root {
+      --node-fill: #fff;
+      --node-stroke: #000;
+      --line-stroke: #fff;
+    }
+
+    /* For black nodes on light backgrounds:
+       --node-fill: #000;
+       --node-stroke: #fff;
+       --line-stroke: #000;
+    */
+  </style>
+  <rect width="128" height="128" fill="transparent"/>
+  <g stroke="var(--line-stroke)" stroke-linecap="round" stroke-linejoin="round" stroke-width="5.5">
+    <path d="M18 24 L56 12 L108 28"/>
+    <path d="M18 24 L34 70 L12 112"/>
+    <path d="M56 12 L70 62 L108 28"/>
+    <path d="M34 70 L70 62 L116 86"/>
+    <path d="M12 112 L58 116 L116 86"/>
+    <path d="M70 62 L58 116"/>
+    <path d="M108 28 L116 86"/>
+  </g>
+  <g fill="var(--node-fill)" stroke="var(--node-stroke)" stroke-width="4">
+    <circle cx="18" cy="24" r="11"/>
+    <circle cx="56" cy="12" r="9"/>
+    <circle cx="108" cy="28" r="11"/>
+    <circle cx="34" cy="70" r="12"/>
+    <circle cx="70" cy="62" r="14"/>
+    <circle cx="116" cy="86" r="10"/>
+    <circle cx="12" cy="112" r="9"/>
+    <circle cx="58" cy="116" r="11"/>
+  </g>
+</svg>

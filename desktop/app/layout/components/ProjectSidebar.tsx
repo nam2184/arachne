@@ -2,7 +2,9 @@ import { Folder, Plus, Settings, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { NodeWebSvg } from "@/components/node-web-svg";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { useAppStore } from "@/features/app/appStore";
 import { cn } from "@/lib/utils";
 import { useProjectStore, type Project } from "@/features/project/projectStore";
 
@@ -13,6 +15,7 @@ interface ProjectSidebarProps {
 
 export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps) {
   const { createProject, initializeProjects, projects, setCurrentProject } = useProjectStore();
+  const theme = useAppStore((state) => state.settings.theme);
   const [projectName, setProjectName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isAddingProject, setIsAddingProject] = useState(false);
@@ -58,6 +61,19 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
   return (
     <aside className="flex w-[200px] shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)]">
       <div className="p-4 pb-2">
+        <div className="mb-5 flex items-center">
+          <a href="#top" className="flex items-center gap-3" aria-label="Arachne home">
+            <span className={cn(
+              "flex h-14 w-14 items-center justify-center overflow-hidden border-2 p-1.5",
+              theme === "light" ? "border-black bg-transparent" : "border-white bg-transparent",
+            )}>
+              <NodeWebSvg nodeTone={theme === "light" ? "black" : "white"} className="h-full w-full" />
+            </span>
+            <span className="font-mono text-sm font-semibold uppercase tracking-[0.28em] text-[var(--foreground)]">
+              ARACHNE
+            </span>
+          </a>
+        </div>
         <div className="flex items-center justify-between">
           <h2 className="text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">Projects</h2>
           <Button

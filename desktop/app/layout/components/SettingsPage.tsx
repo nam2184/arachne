@@ -195,27 +195,21 @@ export function SettingsPage() {
                 description="Soft glow orb with radial gradient"
                 active={settings.node_skin === "default"}
                 onSelect={saveNodeSkin}
-              >
-                <NodePreviewDefault />
-              </NodeSkinCard>
+              />
               <NodeSkinCard
                 skin="minimal"
                 title="Minimal"
                 description="Small dot, low visual weight"
                 active={settings.node_skin === "minimal"}
                 onSelect={saveNodeSkin}
-              >
-                <NodePreviewMinimal />
-              </NodeSkinCard>
+              />
               <NodeSkinCard
                 skin="tui"
                 title="TUI"
                 description="Bordered, monospace feel"
                 active={settings.node_skin === "tui"}
                 onSelect={saveNodeSkin}
-              >
-                <NodePreviewTui />
-              </NodeSkinCard>
+              />
             </div>
           </section>
 
@@ -407,76 +401,26 @@ interface NodeSkinCardProps {
   description: string;
   active: boolean;
   onSelect: (skin: NodeSkin) => Promise<void> | void;
-  children: React.ReactNode;
 }
 
-function NodeSkinCard({ skin, title, description, active, onSelect, children }: NodeSkinCardProps) {
+function NodeSkinCard({ skin, title, active, onSelect }: NodeSkinCardProps) {
   return (
     <button
       type="button"
       onClick={() => onSelect(skin)}
       className={cn(
-        "flex flex-col items-start gap-3 rounded-none border bg-[#0a0a0a] p-4 text-left transition-colors",
-        active ? "border-white" : "border-[#1f1f1f] hover:border-[#2a2a2a]",
+        "flex items-center justify-between rounded-none border bg-[var(--surface-raised)] p-4 text-left transition-colors",
+        active ? "border-[var(--foreground)]" : "border-[var(--border)] hover:border-[var(--node-border-hover)]",
       )}
     >
-      <div className="flex h-16 w-full items-center justify-center bg-black">{children}</div>
-      <div className="flex w-full items-center justify-between">
-        <div>
-          <p className="text-sm font-medium text-white">{title}</p>
-          <p className="text-xs text-[#8a8a8a]">{description}</p>
-        </div>
-        <span
-          className={cn(
-            "h-3 w-3 rounded-full border",
-            active ? "border-white bg-white" : "border-[#2a2a2a] bg-transparent",
-          )}
-          aria-hidden="true"
-        />
-      </div>
+      <span className="text-sm font-medium text-[var(--foreground)]">{title}</span>
+      <span
+        className={cn(
+          "h-3 w-3 rounded-full border",
+          active ? "border-[var(--foreground)] bg-[var(--foreground)]" : "border-[var(--node-border-hover)] bg-transparent",
+        )}
+        aria-hidden="true"
+      />
     </button>
-  );
-}
-
-function NodePreviewDefault() {
-  return (
-    <div className="flex flex-col items-center gap-1">
-      <div className="relative flex h-10 w-10 items-center justify-center rounded-full">
-        <svg viewBox="0 0 24 24" className="h-5 w-5">
-          <defs>
-            <radialGradient id="preview-default" cx="50%" cy="50%" r="50%">
-              <stop offset="0%" stopColor="#ffffff" stopOpacity="0.9" />
-              <stop offset="70%" stopColor="#ffffff" stopOpacity="0.22" />
-              <stop offset="100%" stopColor="#ffffff" stopOpacity="0" />
-            </radialGradient>
-          </defs>
-          <circle cx="12" cy="12" r="10" fill="url(#preview-default)" />
-          <circle cx="12" cy="12" r="3" fill="#ffffff" />
-        </svg>
-      </div>
-      <span className="truncate text-[10px] text-[#737373]">session</span>
-    </div>
-  );
-}
-
-function NodePreviewMinimal() {
-  return (
-    <div className="flex flex-col items-center gap-1">
-      <div className="h-3 w-3 rounded-full bg-[#f5f5f5]" />
-      <span className="truncate text-[10px] text-[#737373]">session</span>
-    </div>
-  );
-}
-
-function NodePreviewTui() {
-  return (
-    <div className="flex flex-col items-start gap-0">
-      <div className="flex h-10 w-10 items-center justify-center border border-[#f5f5f5] bg-black">
-        <span className="text-xs text-[#f5f5f5]">◉</span>
-      </div>
-      <span className="border-l border-r border-b border-[#f5f5f5] px-1 text-[10px] text-[#f5f5f5]">
-        session
-      </span>
-    </div>
   );
 }

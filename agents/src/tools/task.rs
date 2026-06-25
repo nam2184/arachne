@@ -98,7 +98,7 @@ pub async fn run_async(call: &ToolCall, runtime: ToolRuntime) -> ToolResult {
         caller.model.clone(),
         Some(caller.id.clone()),
     ) {
-        Ok(id) => id,
+        Ok((id, _created)) => id,
         Err(e) => return failure("task", format!("failed to create child session: {e}")),
     };
     runtime

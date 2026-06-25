@@ -247,8 +247,6 @@ function DefaultNode({ id, selected, directoryName, theme, onSelect, onOpenChat,
   onOpenChat: (id: string) => void;
   onDelete?: (id: string) => void;
 }) {
-  const ink = theme === "light" ? "#1f1a14" : "#ffffff";
-
   return (
     <div className="group flex flex-col items-center gap-1">
       <div
@@ -260,18 +258,25 @@ function DefaultNode({ id, selected, directoryName, theme, onSelect, onOpenChat,
         onDoubleClick={() => onOpenChat(id)}
       >
         <Handle type="target" position={Position.Top} className="!border-[var(--canvas-bg)] !bg-[var(--node-ink)]" />
-        <svg viewBox="0 0 24 24" className="h-5 w-5">
-          <defs>
-            <radialGradient id={`diffuse-${id}`} cx="50%" cy="50%" r="50%">
-              <stop offset="0%" stopColor={ink} stopOpacity="0.9" />
-              <stop offset="70%" stopColor={ink} stopOpacity={theme === "light" ? "0.3" : "0.22"} />
-              <stop offset="100%" stopColor={ink} stopOpacity="0" />
-            </radialGradient>
-          </defs>
-          <circle cx="12" cy="12" r="10" fill={`url(#diffuse-${id})`} />
-          <circle cx="12" cy="12" r="3" fill={ink} />
+        <svg viewBox="-12 -12 48 48" className="h-8 w-8 overflow-visible">
+          <circle
+            cx="12"
+            cy="12"
+            r="16"
+            fill={theme === "light" ? "#000000" : "#ffffff"}
+            opacity="0.08"
+            style={{ animation: `session-node-glow-${id} 2.4s ease-in-out infinite` }}
+          />
+          <circle cx="12" cy="12" r="10" fill={theme === "light" ? "#000000" : "#ffffff"} />
+          <circle cx="12" cy="12" r="6.5" fill={theme === "light" ? "#ffffff" : "#000000"} />
         </svg>
         <Handle type="source" position={Position.Bottom} className="!border-[var(--canvas-bg)] !bg-[var(--node-ink)]" />
+        <style>{`
+          @keyframes session-node-glow-${id} {
+            0%, 100% { opacity: 0.05; }
+            50% { opacity: 0.16; }
+          }
+        `}</style>
       </div>
       <span className="truncate text-[10px] text-[var(--text-muted)]">{directoryName}</span>
       <DeleteButton onDelete={onDelete} nodeId={id} directoryName={directoryName} />

@@ -481,7 +481,8 @@ pub async fn run_tool_async_sandboxed(
         if let Err(error) = validate_peer_tool_request(call, runtime.mode) {
             return failure(&call.name, error);
         }
-        if let Err(error) = resolve_peer_tool_target(runtime, &string_arg(call, "peer_session_id")) {
+        if let Err(error) = resolve_peer_tool_target(runtime, &string_arg(call, "peer_session_id"))
+        {
             return failure(&call.name, error);
         }
     }
@@ -591,13 +592,16 @@ fn resolve_peer_tool_target(
         &peer.id,
         runtime.turn_id,
         || {
-            runtime.session_service.create_session_with_parent(
-                peer.project_id.clone(),
-                peer.directory.clone(),
-                caller.provider.clone(),
-                caller.model.clone(),
-                Some(caller.id.clone()),
-            )
+            runtime
+                .session_service
+                .create_session_with_parent(
+                    peer.project_id.clone(),
+                    peer.directory.clone(),
+                    caller.provider.clone(),
+                    caller.model.clone(),
+                    Some(caller.id.clone()),
+                )
+                .map(|(id, _created)| id)
         },
     )?;
 
@@ -1486,13 +1490,11 @@ mod tests {
         .await;
 
         assert!(!result.success, "result: {result:?}");
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("outside peer session directory")
-        );
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("outside peer session directory"));
     }
 
     #[tokio::test]
@@ -1514,13 +1516,11 @@ mod tests {
         .await;
 
         assert!(!result.success, "result: {result:?}");
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("is not connected to this session")
-        );
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("is not connected to this session"));
     }
 
     #[tokio::test]
