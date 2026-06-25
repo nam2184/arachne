@@ -43,6 +43,9 @@ strand. Arachne applies the same idea to coding sessions:
   genealogy; child sessions feed results back into the parent's
   conversation. Connected sibling sessions can be addressed by passing
   `peer_session_id` to read/glob/grep/plan tools
+- Read-only tools may target a connected peer session by passing
+  `peer_session_id`; the path is allowed without an external-root prompt as
+  long as it canonicalizes inside that peer's directory.
 - **Snippet interjection** — Pull a file range, a search hit, or shell
   output into the active turn without rewriting the prompt
 - **Real-time streaming** — Live message updates during agent execution,

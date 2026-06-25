@@ -98,7 +98,7 @@ pub async fn run_async(call: &ToolCall, runtime: ToolRuntime) -> ToolResult {
         caller.model.clone(),
         Some(caller.id.clone()),
     ) {
-        Ok(id) => id,
+        Ok((id, _created)) => id,
         Err(e) => return failure("task", format!("failed to create child session: {e}")),
     };
     runtime
@@ -200,7 +200,10 @@ async fn run_child_foreground(
         Ok(Some(child)) => {
             let (permissions, _rx) = PermissionService::new(child.id.clone(), default_ruleset());
             let sandbox = SandboxPolicy::new(std::path::PathBuf::from(&child.directory));
-            let sandboxed_ctx = Arc::new(SandboxedContext::new(sandbox, Arc::clone(&permissions)));
+            let sandboxed_ctx = Arc::new(
+                SandboxedContext::new(sandbox, Arc::clone(&permissions))
+                    .with_caller_session(child.id.clone(), Arc::clone(&runtime.session_service)),
+            );
             SessionRunner::new(
                 Arc::clone(&runtime.session_service),
                 Arc::clone(&runtime.conversation_service),

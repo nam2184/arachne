@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 use std::sync::Arc;
 
 use aisdk::core::capabilities::{TextInputSupport, ToolCallSupport};
-use aisdk::core::language_model::{LanguageModelResponseContentType, StopReason};
+use aisdk::core::language_model::{LanguageModelResponseContentType, Step, StopReason};
 use aisdk::core::tools::ToolExecute;
 use aisdk::core::{
     AssistantMessage, DynamicModel, LanguageModel, LanguageModelRequest,
@@ -140,7 +140,11 @@ where
             for tool in &request.tools {
                 builder = builder.with_tool(sdk_tool(tool)?);
             }
-            builder = builder.stop_when(|options| options.tool_calls().is_some());
+            builder = builder.stop_when(|options| {
+                options
+                    .last_step()
+                    .is_some_and(|step| sdk_generated_step_has_tool_calls(&step))
+            });
         }
 
         let mut sdk_request = builder.build();
@@ -185,7 +189,7 @@ where
                 }
             }
 
-            let tool_calls = response.tool_calls().await.unwrap_or_default();
+            let tool_calls = sdk_generated_step_tool_calls(response.last_step().await);
             for call in &tool_calls {
                 for event in sdk_tool_call_events(call) {
                     yield event;
@@ -774,6 +778,22 @@ fn sdk_tool(tool: &ToolDefinition) -> Result<Tool, LlmError> {
         .map_err(|error| LlmError::new("sdk_tool", &error.to_string()))
 }
 
+fn sdk_generated_step_has_tool_calls(step: &Step) -> bool {
+    step.step_id > 0 && step.tool_calls().is_some_and(|calls| !calls.is_empty())
+}
+
+fn sdk_generated_step_tool_calls(step: Option<Step>) -> Vec<ToolCallInfo> {
+    let Some(step) = step else {
+        return Vec::new();
+    };
+
+    if step.step_id == 0 {
+        return Vec::new();
+    }
+
+    step.tool_calls().unwrap_or_default()
+}
+
 fn sdk_tool_call_events(call: &ToolCallInfo) -> Vec<LlmEvent> {
     let id = if call.tool.id.is_empty() {
         format!("tool-{}", call.tool.name)
@@ -868,6 +888,44 @@ mod tests {
             docs_url("Anthropic"),
             "https://aisdk.rs/docs/providers/anthropic"
         );
+    }
+
+    #[test]
+    fn sdk_generated_step_tool_calls_ignore_initial_history_step() {
+        let mut call = ToolCallInfo::new("read");
+        call.id("call_history");
+        call.input(serde_json::json!({"path":"README.md"}));
+
+        let step = Step::new(
+            0,
+            vec![Message::Assistant(AssistantMessage::new(
+                LanguageModelResponseContentType::ToolCall(call),
+                None,
+            ))],
+        );
+
+        assert!(!sdk_generated_step_has_tool_calls(&step));
+        assert!(sdk_generated_step_tool_calls(Some(step)).is_empty());
+    }
+
+    #[test]
+    fn sdk_generated_step_tool_calls_keep_generated_step() {
+        let mut call = ToolCallInfo::new("glob");
+        call.id("call_new");
+        call.input(serde_json::json!({"path":"src"}));
+
+        let step = Step::new(
+            1,
+            vec![Message::Assistant(AssistantMessage::new(
+                LanguageModelResponseContentType::ToolCall(call),
+                None,
+            ))],
+        );
+
+        assert!(sdk_generated_step_has_tool_calls(&step));
+        let calls = sdk_generated_step_tool_calls(Some(step));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool.id, "call_new");
     }
 
     #[tokio::test]

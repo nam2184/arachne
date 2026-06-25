@@ -27,10 +27,13 @@ pub async fn create_session(
     session_service: State<'_, Arc<SessionService>>,
     conversation_service: State<'_, Arc<ConversationService>>,
 ) -> Result<String, String> {
-    let id = session_service.create_session(project_id, directory, provider, model)?;
-    if let Err(error) = conversation_service.create_conversation(&id) {
-        let _ = session_service.delete_session(&id);
-        return Err(error);
+    let (id, created) =
+        session_service.create_top_level_session(project_id, directory, provider, model)?;
+    if created {
+        if let Err(error) = conversation_service.create_conversation(&id) {
+            let _ = session_service.delete_session(&id);
+            return Err(error);
+        }
     }
     Ok(id)
 }

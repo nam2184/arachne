@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use std::sync::{Arc, Mutex};
 
-use aisdk::core::language_model::{LanguageModelResponseContentType, StopReason};
+use aisdk::core::language_model::{LanguageModelResponseContentType, Step, StopReason};
 use aisdk::core::{
     AssistantMessage, DynamicModel, LanguageModelRequest, LanguageModelStreamChunkType, Message,
     ToolCallInfo, ToolResultInfo, UserMessage,
@@ -10,8 +10,8 @@ use aisdk::core::{
 use aisdk::providers::OpenAICompatible;
 
 use super::error_parsing::{format_provider_error, parse_provider_error_body};
-use super::{LlmError, LlmProvider, LlmStream, ToolDispatcherFn};
 use super::sdk_tool_registry::build_sdk_tool;
+use super::{LlmError, LlmProvider, LlmStream, ToolDispatcherFn};
 use crate::llm::events::{FinishReason, LlmEvent, ToolResultValue};
 use crate::llm::request::{ContentPart, LlmRequest};
 
@@ -264,33 +264,39 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
             // drops inside the SDK's internal follow-up request fail
             // the whole turn, whereas a per-round runner step can be
             // retried by the user.
-            builder = builder.stop_when(|options| options.tool_calls().is_some());
+            builder = builder.stop_when(|options| {
+                options
+                    .last_step()
+                    .is_some_and(|step| sdk_generated_step_has_tool_calls(&step))
+            });
         }
 
         let mut sdk_request = builder.build();
-        let response = stream_text_with_retry(&mut sdk_request).await.map_err(|error| {
-            // The SDK wraps provider 4xx/5xx as `Error::ApiError`
-            // with the response body in `details`. Parse the
-            // body so the user sees `[type] message (code, param)`
-            // instead of `Model streaming failed: ApiError { .. }`.
-            let raw = error.to_string();
-            let info = parse_provider_error_body(&raw);
-            tracing::error!(
-                provider = %self.provider_name,
-                model = %request.model,
-                error_kind = %info.kind,
-                error_type = info.error_type.as_deref().unwrap_or(""),
-                error_code = info.error_code.as_deref().unwrap_or(""),
-                error_param = info.error_param.as_deref().unwrap_or(""),
-                error_message = %info.message,
-                response_body_chars = raw.chars().count(),
-                "sdk_request failed: provider rejected the request"
-            );
-            let user_message = format_provider_error(&info, &raw);
-            LlmError::new("sdk_request", &user_message)
-                .provider(&self.provider_name)
-                .model(&request.model)
-        })?;
+        let response = stream_text_with_retry(&mut sdk_request)
+            .await
+            .map_err(|error| {
+                // The SDK wraps provider 4xx/5xx as `Error::ApiError`
+                // with the response body in `details`. Parse the
+                // body so the user sees `[type] message (code, param)`
+                // instead of `Model streaming failed: ApiError { .. }`.
+                let raw = error.to_string();
+                let info = parse_provider_error_body(&raw);
+                tracing::error!(
+                    provider = %self.provider_name,
+                    model = %request.model,
+                    error_kind = %info.kind,
+                    error_type = info.error_type.as_deref().unwrap_or(""),
+                    error_code = info.error_code.as_deref().unwrap_or(""),
+                    error_param = info.error_param.as_deref().unwrap_or(""),
+                    error_message = %info.message,
+                    response_body_chars = raw.chars().count(),
+                    "sdk_request failed: provider rejected the request"
+                );
+                let user_message = format_provider_error(&info, &raw);
+                LlmError::new("sdk_request", &user_message)
+                    .provider(&self.provider_name)
+                    .model(&request.model)
+            })?;
 
         let stream_provider = self.provider_name.clone();
         let stream_model = request.model.clone();
@@ -350,8 +356,7 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
             // resolved calls and results as `LlmEvent`s so the
             // runner-side persistence block can keep building
             // the assistant message the same way it always has.
-            let tool_calls = response.tool_calls().await.unwrap_or_default();
-            let tool_results = response.tool_results().await.unwrap_or_default();
+            let (tool_calls, tool_results) = sdk_generated_step_tool_activity(response.last_step().await);
             for call in &tool_calls {
                 for event in sdk_tool_call_events(call) {
                     yield event;
@@ -487,14 +492,15 @@ fn sdk_assistant_messages(content: &[ContentPart]) -> Vec<Message> {
     let mut text_parts = Vec::new();
     let mut pending_tool_calls: Vec<ToolCallInfo> = Vec::new();
 
-    let flush_pending_tool_calls = |messages: &mut Vec<Message>, pending: &mut Vec<ToolCallInfo>| {
-        messages.extend(pending.drain(..).map(|tool_call| {
-            Message::Assistant(AssistantMessage::new(
-                LanguageModelResponseContentType::ToolCall(tool_call),
-                None,
-            ))
-        }));
-    };
+    let flush_pending_tool_calls =
+        |messages: &mut Vec<Message>, pending: &mut Vec<ToolCallInfo>| {
+            messages.extend(pending.drain(..).map(|tool_call| {
+                Message::Assistant(AssistantMessage::new(
+                    LanguageModelResponseContentType::ToolCall(tool_call),
+                    None,
+                ))
+            }));
+        };
 
     for part in content {
         match part {
@@ -505,7 +511,10 @@ fn sdk_assistant_messages(content: &[ContentPart]) -> Vec<Message> {
                 pending_tool_calls.push(tool_call);
             }
             ContentPart::ToolResult { id, name, result } => {
-                if let Some(index) = pending_tool_calls.iter().position(|call| call.tool.id == *id) {
+                if let Some(index) = pending_tool_calls
+                    .iter()
+                    .position(|call| call.tool.id == *id)
+                {
                     let tool_call = pending_tool_calls.remove(index);
                     messages.push(Message::Assistant(AssistantMessage::new(
                         LanguageModelResponseContentType::ToolCall(tool_call),
@@ -564,6 +573,27 @@ fn prompt_text(content: &[ContentPart]) -> String {
         .join("\n")
 }
 
+fn sdk_generated_step_has_tool_calls(step: &Step) -> bool {
+    step.step_id > 0 && step.tool_calls().is_some_and(|calls| !calls.is_empty())
+}
+
+fn sdk_generated_step_tool_activity(
+    step: Option<Step>,
+) -> (Vec<ToolCallInfo>, Vec<ToolResultInfo>) {
+    let Some(step) = step else {
+        return (Vec::new(), Vec::new());
+    };
+
+    if step.step_id == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    (
+        step.tool_calls().unwrap_or_default(),
+        step.tool_results().unwrap_or_default(),
+    )
+}
+
 fn sdk_tool_call_events(call: &ToolCallInfo) -> Vec<LlmEvent> {
     let id = if call.tool.id.is_empty() {
         format!("tool-{}", call.tool.name)
@@ -610,11 +640,17 @@ fn sdk_tool_result_event(result: &ToolResultInfo) -> Option<LlmEvent> {
     let id = result.tool.id.clone();
     let value = match &result.output {
         Ok(value) => match value {
-            serde_json::Value::String(text) => match serde_json::from_str::<serde_json::Value>(text) {
-                Ok(parsed) => ToolResultValue::Json { value: parsed },
-                Err(_) => ToolResultValue::Text { value: text.clone() },
+            serde_json::Value::String(text) => {
+                match serde_json::from_str::<serde_json::Value>(text) {
+                    Ok(parsed) => ToolResultValue::Json { value: parsed },
+                    Err(_) => ToolResultValue::Text {
+                        value: text.clone(),
+                    },
+                }
+            }
+            other => ToolResultValue::Json {
+                value: other.clone(),
             },
-            other => ToolResultValue::Json { value: other.clone() },
         },
         Err(message) => ToolResultValue::Error {
             value: format!("Error: {message}"),
@@ -661,8 +697,8 @@ fn percent_u32(value: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aisdk::core::tools::ToolDetails;
     use crate::llm::request::LlmMessage;
+    use aisdk::core::tools::ToolDetails;
 
     #[test]
     fn sdk_provider_can_be_constructed() {
@@ -713,6 +749,62 @@ mod tests {
         assert_eq!(id, "call_1");
         assert_eq!(name, "read");
         assert_eq!(input["path"], "src/lib.rs");
+    }
+
+    #[test]
+    fn sdk_generated_step_tool_activity_ignores_initial_history_step() {
+        let mut call = ToolCallInfo::new("read");
+        call.id("call_history");
+        call.input(serde_json::json!({"path":"README.md"}));
+
+        let step = Step::new(
+            0,
+            vec![
+                Message::Assistant(AssistantMessage::new(
+                    LanguageModelResponseContentType::ToolCall(call),
+                    None,
+                )),
+                Message::Tool(sdk_tool_result_info(
+                    "call_history",
+                    "read",
+                    &serde_json::json!({"text":"history"}),
+                )),
+            ],
+        );
+
+        assert!(!sdk_generated_step_has_tool_calls(&step));
+        let (calls, results) = sdk_generated_step_tool_activity(Some(step));
+        assert!(calls.is_empty());
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn sdk_generated_step_tool_activity_keeps_generated_step() {
+        let mut call = ToolCallInfo::new("glob");
+        call.id("call_new");
+        call.input(serde_json::json!({"path":"src"}));
+
+        let step = Step::new(
+            1,
+            vec![
+                Message::Assistant(AssistantMessage::new(
+                    LanguageModelResponseContentType::ToolCall(call),
+                    None,
+                )),
+                Message::Tool(sdk_tool_result_info(
+                    "call_new",
+                    "glob",
+                    &serde_json::json!({"matches":[]}),
+                )),
+            ],
+        );
+
+        assert!(sdk_generated_step_has_tool_calls(&step));
+        let (calls, results) = sdk_generated_step_tool_activity(Some(step));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool.id, "call_new");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool.id, "call_new");
     }
 
     #[test]
@@ -796,12 +888,18 @@ mod tests {
             messages
         );
         let Message::Tool(tool_result) = &messages[1] else {
-            panic!("tool result must lower to Message::Tool, got: {:?}", messages[1]);
+            panic!(
+                "tool result must lower to Message::Tool, got: {:?}",
+                messages[1]
+            );
         };
         assert_eq!(tool_result.tool.id, "call_1");
         assert_eq!(tool_result.tool.name, "glob");
         let output = tool_result.output.as_ref().expect("tool output");
-        assert_eq!(output, &serde_json::json!({"error": "user rejected request abc"}));
+        assert_eq!(
+            output,
+            &serde_json::json!({"error": "user rejected request abc"})
+        );
     }
 
     #[test]
@@ -1026,7 +1124,8 @@ fn log_sdk_request_structure(
     const INPUT_LOG_CHARS: usize = 1024;
     let last_user_input = last_user_input.map(|text| truncate_chars(&text, INPUT_LOG_CHARS));
     const TOOL_RESULT_LOG_CHARS: usize = 512;
-    let last_tool_result = last_tool_result.map(|text| truncate_chars(&text, TOOL_RESULT_LOG_CHARS));
+    let last_tool_result =
+        last_tool_result.map(|text| truncate_chars(&text, TOOL_RESULT_LOG_CHARS));
 
     tracing::debug!(
         provider = %provider,
@@ -1190,7 +1289,9 @@ async fn stream_text_with_retry(
 ) -> aisdk::error::Result<aisdk::core::language_model::stream_text::StreamTextResponse> {
     match request.stream_text().await {
         Ok(response) => Ok(response),
-        Err(aisdk::error::Error::ApiError { status_code: None, .. }) => {
+        Err(aisdk::error::Error::ApiError {
+            status_code: None, ..
+        }) => {
             tracing::warn!(
                 "sdk stream_text returned ApiError with no status code; retrying once after 250ms"
             );

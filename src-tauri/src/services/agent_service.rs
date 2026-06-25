@@ -95,7 +95,10 @@ impl AgentService {
     pub fn build_runner_for_session(&self, session_id: &str, directory: &str) -> SessionRunner {
         let permissions = self.permission_map.get_or_create(session_id);
         let sandbox = SandboxPolicy::new(std::path::PathBuf::from(directory));
-        let sandboxed_ctx = Arc::new(SandboxedContext::new(sandbox, Arc::clone(&permissions)));
+        let sandboxed_ctx = Arc::new(
+            SandboxedContext::new(sandbox, Arc::clone(&permissions))
+                .with_caller_session(session_id.to_string(), Arc::clone(&self.session_service)),
+        );
 
         self.build_runner()
             .with_permissions(permissions)

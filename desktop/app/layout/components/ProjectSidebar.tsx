@@ -2,7 +2,9 @@ import { Folder, Plus, Settings, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { NodeWebSvg } from "@/components/node-web-svg";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { useAppStore } from "@/features/app/appStore";
 import { cn } from "@/lib/utils";
 import { useProjectStore, type Project } from "@/features/project/projectStore";
 
@@ -13,6 +15,7 @@ interface ProjectSidebarProps {
 
 export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps) {
   const { createProject, initializeProjects, projects, setCurrentProject } = useProjectStore();
+  const theme = useAppStore((state) => state.settings.theme);
   const [projectName, setProjectName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isAddingProject, setIsAddingProject] = useState(false);
@@ -56,14 +59,27 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
   };
 
   return (
-    <aside className="flex w-[200px] shrink-0 flex-col border-r border-[#1f1f1f] bg-[#050505]">
+    <aside className="flex w-[200px] shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)]">
       <div className="p-4 pb-2">
+        <div className="mb-5 flex items-center">
+          <a href="#top" className="flex items-center gap-3" aria-label="Arachne home">
+            <span className={cn(
+              "flex h-14 w-14 items-center justify-center overflow-hidden border-2 p-1.5",
+              theme === "light" ? "border-black bg-transparent" : "border-white bg-transparent",
+            )}>
+              <NodeWebSvg nodeTone={theme === "light" ? "black" : "white"} className="h-full w-full" />
+            </span>
+            <span className="font-mono text-sm font-semibold uppercase tracking-[0.28em] text-[var(--foreground)]">
+              ARACHNE
+            </span>
+          </a>
+        </div>
         <div className="flex items-center justify-between">
-          <h2 className="text-xs font-semibold uppercase tracking-wide text-[#737373]">Projects</h2>
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">Projects</h2>
           <Button
             variant="ghost"
             size="icon"
-            className="h-7 w-7 bg-transparent text-[#737373] hover:bg-transparent hover:text-white"
+            className="h-7 w-7 bg-transparent text-[var(--text-muted)] hover:bg-transparent hover:text-[var(--foreground)]"
             onClick={() => setIsAddingProject((value) => !value)}
             aria-label="Add project"
           >
@@ -102,7 +118,7 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
         <ScrollArea className="h-full">
           <div className="space-y-2 pr-2">
             {sortedProjects.length === 0 ? (
-              <p className="text-xs text-[#737373]">
+              <p className="text-xs text-[var(--text-muted)]">
                 No projects yet. Create a project before adding sessions.
               </p>
             ) : (
@@ -110,8 +126,8 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
                 <button
                   key={item.id}
                   className={cn(
-                    "flex w-full items-center gap-2 bg-transparent p-2 text-left transition-colors hover:text-white",
-                    project?.id === item.id ? "text-white" : "text-[#737373]",
+                    "flex w-full items-center gap-2 bg-transparent p-2 text-left transition-colors hover:bg-[var(--surface-raised)] hover:text-[var(--foreground)]",
+                    project?.id === item.id ? "text-[var(--foreground)]" : "text-[var(--text-muted)]",
                   )}
                   onClick={() => setCurrentProject(item)}
                 >
@@ -124,7 +140,7 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
         </ScrollArea>
       </div>
       <div className="p-4">
-        <Button variant="ghost" className="w-full justify-start gap-2 bg-transparent p-2 text-[#737373] hover:bg-transparent hover:text-white" onClick={onOpenSettings}>
+        <Button variant="ghost" className="w-full justify-start gap-2 bg-transparent p-2 text-[var(--text-muted)] hover:bg-[var(--surface-raised)] hover:text-[var(--foreground)]" onClick={onOpenSettings}>
           <Settings className="h-3.5 w-3.5" />
           <span className="text-sm font-medium">Settings</span>
         </Button>

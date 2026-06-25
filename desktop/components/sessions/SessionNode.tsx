@@ -7,6 +7,7 @@ import type { NodeSkin } from "@/features/app/appStore";
 interface SessionNodeData {
   session: AgentSession;
   skin: NodeSkin;
+  theme: "dark" | "light";
   onSelect: (id: string) => void;
   onOpenChat: (id: string) => void;
   onDelete?: (id: string) => void;
@@ -20,12 +21,10 @@ function DeleteButton({
   onDelete,
   nodeId,
   directoryName,
-  tone,
 }: {
   onDelete?: (id: string) => void;
   nodeId: string;
   directoryName: string;
-  tone: "light" | "dark";
 }) {
   if (!onDelete) return null;
   return (
@@ -38,9 +37,7 @@ function DeleteButton({
       style={{ pointerEvents: "auto" }}
       className={cn(
         "mt-1 flex items-center gap-1 border px-1.5 py-0.5 text-[10px] opacity-0 transition-opacity group-hover:opacity-100",
-        tone === "dark"
-          ? "border-[#1f1f1f] bg-[#0a0a0a] text-[#a0a0a0] hover:border-[#ff5f5f] hover:text-[#ff5f5f]"
-          : "border-[#f5f5f5] bg-black text-[#a0a0a0] hover:border-[#ff5f5f] hover:text-[#ff5f5f]",
+        "border-[var(--node-border)] bg-[var(--node-bg)] text-[var(--text-subtle)] hover:border-[#ff5f5f] hover:text-[#ff5f5f]",
       )}
       title={`Delete ${directoryName}`}
     >
@@ -50,14 +47,17 @@ function DeleteButton({
   );
 }
 
-function MinimalNode({ id, selected, directoryName, onSelect, onOpenChat, onDelete }: {
+function MinimalNode({ id, selected, directoryName, theme, onSelect, onOpenChat, onDelete }: {
   id: string;
   selected: boolean | undefined;
   directoryName: string;
+  theme: "dark" | "light";
   onSelect: (id: string) => void;
   onOpenChat: (id: string) => void;
   onDelete?: (id: string) => void;
 }) {
+  const ink = theme === "light" ? "#1f1a14" : "#ffffff";
+
   return (
     <div className="group flex flex-col items-center gap-1">
       <div
@@ -68,20 +68,20 @@ function MinimalNode({ id, selected, directoryName, onSelect, onOpenChat, onDele
         onClick={() => onSelect(id)}
         onDoubleClick={() => onOpenChat(id)}
       >
-        <Handle type="target" position={Position.Top} className="!h-1 !w-1 !border-0 !bg-[#737373]" />
-        <Handle type="source" position={Position.Bottom} className="!h-1 !w-1 !border-0 !bg-[#737373]" />
+        <Handle type="target" position={Position.Top} className="!h-1 !w-1 !border-0 !bg-[var(--node-muted)]" />
+        <Handle type="source" position={Position.Bottom} className="!h-1 !w-1 !border-0 !bg-[var(--node-muted)]" />
 
         <svg viewBox="-32 -32 64 64" className="absolute inset-0 h-full w-full overflow-visible">
           <defs>
             <radialGradient id={`absorber-${id}`} cx="50%" cy="50%" r="50%">
-              <stop offset="0%" stopColor="#ffffff" stopOpacity="0.0" />
-              <stop offset="60%" stopColor="#ffffff" stopOpacity="0.05" />
-              <stop offset="100%" stopColor="#ffffff" stopOpacity="0" />
+              <stop offset="0%" stopColor={ink} stopOpacity="0.0" />
+              <stop offset="60%" stopColor={ink} stopOpacity={theme === "light" ? "0.12" : "0.05"} />
+              <stop offset="100%" stopColor={ink} stopOpacity="0" />
             </radialGradient>
             <radialGradient id={`absorber-core-${id}`} cx="50%" cy="50%" r="50%">
-              <stop offset="0%" stopColor="#ffffff" stopOpacity="1" />
-              <stop offset="40%" stopColor="#ffffff" stopOpacity="0.6" />
-              <stop offset="100%" stopColor="#ffffff" stopOpacity="0" />
+              <stop offset="0%" stopColor={ink} stopOpacity="1" />
+              <stop offset="40%" stopColor={ink} stopOpacity="0.6" />
+              <stop offset="100%" stopColor={ink} stopOpacity="0" />
             </radialGradient>
           </defs>
 
@@ -94,7 +94,7 @@ function MinimalNode({ id, selected, directoryName, onSelect, onOpenChat, onDele
                 cx="0"
                 cy="0"
                 r="1.2"
-                fill="#ffffff"
+                fill={ink}
                 opacity="0.85"
                 style={{
                   transformOrigin: "0 0",
@@ -117,7 +117,7 @@ function MinimalNode({ id, selected, directoryName, onSelect, onOpenChat, onDele
             }}
           />
 
-          <circle cx="0" cy="0" r="2.5" fill="#ffffff" />
+          <circle cx="0" cy="0" r="2.5" fill={ink} />
 
           {selected && (
             <circle
@@ -125,7 +125,7 @@ function MinimalNode({ id, selected, directoryName, onSelect, onOpenChat, onDele
               cy="0"
               r="18"
               fill="none"
-              stroke="#ffffff"
+              stroke={ink}
               strokeWidth="0.5"
               strokeDasharray="2 3"
               style={{
@@ -159,8 +159,8 @@ function MinimalNode({ id, selected, directoryName, onSelect, onOpenChat, onDele
         `}</style>
       </div>
 
-      <span className="truncate font-mono text-[10px] text-[#a0a0a0]">{directoryName}</span>
-      <DeleteButton onDelete={onDelete} nodeId={id} directoryName={directoryName} tone="dark" />
+      <span className="truncate font-mono text-[10px] text-[var(--text-subtle)]">{directoryName}</span>
+      <DeleteButton onDelete={onDelete} nodeId={id} directoryName={directoryName} />
     </div>
   );
 }
@@ -178,29 +178,29 @@ function TuiNode({ id, selected, directoryName, onSelect, onOpenChat, onDelete }
     <div className="group flex flex-col items-stretch gap-0">
       <div
         className={cn(
-          "relative flex h-16 w-32 cursor-pointer flex-col justify-between border bg-black px-2 py-1 font-mono text-[10px]",
+          "relative flex h-16 w-32 cursor-pointer flex-col justify-between border px-2 py-1 font-mono text-[10px]",
           selected
-            ? "border-[#7ddc8a] text-[#7ddc8a]"
-            : "border-[#2a2a2a] text-[#737373] hover:border-[#4a4a4a] hover:text-[#bdbdbd]",
+            ? "border-[var(--node-focus)] bg-[var(--node-bg)] text-[var(--node-focus)]"
+            : "border-[var(--node-border)] bg-[var(--node-bg)] text-[var(--node-muted)] hover:border-[var(--node-border-hover)] hover:text-[var(--node-secondary)]",
         )}
         onClick={() => onSelect(id)}
         onDoubleClick={() => onOpenChat(id)}
       >
-        <Handle type="target" position={Position.Top} className="!h-1 !w-1 !border-0 !bg-[#737373]" />
-        <Handle type="source" position={Position.Bottom} className="!h-1 !w-1 !border-0 !bg-[#737373]" />
+        <Handle type="target" position={Position.Top} className="!h-1 !w-1 !border-0 !bg-[var(--node-muted)]" />
+        <Handle type="source" position={Position.Bottom} className="!h-1 !w-1 !border-0 !bg-[var(--node-muted)]" />
 
         <div className="flex items-center justify-between text-[9px] uppercase tracking-[0.18em] opacity-70">
           <span>session</span>
-          <span className={cn("h-1.5 w-1.5 rounded-full", selected ? "bg-[#7ddc8a]" : "bg-[#737373]")} />
+          <span className={cn("h-1.5 w-1.5 rounded-full", selected ? "bg-[var(--node-focus)]" : "bg-[var(--node-muted)]")} />
         </div>
 
         <div className="flex items-center gap-1 truncate">
-          <span className={cn(selected ? "text-[#7ddc8a]" : "text-[#bdbdbd]")}>&gt;</span>
+          <span className={cn(selected ? "text-[var(--node-focus)]" : "text-[var(--node-secondary)]")}>&gt;</span>
           <span className="truncate">{directoryName}</span>
           <span
             className={cn(
               "ml-auto",
-              selected ? "text-[#7ddc8a]" : "text-[#737373]",
+              selected ? "text-[var(--node-focus)]" : "text-[var(--node-muted)]",
             )}
             style={{ animation: `tui-cursor-${id} 1s steps(1) infinite` }}
           >
@@ -215,7 +215,7 @@ function TuiNode({ id, selected, directoryName, onSelect, onOpenChat, onDelete }
 
         {selected && (
           <div
-            className="pointer-events-none absolute inset-0 border border-[#7ddc8a]"
+            className="pointer-events-none absolute inset-0 border border-[var(--node-focus)]"
             style={{ animation: `tui-scan-${id} 2.4s linear infinite` }}
           />
         )}
@@ -233,15 +233,16 @@ function TuiNode({ id, selected, directoryName, onSelect, onOpenChat, onDelete }
         `}</style>
       </div>
 
-      <DeleteButton onDelete={onDelete} nodeId={id} directoryName={directoryName} tone="light" />
+      <DeleteButton onDelete={onDelete} nodeId={id} directoryName={directoryName} />
     </div>
   );
 }
 
-function DefaultNode({ id, selected, directoryName, onSelect, onOpenChat, onDelete }: {
+function DefaultNode({ id, selected, directoryName, theme, onSelect, onOpenChat, onDelete }: {
   id: string;
   selected: boolean | undefined;
   directoryName: string;
+  theme: "dark" | "light";
   onSelect: (id: string) => void;
   onOpenChat: (id: string) => void;
   onDelete?: (id: string) => void;
@@ -251,33 +252,40 @@ function DefaultNode({ id, selected, directoryName, onSelect, onOpenChat, onDele
       <div
         className={cn(
           "relative flex h-10 w-10 cursor-pointer items-center justify-center rounded-full",
-          selected && "ring-2 ring-white ring-offset-2 ring-offset-black",
+          selected && "ring-2 ring-[var(--node-ink)] ring-offset-2 ring-offset-[var(--canvas-bg)]",
         )}
         onClick={() => onSelect(id)}
         onDoubleClick={() => onOpenChat(id)}
       >
-        <Handle type="target" position={Position.Top} className="!border-black !bg-white" />
-        <svg viewBox="0 0 24 24" className="h-5 w-5">
-          <defs>
-            <radialGradient id={`diffuse-${id}`} cx="50%" cy="50%" r="50%">
-              <stop offset="0%" stopColor="#ffffff" stopOpacity="0.9" />
-              <stop offset="70%" stopColor="#ffffff" stopOpacity="0.22" />
-              <stop offset="100%" stopColor="#ffffff" stopOpacity="0" />
-            </radialGradient>
-          </defs>
-          <circle cx="12" cy="12" r="10" fill={`url(#diffuse-${id})`} />
-          <circle cx="12" cy="12" r="3" fill="#ffffff" />
+        <Handle type="target" position={Position.Top} className="!border-[var(--canvas-bg)] !bg-[var(--node-ink)]" />
+        <svg viewBox="-12 -12 48 48" className="h-8 w-8 overflow-visible">
+          <circle
+            cx="12"
+            cy="12"
+            r="16"
+            fill={theme === "light" ? "#000000" : "#ffffff"}
+            opacity="0.08"
+            style={{ animation: `session-node-glow-${id} 2.4s ease-in-out infinite` }}
+          />
+          <circle cx="12" cy="12" r="10" fill={theme === "light" ? "#000000" : "#ffffff"} />
+          <circle cx="12" cy="12" r="6.5" fill={theme === "light" ? "#ffffff" : "#000000"} />
         </svg>
-        <Handle type="source" position={Position.Bottom} className="!border-black !bg-white" />
+        <Handle type="source" position={Position.Bottom} className="!border-[var(--canvas-bg)] !bg-[var(--node-ink)]" />
+        <style>{`
+          @keyframes session-node-glow-${id} {
+            0%, 100% { opacity: 0.05; }
+            50% { opacity: 0.16; }
+          }
+        `}</style>
       </div>
-      <span className="truncate text-[10px] text-[#737373]">{directoryName}</span>
-      <DeleteButton onDelete={onDelete} nodeId={id} directoryName={directoryName} tone="dark" />
+      <span className="truncate text-[10px] text-[var(--text-muted)]">{directoryName}</span>
+      <DeleteButton onDelete={onDelete} nodeId={id} directoryName={directoryName} />
     </div>
   );
 }
 
 export function SessionNode({ id, selected, data }: NodeProps<SessionNodeData>) {
-  const { session, skin, onSelect, onOpenChat, onDelete } = data;
+  const { session, skin, theme, onSelect, onOpenChat, onDelete } = data;
   const directoryName = session.directory.split(/[\\/]/).filter(Boolean).pop() ?? session.directory;
 
   if (skin === "minimal") {
@@ -286,6 +294,7 @@ export function SessionNode({ id, selected, data }: NodeProps<SessionNodeData>) 
         id={id}
         selected={selected}
         directoryName={directoryName}
+        theme={theme}
         onSelect={onSelect}
         onOpenChat={onOpenChat}
         onDelete={onDelete}
@@ -311,6 +320,7 @@ export function SessionNode({ id, selected, data }: NodeProps<SessionNodeData>) 
       id={id}
       selected={selected}
       directoryName={directoryName}
+      theme={theme}
       onSelect={onSelect}
       onOpenChat={onOpenChat}
       onDelete={onDelete}

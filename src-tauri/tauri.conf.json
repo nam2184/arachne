@@ -25,7 +25,8 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all"
+    "targets": "all",
+    "icon": ["icons/node-web.svg"]
   },
   "plugins": {
     "fs": {

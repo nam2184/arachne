@@ -35,6 +35,8 @@ type AgentLlmEvent = {
   provider_executed?: boolean | null;
 };
 
+type StreamingTextPart = Extract<ChatMessagePart, { type: "text" | "reasoning" }>;
+
 export type AgentStreamEvent =
   | { type: "started"; session_id: string }
   | { type: "llm_event"; session_id: string; step: number; event: AgentLlmEvent }
@@ -137,54 +139,76 @@ class ThinkSplitter {
   private buffer = "";
   private visible = "";
   private reasoning = "";
+  private inThink = false;
 
-  feed(chunk: string): { content: string; reasoning: string } {
+  feed(chunk: string): { content: string; reasoning: string; parts: ChatMessagePart[] } {
     this.buffer += chunk;
-    this.drainComplete();
-    return this.snapshot();
+    const parts = this.drainAvailable();
+    return { ...this.snapshot(), parts };
   }
 
   snapshot(): { content: string; reasoning: string } {
     return { content: this.visible, reasoning: this.reasoning };
   }
 
-  private drainComplete() {
+  private drainAvailable(): ChatMessagePart[] {
+    const parts: ChatMessagePart[] = [];
     while (this.buffer.length > 0) {
-      const closeIdx = this.buffer.indexOf(THINK_CLOSE);
-      if (closeIdx === -1) {
-        // No close yet. Look for an open: anything before it is visible,
-        // anything from the open onward stays buffered (and will be
-        // flushed as reasoning when/if the close arrives, or as visible
-        // text if no close ever arrives).
-        const openIdx = this.buffer.indexOf(THINK_OPEN);
-        if (openIdx === -1) {
-          this.visible += this.buffer;
-          this.buffer = "";
-        } else if (openIdx > 0) {
-          this.visible += this.buffer.slice(0, openIdx);
-          this.buffer = this.buffer.slice(openIdx);
+      if (this.inThink) {
+        const closeIdx = this.buffer.indexOf(THINK_CLOSE);
+        if (closeIdx === -1) {
+          const keep = trailingTokenPrefixLength(this.buffer, THINK_CLOSE);
+          const text = this.buffer.slice(0, this.buffer.length - keep);
+          if (text) {
+            this.reasoning += text;
+            parts.push({ type: "reasoning", text });
+          }
+          this.buffer = this.buffer.slice(this.buffer.length - keep);
+          return parts;
         }
-        return;
-      }
 
-      // We have a close. Find the most recent open before it.
-      const openIdx = this.buffer.lastIndexOf(THINK_OPEN, closeIdx);
-      if (openIdx === -1) {
-        // Stray close (no matching open). Treat as visible text.
-        this.visible += this.buffer.slice(0, closeIdx + THINK_CLOSE.length);
+        const text = this.buffer.slice(0, closeIdx);
+        if (text) {
+          this.reasoning += text;
+          parts.push({ type: "reasoning", text });
+        }
         this.buffer = this.buffer.slice(closeIdx + THINK_CLOSE.length);
+        this.inThink = false;
         continue;
       }
 
-      const before = this.buffer.slice(0, openIdx);
-      const think = this.buffer.slice(openIdx + THINK_OPEN.length, closeIdx);
-      const after = this.buffer.slice(closeIdx + THINK_CLOSE.length);
+      const openIdx = this.buffer.indexOf(THINK_OPEN);
+      if (openIdx === -1) {
+        const keep = trailingTokenPrefixLength(this.buffer, THINK_OPEN);
+        const text = this.buffer.slice(0, this.buffer.length - keep);
+        if (text) {
+          this.visible += text;
+          parts.push({ type: "text", text });
+        }
+        this.buffer = this.buffer.slice(this.buffer.length - keep);
+        return parts;
+      }
 
-      if (before) this.visible += before;
-      if (think) this.reasoning += think;
-      this.buffer = after;
+      const text = this.buffer.slice(0, openIdx);
+      if (text) {
+        this.visible += text;
+        parts.push({ type: "text", text });
+      }
+      this.buffer = this.buffer.slice(openIdx + THINK_OPEN.length);
+      this.inThink = true;
+    }
+    return parts;
+  }
+}
+
+function trailingTokenPrefixLength(value: string, token: string): number {
+  const max = Math.min(value.length, token.length - 1);
+  for (let length = max; length > 0; length -= 1) {
+    if (value.endsWith(token.slice(0, length))) {
+      return length;
     }
   }
+  return 0;
 }
 
 function createTempMessage(role: ConversationMessage["role"], content: string): ConversationMessage {
@@ -236,14 +260,27 @@ function appendPart(parts: ChatMessagePart[] | undefined, part: ChatMessagePart)
   return [...current, part];
 }
 
-function setTextPart(parts: ChatMessagePart[] | undefined, text: string): ChatMessagePart[] | undefined {
-  if (!text) return parts;
+function isStreamingTextPart(part: ChatMessagePart | undefined): part is StreamingTextPart {
+  return part?.type === "text" || part?.type === "reasoning";
+}
+
+function appendStreamingPart(parts: ChatMessagePart[] | undefined, part: ChatMessagePart): ChatMessagePart[] | undefined {
+  if (!isStreamingTextPart(part) || !part.text) return parts;
   const current = parts ?? [];
-  const textIndex = current.findIndex((part) => part.type === "text");
-  if (textIndex === -1) {
-    return [{ type: "text", text }, ...current];
+  const last = current[current.length - 1];
+  if (isStreamingTextPart(last) && last.type === part.type) {
+    return current.map((existing, index) =>
+      index === current.length - 1 ? { type: part.type, text: last.text + part.text } : existing,
+    );
   }
-  return current.map((part, index) => (index === textIndex ? { type: "text", text } : part));
+  return [...current, part];
+}
+
+function appendStreamingParts(parts: ChatMessagePart[] | undefined, nextParts: ChatMessagePart[]): ChatMessagePart[] | undefined {
+  return nextParts.reduce<ChatMessagePart[] | undefined>(
+    (current, part) => appendStreamingPart(current, part),
+    parts,
+  );
 }
 
 function normalizeConversation(conv: ConversationFile): ConversationFile {
@@ -380,7 +417,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
               ...current,
               content: snapshot.content,
               reasoning: snapshot.reasoning,
-              parts: setTextPart(current.parts, snapshot.content),
+              parts: appendStreamingParts(current.parts, snapshot.parts),
             };
           },
         );
@@ -394,7 +431,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           (current) => ({
             ...current,
             reasoning: (current.reasoning ?? "") + (event.event.text ?? ""),
-            parts: appendPart(current.parts, { type: "reasoning", text: event.event.text ?? "" }),
+            parts: appendStreamingPart(current.parts, { type: "reasoning", text: event.event.text ?? "" }),
           }),
         );
         return { activeConversation: conversation, streamingMessageId };
