@@ -73,6 +73,11 @@ exposed to the frontend as `#[tauri::command]` functions in
 
 ## Development
 
+On Windows, install **Visual Studio Installer** and add the **Desktop development
+with C++** workload before running Tauri. That workload includes the MSVC build
+tools, Windows SDK, CMake tools, and related native build dependencies Tauri/Rust
+may need.
+
 ```bash
 # Install dependencies
 npm install
