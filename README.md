@@ -1,15 +1,8 @@
 # Arachne
 
-```
-                         █████╗ ██████╗  █████╗  ██████╗██╗  ██╗███╗   ██╗███████╗
-                        ██╔══██╗██╔══██╗██╔══██╗██╔════╝██║  ██║████╗  ██║██╔════╝
-                        ███████║██████╔╝███████║██║     ███████║██╔██╗ ██║█████╗  
-                        ██╔══██║██╔══██╗██╔══██║██║     ██╔══██║██║╚██╗██║██╔══╝  
-                        ██║  ██║██║  ██║██║  ██║╚██████╗██║  ██║██║ ╚████║███████╗
-                        ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝
-```
-
-> _A network-weaving AI coding agent — many threads, one web._
+<p align="center">
+  <img src="src-tauri/icons/node-web.svg" alt="Arachne node web logo" width="128" height="128" />
+</p>
 
 Arachne is an open-source AI coding agent that lets you spin up multiple LLM
 sessions, lay them out on a visual canvas as a graph, and have them share
