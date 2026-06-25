@@ -7,6 +7,23 @@
     --background: #000000;
     --foreground: #ffffff;
     --border: #1f1f1f;
+    --surface: #050505;
+    --surface-raised: #0a0a0a;
+    --surface-soft: #111111;
+    --text-muted: #737373;
+    --text-subtle: #a0a0a0;
+    --text-secondary: #d4d4d4;
+    --canvas-bg: #000000;
+    --canvas-grid: #1f1f1f;
+    --node-bg: #000000;
+    --node-border: #1f1f1f;
+    --node-border-hover: #2a2a2a;
+    --node-muted: #737373;
+    --node-secondary: #bdbdbd;
+    --node-focus: #7ddc8a;
+    --node-ink: #ffffff;
+    --edge-session: #f5f5f5;
+    --edge-loop: #7ddc8a;
     --input-bg: #000000;
     --input-border: #2a2a2a;
     --accent: #2a2a2a;
@@ -14,9 +31,26 @@
   }
 
   :root.light {
-    --background: #ffffff;
-    --foreground: #000000;
-    --border: #e5e5e5;
+    --background: #f8f6f1;
+    --foreground: #171717;
+    --border: #ded8ce;
+    --surface: #f0ece3;
+    --surface-raised: #fffdf8;
+    --surface-soft: #ebe5da;
+    --text-muted: #766f64;
+    --text-subtle: #5f574d;
+    --text-secondary: #332f29;
+    --canvas-bg: #f6f1e8;
+    --canvas-grid: #ded4c4;
+    --node-bg: #fffdf8;
+    --node-border: #d7ccba;
+    --node-border-hover: #b7aa96;
+    --node-muted: #766f64;
+    --node-secondary: #4c453c;
+    --node-focus: #087a3a;
+    --node-ink: #1f1a14;
+    --edge-session: #4c453c;
+    --edge-loop: #087a3a;
     --input-bg: #ffffff;
     --input-border: #d4d4d4;
     --accent: #f5f5f5;

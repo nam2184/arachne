@@ -56,14 +56,14 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
   };
 
   return (
-    <aside className="flex w-[200px] shrink-0 flex-col border-r border-[#1f1f1f] bg-[#050505]">
+    <aside className="flex w-[200px] shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)]">
       <div className="p-4 pb-2">
         <div className="flex items-center justify-between">
-          <h2 className="text-xs font-semibold uppercase tracking-wide text-[#737373]">Projects</h2>
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">Projects</h2>
           <Button
             variant="ghost"
             size="icon"
-            className="h-7 w-7 bg-transparent text-[#737373] hover:bg-transparent hover:text-white"
+            className="h-7 w-7 bg-transparent text-[var(--text-muted)] hover:bg-transparent hover:text-[var(--foreground)]"
             onClick={() => setIsAddingProject((value) => !value)}
             aria-label="Add project"
           >
@@ -102,7 +102,7 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
         <ScrollArea className="h-full">
           <div className="space-y-2 pr-2">
             {sortedProjects.length === 0 ? (
-              <p className="text-xs text-[#737373]">
+              <p className="text-xs text-[var(--text-muted)]">
                 No projects yet. Create a project before adding sessions.
               </p>
             ) : (
@@ -110,8 +110,8 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
                 <button
                   key={item.id}
                   className={cn(
-                    "flex w-full items-center gap-2 bg-transparent p-2 text-left transition-colors hover:text-white",
-                    project?.id === item.id ? "text-white" : "text-[#737373]",
+                    "flex w-full items-center gap-2 bg-transparent p-2 text-left transition-colors hover:bg-[var(--surface-raised)] hover:text-[var(--foreground)]",
+                    project?.id === item.id ? "text-[var(--foreground)]" : "text-[var(--text-muted)]",
                   )}
                   onClick={() => setCurrentProject(item)}
                 >
@@ -124,7 +124,7 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
         </ScrollArea>
       </div>
       <div className="p-4">
-        <Button variant="ghost" className="w-full justify-start gap-2 bg-transparent p-2 text-[#737373] hover:bg-transparent hover:text-white" onClick={onOpenSettings}>
+        <Button variant="ghost" className="w-full justify-start gap-2 bg-transparent p-2 text-[var(--text-muted)] hover:bg-[var(--surface-raised)] hover:text-[var(--foreground)]" onClick={onOpenSettings}>
           <Settings className="h-3.5 w-3.5" />
           <span className="text-sm font-medium">Settings</span>
         </Button>

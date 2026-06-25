@@ -153,8 +153,8 @@ export function SettingsPage() {
   const modelMaxOutput = selectedSpec?.max_output ?? getMaxOutput(providerDraft.model);
 
   return (
-    <div className="flex h-full flex-col bg-black text-white">
-      <header className="flex items-center gap-4 border-b border-[#1f1f1f] px-6 py-4">
+    <div className="flex h-full flex-col bg-[var(--background)] text-[var(--foreground)]">
+      <header className="flex items-center gap-4 border-b border-[var(--border)] px-6 py-4">
         <Button variant="ghost" size="icon" onClick={() => setView("canvas")} aria-label="Back to canvas">
           <ArrowLeft className="h-5 w-5" />
         </Button>
@@ -167,12 +167,12 @@ export function SettingsPage() {
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-2xl space-y-8 p-6">
           <section className="space-y-4">
-            <h2 className="text-sm font-medium text-[#d4d4d4]">Appearance</h2>
-            <div className="rounded-none border border-[#1f1f1f] bg-[#0a0a0a] p-4">
+            <h2 className="text-sm font-medium text-[var(--text-secondary)]">Appearance</h2>
+            <div className="rounded-none border border-[var(--border)] bg-[var(--surface-raised)] p-4">
               <div className="flex items-center justify-between">
                 <div>
                   <p className="text-sm font-medium">Theme</p>
-                  <p className="text-xs text-[#8a8a8a]">Choose your preferred color scheme</p>
+                  <p className="text-xs text-[var(--text-subtle)]">Choose your preferred color scheme</p>
                 </div>
                 <Button variant="secondary" size="icon" onClick={handleThemeToggle}>
                   {settings.theme === "dark" ? (
@@ -186,8 +186,8 @@ export function SettingsPage() {
           </section>
 
           <section className="space-y-4">
-            <h2 className="text-sm font-medium text-[#d4d4d4]">Node Style</h2>
-            <p className="text-xs text-[#8a8a8a]">Choose how session nodes render on the canvas.</p>
+            <h2 className="text-sm font-medium text-[var(--text-secondary)]">Node Style</h2>
+            <p className="text-xs text-[var(--text-subtle)]">Choose how session nodes render on the canvas.</p>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
               <NodeSkinCard
                 skin="default"
@@ -220,14 +220,14 @@ export function SettingsPage() {
           </section>
 
           <section className="space-y-4">
-            <h2 className="text-sm font-medium text-[#d4d4d4]">Web Search</h2>
-            <div className="space-y-4 rounded-none border border-[#1f1f1f] bg-[#0a0a0a] p-4">
+            <h2 className="text-sm font-medium text-[var(--text-secondary)]">Web Search</h2>
+            <div className="space-y-4 rounded-none border border-[var(--border)] bg-[var(--surface-raised)] p-4">
               <div>
                 <p className="text-sm font-medium">SearXNG JSON API</p>
-                <p className="text-xs text-[#8a8a8a]">Used by the agent websearch tool. Leave blank to disable web search.</p>
+                <p className="text-xs text-[var(--text-subtle)]">Used by the agent websearch tool. Leave blank to disable web search.</p>
               </div>
               <label className="block space-y-1.5">
-                <span className="text-xs font-medium text-[#d4d4d4]">Base URL</span>
+                <span className="text-xs font-medium text-[var(--text-secondary)]">Base URL</span>
                 <Input
                   value={searxngBaseUrl}
                   onChange={(event: ChangeEvent<HTMLInputElement>) => setSearxngBaseUrl(event.target.value)}
@@ -235,7 +235,7 @@ export function SettingsPage() {
                 />
               </label>
               <label className="block space-y-1.5">
-                <span className="text-xs font-medium text-[#d4d4d4]">Max Results</span>
+                <span className="text-xs font-medium text-[var(--text-secondary)]">Max Results</span>
                 <Input
                   type="number"
                   min={1}
@@ -249,19 +249,19 @@ export function SettingsPage() {
                 Save Web Search
               </Button>
               {(websearchStatus || websearchError) && (
-                <p className={cn("text-xs", websearchError ? "text-[#ff5f5f]" : "text-[#bdbdbd]")}>{websearchError ?? websearchStatus}</p>
+                <p className={cn("text-xs", websearchError ? "text-[#ff5f5f]" : "text-[var(--text-secondary)]")}>{websearchError ?? websearchStatus}</p>
               )}
             </div>
           </section>
 
           <section className="space-y-4">
-            <h2 className="text-sm font-medium text-[#d4d4d4]">AI Configuration</h2>
-            <div className="space-y-4 rounded-none border border-[#1f1f1f] bg-[#0a0a0a] p-4">
+            <h2 className="text-sm font-medium text-[var(--text-secondary)]">AI Configuration</h2>
+            <div className="space-y-4 rounded-none border border-[var(--border)] bg-[var(--surface-raised)] p-4">
               <div className="flex gap-2">
                 <select
                   value={selectedProviderName}
                   onChange={(event) => selectProvider(event.target.value)}
-                  className="h-9 min-w-0 flex-1 rounded-none border border-[#1f1f1f] bg-black px-3 text-sm text-white outline-none transition-colors hover:border-[#2a2a2a] focus:border-white"
+                  className="h-9 min-w-0 flex-1 rounded-none border border-[var(--input-border)] bg-[var(--input-bg)] px-3 text-sm text-[var(--foreground)] outline-none transition-colors hover:border-[var(--node-border-hover)] focus:border-[var(--foreground)]"
                 >
                   {providers.map((provider) => (
                     <option key={provider.name} value={provider.name}>{provider.name}</option>
@@ -283,7 +283,7 @@ export function SettingsPage() {
               </div>
 
               <label className="block space-y-1.5">
-                <span className="text-xs font-medium text-[#d4d4d4]">Name</span>
+                <span className="text-xs font-medium text-[var(--text-secondary)]">Name</span>
                 <Input
                   value={providerDraft.name}
                   onChange={(event: ChangeEvent<HTMLInputElement>) => {
@@ -299,22 +299,22 @@ export function SettingsPage() {
                 />
               </label>
               <label className="block space-y-1.5">
-                <span className="text-xs font-medium text-[#d4d4d4]">Protocol</span>
+                <span className="text-xs font-medium text-[var(--text-secondary)]">Protocol</span>
                 <select
                   value={providerDraft.protocol}
                   onChange={(event: ChangeEvent<HTMLSelectElement>) => setProviderDraft((draft) => ({ ...draft, protocol: event.target.value as ProviderDraft["protocol"] }))}
-                  className="h-9 w-full rounded-none border border-[#1f1f1f] bg-black px-3 text-sm text-white outline-none transition-colors hover:border-[#2a2a2a] focus:border-white"
+                  className="h-9 w-full rounded-none border border-[var(--input-border)] bg-[var(--input-bg)] px-3 text-sm text-[var(--foreground)] outline-none transition-colors hover:border-[var(--node-border-hover)] focus:border-[var(--foreground)]"
                 >
                   <option value="openai">OpenAI-compatible chat</option>
                   <option value="anthropic">Anthropic messages</option>
                 </select>
               </label>
               <label className="block space-y-1.5">
-                <span className="text-xs font-medium text-[#d4d4d4]">Default Model</span>
+                <span className="text-xs font-medium text-[var(--text-secondary)]">Default Model</span>
                 <select
                   value={providerDraft.model}
                   onChange={(event: ChangeEvent<HTMLSelectElement>) => setProviderDraft((draft) => ({ ...draft, model: event.target.value }))}
-                  className="h-9 w-full rounded-none border border-[#1f1f1f] bg-black px-3 text-sm text-white outline-none transition-colors hover:border-[#2a2a2a] focus:border-white disabled:cursor-not-allowed disabled:opacity-50"
+                  className="h-9 w-full rounded-none border border-[var(--input-border)] bg-[var(--input-bg)] px-3 text-sm text-[var(--foreground)] outline-none transition-colors hover:border-[var(--node-border-hover)] focus:border-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-50"
                   disabled={modelOptions.length === 0}
                 >
                   {modelOptions.length === 0 ? (
@@ -327,7 +327,7 @@ export function SettingsPage() {
                 </select>
               </label>
               <label className="block space-y-1.5">
-                <span className="text-xs font-medium text-[#d4d4d4]">API Key</span>
+                <span className="text-xs font-medium text-[var(--text-secondary)]">API Key</span>
                 <Input
                   type="password"
                   value={providerDraft.api_key}
@@ -336,20 +336,20 @@ export function SettingsPage() {
                 />
               </label>
               <label className="block space-y-1.5">
-                <span className="text-xs font-medium text-[#d4d4d4]">Base URL</span>
+                <span className="text-xs font-medium text-[var(--text-secondary)]">Base URL</span>
                 <Input
                   value={providerDraft.base_url}
                   onChange={(event: ChangeEvent<HTMLInputElement>) => setProviderDraft((draft) => ({ ...draft, base_url: event.target.value }))}
                   placeholder="Optional provider endpoint"
                 />
               </label>
-              <div className="rounded-none border border-[#1f1f1f] bg-[#050505] p-3 text-xs text-[#bdbdbd]">
-                <p className="text-[10px] uppercase tracking-wider text-[#737373]">Context budget (from model spec)</p>
+              <div className="rounded-none border border-[var(--border)] bg-[var(--surface)] p-3 text-xs text-[var(--text-secondary)]">
+                <p className="text-[10px] uppercase tracking-wider text-[var(--text-muted)]">Context budget (from model spec)</p>
                 <p className="mt-1">
-                  Window: <span className="text-white">{modelContextWindow.toLocaleString()}</span> tokens
+                  Window: <span className="text-[var(--foreground)]">{modelContextWindow.toLocaleString()}</span> tokens
                 </p>
                 <p>
-                  Max output: <span className="text-white">{modelMaxOutput.toLocaleString()}</span> tokens
+                  Max output: <span className="text-[var(--foreground)]">{modelMaxOutput.toLocaleString()}</span> tokens
                 </p>
                 {!selectedSpec && providerDraft.model && (
                   <p className="mt-1 text-[#ff8a3d]">
@@ -357,12 +357,12 @@ export function SettingsPage() {
                   </p>
                 )}
               </div>
-              <label className="flex items-center gap-2 text-sm text-[#d4d4d4]">
+              <label className="flex items-center gap-2 text-sm text-[var(--text-secondary)]">
                 <input
                   type="checkbox"
                   checked={providerDraft.enabled}
                   onChange={(event) => setProviderDraft((draft) => ({ ...draft, enabled: event.target.checked }))}
-                  className="h-4 w-4 rounded-none border-[#1f1f1f] bg-black accent-white"
+                  className="h-4 w-4 rounded-none border-[var(--border)] bg-[var(--input-bg)] accent-[var(--foreground)]"
                 />
                 Enabled for new sessions
               </label>
@@ -372,7 +372,7 @@ export function SettingsPage() {
               </Button>
 
               {(status || error) && (
-                <p className={cn("text-xs", error ? "text-[#ff5f5f]" : "text-[#bdbdbd]")}>{error ?? status}</p>
+                <p className={cn("text-xs", error ? "text-[#ff5f5f]" : "text-[var(--text-secondary)]")}>{error ?? status}</p>
               )}
             </div>
           </section>

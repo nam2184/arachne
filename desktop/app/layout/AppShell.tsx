@@ -14,7 +14,7 @@ export function AppShell() {
   }, [loadSettings]);
 
   return (
-    <div className="flex h-screen overflow-hidden bg-black text-white">
+    <div className="flex h-screen overflow-hidden bg-[var(--background)] text-[var(--foreground)]">
       <ProjectSidebar project={currentProject} onOpenSettings={() => setView("settings")} />
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         {view === "settings" ? <SettingsPage /> : <SessionWorkspace />}

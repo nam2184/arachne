@@ -3,8 +3,10 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Plus } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { LoopConfigDialog } from "@/components/loops";
 import { PermissionPromptBar, SessionCanvas, SessionChat, DeleteSessionDialog } from "@/components/sessions";
 import { Button } from "@/components/ui/button";
+import { useLoopStore, type LoopInput } from "@/features/loops/loopStore";
 import { useProjectStore } from "@/features/project/projectStore";
 import { usePermissionStore } from "@/features/permissions/permissionStore";
 import { useConversationStore, type AgentStreamEvent } from "@/features/sessions/conversationStore";
@@ -24,6 +26,14 @@ export function SessionWorkspace() {
     updateSessionProvider,
   } = useSessionStore();
   const {
+    appendSessionToLoop,
+    createLoop,
+    deleteLoop,
+    initialize: initializeLoops,
+    loops,
+    updateLoop,
+  } = useLoopStore();
+  const {
     activeConversation,
     applyAgentEvent,
     beginStreamingMessage,
@@ -42,8 +52,13 @@ export function SessionWorkspace() {
   const [error, setError] = useState<string | null>(null);
   const [chatSessionId, setChatSessionId] = useState<string | null>(null);
   const [sessionPendingDelete, setSessionPendingDelete] = useState<string | null>(null);
+  const [isAddMenuOpen, setIsAddMenuOpen] = useState(false);
+  const [isLoopDialogOpen, setIsLoopDialogOpen] = useState(false);
+  const [configuringLoopId, setConfiguringLoopId] = useState<string | null>(null);
+  const [focusRequest, setFocusRequest] = useState<{ sessionId: string; nonce: number } | null>(null);
   const sendQueuesRef = useRef(new Map<string, Array<{ content: string; mode: "plan" | "build" }>>());
   const processingSessionsRef = useRef(new Set<string>());
+  const creatingSessionRef = useRef(false);
   const chatSessionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -56,6 +71,10 @@ export function SessionWorkspace() {
       console.error("Failed to initialize sessions:", initError);
     });
   }, [initialize]);
+
+  useEffect(() => {
+    initializeLoops();
+  }, [initializeLoops]);
 
   useEffect(() => {
     let dispose: (() => void) | undefined;
@@ -116,27 +135,59 @@ export function SessionWorkspace() {
     );
   }, [currentProject, sessions]);
 
+  const projectLoops = useMemo(() => {
+    if (!currentProject) return new Map();
+
+    return new Map(
+      Array.from(loops.entries()).filter(([, loop]) => loop.project_id === currentProject.id),
+    );
+  }, [currentProject, loops]);
+
   const createSessionNode = async () => {
+    if (creatingSessionRef.current) return;
+
     if (!currentProject) {
       setError("Create or select a project before adding sessions.");
       return;
     }
 
-    const directory = await open({ directory: true });
-    if (!directory) return;
-
-    setIsCreating(true);
+    creatingSessionRef.current = true;
     setError(null);
 
     try {
-      await createSession(currentProject.id, directory);
+      const selection = await open({ directory: true, multiple: false });
+      const directory = Array.isArray(selection) ? selection[0] : selection;
+      if (!directory) return;
+
+      setIsCreating(true);
+      const sessionId = await createSession(currentProject.id, directory);
+      setFocusRequest((current) => ({
+        sessionId,
+        nonce: (current?.nonce ?? 0) + 1,
+      }));
     } catch (createError) {
       setError(formatError(createError));
       console.error("Failed to create session:", createError);
     } finally {
+      creatingSessionRef.current = false;
       setIsCreating(false);
     }
   };
+
+  const toggleAddMenu = useCallback(() => {
+    setIsAddMenuOpen((open) => !open);
+  }, []);
+
+  const chooseSession = useCallback(() => {
+    setIsAddMenuOpen(false);
+    void createSessionNode();
+  }, [currentProject, createSession, setFocusRequest]);
+
+  const chooseLoop = useCallback(() => {
+    setIsAddMenuOpen(false);
+    setConfiguringLoopId(null);
+    setIsLoopDialogOpen(true);
+  }, []);
 
   const selectSession = useCallback((id: string) => {
     setActiveSession(id);
@@ -180,6 +231,32 @@ export function SessionWorkspace() {
       console.error("Failed to update session group:", groupError);
     });
   }, [addSessionToGroup, createGroup, groups, sessions]);
+
+  const openConfigureLoopDialog = useCallback((id: string) => {
+    setConfiguringLoopId(id);
+    setIsLoopDialogOpen(true);
+  }, []);
+
+  const closeLoopDialog = useCallback(() => {
+    setIsLoopDialogOpen(false);
+    setConfiguringLoopId(null);
+  }, []);
+
+  const saveLoop = useCallback((input: LoopInput) => {
+    if (configuringLoopId) {
+      updateLoop(configuringLoopId, input);
+    } else if (currentProject) {
+      createLoop(currentProject.id, input);
+    }
+    closeLoopDialog();
+  }, [closeLoopDialog, configuringLoopId, createLoop, currentProject, updateLoop]);
+
+  const removeLoop = useCallback((id: string) => {
+    deleteLoop(id);
+    if (configuringLoopId === id) {
+      closeLoopDialog();
+    }
+  }, [closeLoopDialog, configuringLoopId, deleteLoop]);
 
   const setSessionRunning = useCallback((sessionId: string, running: boolean) => {
     setRunningSessionIds((current) => {
@@ -289,6 +366,7 @@ export function SessionWorkspace() {
   const sessionPendingDeleteLabel = sessionPendingDelete
     ? (sessions.get(sessionPendingDelete)?.directory ?? null)
     : null;
+  const configuringLoop = configuringLoopId ? loops.get(configuringLoopId) ?? null : null;
 
   const requestDeleteSession = useCallback((id: string) => {
     setSessionPendingDelete(id);
@@ -316,29 +394,56 @@ export function SessionWorkspace() {
   }, [chatSessionId, clearConversation, deleteSession, setActiveSession, setSessionQueuedCount, setSessionRunning]);
 
   return (
-    <section className="flex h-screen min-w-0 flex-1 flex-col bg-black">
+    <section className="flex h-screen min-w-0 flex-1 flex-col bg-[var(--background)]">
       <div className="relative flex min-h-0 flex-1">
         <div className="pointer-events-none absolute right-4 top-4 z-20 flex flex-col items-end gap-2">
           <Button
             size="icon"
-            className="pointer-events-auto h-9 w-9 rounded-none border border-[#1f1f1f] bg-[#0a0a0a] text-white shadow-none hover:border-[#2a2a2a] hover:bg-[#111111]"
-            onClick={createSessionNode}
-            disabled={isCreating || !currentProject}
-            aria-label="Add session"
-            title="Add session"
+            className="pointer-events-auto h-9 w-9 rounded-none border border-black bg-black text-white shadow-none hover:border-black hover:bg-black"
+            onClick={toggleAddMenu}
+            disabled={!currentProject}
+            aria-label="Add to canvas"
+            aria-expanded={isAddMenuOpen}
+            title={isCreating ? "Adding session" : "Add session or loop"}
           >
             <Plus className="h-5 w-5" />
           </Button>
-          {error && <span className="pointer-events-auto max-w-[320px] rounded-none border border-[#1f1f1f] bg-black px-3 py-2 text-xs text-[#ff5f5f] shadow-none">{error}</span>}
+          {isAddMenuOpen && (
+            <div className="pointer-events-auto grid w-40 gap-1 border border-[var(--border)] bg-[var(--surface-raised)] p-1 shadow-[0_18px_60px_rgba(0,0,0,0.18)]" role="menu">
+              <button
+                type="button"
+                onClick={chooseSession}
+                disabled={isCreating}
+                className="h-8 px-2 text-left text-xs text-[var(--foreground)] hover:bg-[var(--surface-soft)] disabled:cursor-not-allowed disabled:opacity-50"
+                role="menuitem"
+              >
+                Session
+              </button>
+              <button
+                type="button"
+                onClick={chooseLoop}
+                className="h-8 px-2 text-left text-xs text-[var(--foreground)] hover:bg-[var(--surface-soft)]"
+                role="menuitem"
+              >
+                Loop container
+              </button>
+            </div>
+          )}
+          {error && <span className="pointer-events-auto max-w-[320px] rounded-none border border-[var(--border)] bg-[var(--surface-raised)] px-3 py-2 text-xs text-[#ff5f5f] shadow-none">{error}</span>}
         </div>
         <div className="min-w-0 flex-1 overflow-hidden">
           <SessionCanvas
             sessions={projectSessions}
             groups={groups}
+            loops={projectLoops}
             onConnectSessions={connectSessions}
+            onAppendSessionToLoop={appendSessionToLoop}
             onOpenSessionChat={openSessionChat}
             onSelectSession={selectSession}
             onDeleteSession={requestDeleteSession}
+            onConfigureLoop={openConfigureLoopDialog}
+            onDeleteLoop={removeLoop}
+            focusRequest={focusRequest}
           />
         </div>
       </div>
@@ -363,6 +468,12 @@ export function SessionWorkspace() {
         sessionLabel={sessionPendingDeleteLabel}
         onCancel={cancelDeleteSession}
         onConfirm={confirmDeleteSession}
+      />
+      <LoopConfigDialog
+        open={isLoopDialogOpen}
+        loop={configuringLoop}
+        onCancel={closeLoopDialog}
+        onSave={saveLoop}
       />
     </section>
   );

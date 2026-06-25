@@ -4,14 +4,14 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "@/lib/utils";
 
 const buttonVariants = cva(
-  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-none text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white disabled:pointer-events-none disabled:opacity-50",
+  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-none text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--foreground)] disabled:pointer-events-none disabled:opacity-50",
   {
     variants: {
       variant: {
-        default: "bg-white text-black hover:bg-[#d4d4d4]",
-        secondary: "border border-[#1f1f1f] bg-[#0a0a0a] text-white hover:bg-[#111111] hover:border-[#2a2a2a]",
-        ghost: "text-white hover:bg-[#0a0a0a]",
-        destructive: "bg-white text-black hover:bg-[#d4d4d4]",
+        default: "bg-[var(--foreground)] text-[var(--background)] hover:bg-[var(--text-secondary)]",
+        secondary: "border border-[var(--border)] bg-[var(--surface-raised)] text-[var(--foreground)] hover:border-[var(--node-border-hover)] hover:bg-[var(--surface-soft)]",
+        ghost: "text-[var(--foreground)] hover:bg-[var(--surface-raised)]",
+        destructive: "bg-[var(--foreground)] text-[var(--background)] hover:bg-[var(--text-secondary)]",
       },
       size: {
         default: "h-9 px-4 py-2",
