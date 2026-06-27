@@ -10,7 +10,7 @@ import { useLoopStore, type LoopInput } from "@/features/loops/loopStore";
 import { useProjectStore } from "@/features/project/projectStore";
 import { usePermissionStore } from "@/features/permissions/permissionStore";
 import { useConversationStore, type AgentStreamEvent } from "@/features/sessions/conversationStore";
-import { useSessionStore } from "@/features/sessions/sessionStore";
+import { useSessionStore, type AgentSession } from "@/features/sessions/sessionStore";
 
 interface UiCommandResult {
   status: string;
@@ -24,12 +24,14 @@ export function SessionWorkspace() {
     addSessionToGroup,
     createGroup,
     createSession,
+    createSessionChat,
     deleteSession,
     groups,
     initialize,
     sessions,
     setActiveSession,
     updateSessionProvider,
+    updateSessionTitle,
   } = useSessionStore();
   const {
     appendSessionToLoop,
@@ -139,6 +141,24 @@ export function SessionWorkspace() {
     );
   }, [currentProject, sessions]);
 
+  const rootProjectSessions = useMemo(() => (
+    new Map(Array.from(projectSessions.entries()).filter(([, session]) => !session.parent_session_id))
+  ), [projectSessions]);
+
+  const chatsByRoot = useMemo(() => {
+    const byRoot = new Map<string, AgentSession[]>();
+    for (const session of projectSessions.values()) {
+      if (!session.parent_session_id) continue;
+      const chats = byRoot.get(session.parent_session_id) ?? [];
+      chats.push(session);
+      byRoot.set(session.parent_session_id, chats);
+    }
+    for (const chats of byRoot.values()) {
+      chats.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+    }
+    return byRoot;
+  }, [projectSessions]);
+
   const projectLoops = useMemo(() => {
     if (!currentProject) return new Map();
 
@@ -198,9 +218,11 @@ export function SessionWorkspace() {
   }, [setActiveSession]);
 
   const openSessionChat = useCallback((id: string) => {
+    const chats = chatsByRoot.get(id) ?? [];
+    const chatId = chats[0]?.id ?? id;
     setActiveSession(id);
-    setChatSessionId(id);
-  }, [setActiveSession]);
+    setChatSessionId(chatId);
+  }, [chatsByRoot, sessions, setActiveSession]);
 
   const connectSessions = useCallback((sourceId: string, targetId: string) => {
     const sourceGroupId = sessions.get(sourceId)?.group_id;
@@ -345,6 +367,16 @@ export function SessionWorkspace() {
     void drainSendQueue(chatSessionId);
   }, [chatSessionId, drainSendQueue, setSessionQueuedCount]);
 
+  const createChatForCurrentSession = useCallback(async () => {
+    if (!chatSessionId) return;
+    const result = await createSessionChat(chatSessionId);
+    setChatSessionId(result.chatSessionId);
+    setFocusRequest((current) => ({
+      sessionId: result.rootSessionId,
+      nonce: (current?.nonce ?? 0) + 1,
+    }));
+  }, [chatSessionId, createSessionChat]);
+
   const closeChat = useCallback(() => {
     setChatSessionId(null);
     clearConversation();
@@ -369,14 +401,22 @@ export function SessionWorkspace() {
   }, [chatSessionId, loadUiConversation, runningSessionIds]);
 
   const chatSession = chatSessionId ? sessions.get(chatSessionId) ?? null : null;
+  const chatRootId = chatSession?.parent_session_id ?? chatSession?.id ?? null;
+  const chatRoot = chatRootId ? sessions.get(chatRootId) ?? chatSession : null;
+  const chatSiblings = chatRootId ? chatsByRoot.get(chatRootId) ?? [] : [];
+  const chatOptions = chatRoot && chatSiblings.length > 0 ? chatSiblings : chatRoot ? [chatRoot] : [];
   const isChatSending = chatSessionId ? runningSessionIds.has(chatSessionId) : false;
   const queuedMessageCount = chatSessionId ? queuedCounts.get(chatSessionId) ?? 0 : 0;
   const chatMessages = activeConversation?.session_id === chatSessionId
     ? activeConversation.messages
     : [];
 
-  const sessionPendingDeleteLabel = sessionPendingDelete
-    ? (sessions.get(sessionPendingDelete)?.directory ?? null)
+  const pendingDeleteSession = sessionPendingDelete ? sessions.get(sessionPendingDelete) ?? null : null;
+  const sessionPendingDeleteKind: "session" | "chat" = pendingDeleteSession?.parent_session_id ? "chat" : "session";
+  const sessionPendingDeleteLabel = pendingDeleteSession
+    ? pendingDeleteSession.parent_session_id
+      ? chatDisplayTitle(pendingDeleteSession)
+      : pendingDeleteSession.directory
     : null;
   const configuringLoop = configuringLoopId ? loops.get(configuringLoopId) ?? null : null;
 
@@ -390,20 +430,42 @@ export function SessionWorkspace() {
 
   const confirmDeleteSession = useCallback(async (id: string) => {
     try {
-      if (chatSessionId === id) {
-        setChatSessionId(null);
-        clearConversation();
-      }
+      const deletedSession = sessions.get(id) ?? null;
+      const deletedRootId = deletedSession?.parent_session_id ?? deletedSession?.id ?? id;
+      const activeChat = chatSessionId ? sessions.get(chatSessionId) ?? null : null;
+      const activeRootId = activeChat?.parent_session_id ?? activeChat?.id ?? null;
+      const isDeletingActiveChat = chatSessionId === id;
+      const isDeletingRoot = deletedSession ? !deletedSession.parent_session_id : false;
+      const isDeletingActiveRoot = isDeletingRoot && activeRootId === id;
+      const nextChatId = isDeletingActiveChat && deletedSession?.parent_session_id
+        ? (chatsByRoot.get(deletedSession.parent_session_id) ?? []).find((chat) => chat.id !== id)?.id ?? null
+        : null;
+
       sendQueuesRef.current.delete(id);
       setSessionQueuedCount(id, 0);
       setSessionRunning(id, false);
-      setActiveSession("");
       await deleteSession(id);
+      if (isDeletingActiveRoot) {
+        setChatSessionId(null);
+        clearConversation();
+        setActiveSession("");
+      } else if (isDeletingActiveChat) {
+        if (nextChatId) {
+          setChatSessionId(nextChatId);
+          setActiveSession(deletedRootId);
+        } else {
+          setChatSessionId(null);
+          clearConversation();
+          setActiveSession("");
+        }
+      } else if (isDeletingRoot) {
+        setActiveSession("");
+      }
       setSessionPendingDelete(null);
     } catch (deleteError) {
       throw deleteError;
     }
-  }, [chatSessionId, clearConversation, deleteSession, setActiveSession, setSessionQueuedCount, setSessionRunning]);
+  }, [chatSessionId, chatsByRoot, clearConversation, deleteSession, sessions, setActiveSession, setSessionQueuedCount, setSessionRunning]);
 
   return (
     <section className="flex h-screen min-w-0 flex-1 flex-col bg-[var(--background)]">
@@ -445,7 +507,7 @@ export function SessionWorkspace() {
         </div>
         <div className="min-w-0 flex-1 overflow-hidden">
           <SessionCanvas
-            sessions={projectSessions}
+            sessions={rootProjectSessions}
             groups={groups}
             loops={projectLoops}
             onConnectSessions={connectSessions}
@@ -462,13 +524,20 @@ export function SessionWorkspace() {
       {chatSession && (
         <SessionChat
           session={chatSession}
+          rootSession={chatRoot ?? chatSession}
+          chats={chatOptions}
+          activeChatId={chatSession.id}
           messages={chatMessages}
           isSending={isChatSending}
           queuedMessageCount={queuedMessageCount}
           streamingMessageId={streamingMessageId}
           onSendMessage={sendChatMessage}
           onRunCommand={runUiCommand}
+          onSelectChat={setChatSessionId}
+          onCreateChat={createChatForCurrentSession}
+          onDeleteChat={requestDeleteSession}
           onUpdateSessionProvider={updateSessionProvider}
+          onUpdateSessionTitle={updateSessionTitle}
           onClose={closeChat}
         />
       )}
@@ -477,6 +546,7 @@ export function SessionWorkspace() {
         open={sessionPendingDelete !== null}
         sessionId={sessionPendingDelete}
         sessionLabel={sessionPendingDeleteLabel}
+        kind={sessionPendingDeleteKind}
         onCancel={cancelDeleteSession}
         onConfirm={confirmDeleteSession}
       />
@@ -492,4 +562,9 @@ export function SessionWorkspace() {
 
 function formatError(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function chatDisplayTitle(session: AgentSession) {
+  const title = session.title?.trim();
+  return title || "Unknown";
 }

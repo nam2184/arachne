@@ -19,11 +19,15 @@
 
 use std::sync::Arc;
 
+use chrono::Utc;
+
+use crate::database::{Database, ProjectRepository, SessionRepository};
 use crate::llm::session::SessionRunner;
 use crate::llm::{ChildCompletion, ChildKind, ProviderRegistry};
 use crate::permission_v2::{default_ruleset, PermissionService};
 use crate::sandbox::SandboxPolicy;
 use crate::tools::{string_arg, SandboxedContext, ToolRuntime};
+use crate::{AgentSession, ConversationService, Project, SessionService};
 
 use super::{failure, not_implemented, success, ToolCall, ToolResult};
 
@@ -87,20 +91,7 @@ pub async fn run_async(call: &ToolCall, runtime: ToolRuntime) -> ToolResult {
         return failure("task", msg);
     }
 
-    // Build a child session. The child inherits the caller's project,
-    // provider, and model. The directory is the caller's directory by
-    // default; peer-tool subsessions use a separate lightweight path when
-    // they need to execute against a peer directory.
-    let child_id = match runtime.session_service.create_session_with_parent(
-        caller.project_id.clone(),
-        caller.directory.clone(),
-        caller.provider.clone(),
-        caller.model.clone(),
-        Some(caller.id.clone()),
-    ) {
-        Ok((id, _created)) => id,
-        Err(e) => return failure("task", format!("failed to create child session: {e}")),
-    };
+    let child_id = format!("task-{}", uuid::Uuid::new_v4());
     runtime
         .subagent_registry
         .register_child(&caller.id, &child_id);
@@ -112,7 +103,7 @@ pub async fn run_async(call: &ToolCall, runtime: ToolRuntime) -> ToolResult {
     );
 
     if background {
-        spawn_background(caller.id.clone(), child_id.clone(), prompt, runtime);
+        spawn_background(caller.clone(), child_id.clone(), prompt, runtime);
         return success(
             "task",
             format!(
@@ -129,7 +120,7 @@ pub async fn run_async(call: &ToolCall, runtime: ToolRuntime) -> ToolResult {
     let parent_id = caller.id.clone();
     let child_prompt = prompt.clone();
 
-    let outcome = run_child_foreground(child_id.clone(), child_prompt, runtime).await;
+    let outcome = run_child_foreground(child_id.clone(), child_prompt, runtime, caller).await;
 
     let completion = ChildCompletion {
         child_session_id: child_id.clone(),
@@ -138,6 +129,7 @@ pub async fn run_async(call: &ToolCall, runtime: ToolRuntime) -> ToolResult {
         success: outcome.success,
     };
     registry.push_completion(&parent_id, completion);
+    registry.complete_child(&parent_id, &child_id);
 
     let body = format!(
         "{envelope_open}<task_result>{}</task_result>\n</task>",
@@ -146,19 +138,21 @@ pub async fn run_async(call: &ToolCall, runtime: ToolRuntime) -> ToolResult {
     success_or_failure("task", outcome.success, body, outcome.error)
 }
 
-fn spawn_background(parent_id: String, child_id: String, prompt: String, runtime: ToolRuntime) {
+fn spawn_background(parent: AgentSession, child_id: String, prompt: String, runtime: ToolRuntime) {
+    let parent_id = parent.id.clone();
     let registry = Arc::clone(&runtime.subagent_registry);
     tokio::spawn(async move {
-        let outcome = run_child_foreground(child_id.clone(), prompt, runtime).await;
+        let outcome = run_child_foreground(child_id.clone(), prompt, runtime, parent).await;
         registry.push_completion(
             &parent_id,
             ChildCompletion {
-                child_session_id: child_id,
+                child_session_id: child_id.clone(),
                 kind: ChildKind::Task,
                 text: outcome.text,
                 success: outcome.success,
             },
         );
+        registry.complete_child(&parent_id, &child_id);
     });
 }
 
@@ -172,11 +166,23 @@ async fn run_child_foreground(
     child_id: String,
     prompt: String,
     runtime: ToolRuntime,
+    parent: AgentSession,
 ) -> ChildOutcome {
+    let ephemeral = match prepare_ephemeral_child_runtime(&child_id, &parent, &runtime) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return ChildOutcome {
+                success: false,
+                text: String::new(),
+                error: Some(error),
+            };
+        }
+    };
+
     // 1. Append the parent's question as a synthetic user message on the
     //    child's conversation. This is what the child "sees" as the
     //    starting point.
-    let prompt_id = match runtime.conversation_service.append_message(
+    let prompt_id = match ephemeral.runtime.conversation_service.append_message(
         &child_id,
         crate::MessageRole::User,
         prompt,
@@ -196,21 +202,24 @@ async fn run_child_foreground(
     //    child has the same providers as the parent. We do not propagate
     //    the caller's event sink — the child's events are not surfaced
     //    to the UI as primary-session activity.
-    let runner = match runtime.session_service.get_session(&child_id) {
+    let runner = match ephemeral.runtime.session_service.get_session(&child_id) {
         Ok(Some(child)) => {
             let (permissions, _rx) = PermissionService::new(child.id.clone(), default_ruleset());
             let sandbox = SandboxPolicy::new(std::path::PathBuf::from(&child.directory));
             let sandboxed_ctx = Arc::new(
-                SandboxedContext::new(sandbox, Arc::clone(&permissions))
-                    .with_caller_session(child.id.clone(), Arc::clone(&runtime.session_service)),
+                SandboxedContext::new(sandbox, Arc::clone(&permissions)).with_caller_session(
+                    child.id.clone(),
+                    Arc::clone(&ephemeral.runtime.session_service),
+                ),
             );
             SessionRunner::new(
-                Arc::clone(&runtime.session_service),
-                Arc::clone(&runtime.conversation_service),
-                child_provider_registry(&runtime),
+                Arc::clone(&ephemeral.runtime.session_service),
+                Arc::clone(&ephemeral.runtime.conversation_service),
+                child_provider_registry(&ephemeral.runtime),
             )
             .with_permissions(permissions)
             .with_sandboxed_context(sandboxed_ctx)
+            .with_subagent_registry(Arc::clone(&ephemeral.runtime.subagent_registry))
             .with_max_turns(DEFAULT_FOREGROUND_MAX_TURNS)
         }
         _ => {
@@ -226,8 +235,8 @@ async fn run_child_foreground(
         Ok(_result) => {
             // Extract the last assistant text from the child's
             // conversation.
-            let text =
-                last_assistant_text(&runtime.conversation_service, &child_id).unwrap_or_default();
+            let text = last_assistant_text(&ephemeral.runtime.conversation_service, &child_id)
+                .unwrap_or_default();
             ChildOutcome {
                 success: true,
                 text,
@@ -240,6 +249,63 @@ async fn run_child_foreground(
             error: Some(e.to_string()),
         },
     }
+}
+
+struct EphemeralChildRuntime {
+    runtime: ToolRuntime,
+    _db_dir: tempfile::TempDir,
+    _conversation_dir: tempfile::TempDir,
+}
+
+fn prepare_ephemeral_child_runtime(
+    child_id: &str,
+    parent: &AgentSession,
+    runtime: &ToolRuntime,
+) -> Result<EphemeralChildRuntime, String> {
+    let db_dir = tempfile::tempdir().map_err(|e| format!("temp db dir: {e}"))?;
+    let conversation_dir =
+        tempfile::tempdir().map_err(|e| format!("temp conversation dir: {e}"))?;
+    let db_path = db_dir.path().join("task.sqlite");
+    let db = Database::new(db_path.clone()).map_err(|e| e.to_string())?;
+    db.init()?;
+    ProjectRepository::insert(
+        &db,
+        &Project {
+            id: parent.project_id.clone(),
+            path: parent.directory.clone(),
+            name: parent.project_id.clone(),
+            tech_stack: vec![],
+            created_at: Utc::now(),
+        },
+    )?;
+    let mut child = AgentSession::new(
+        parent.project_id.clone(),
+        parent.directory.clone(),
+        parent.provider.clone(),
+        parent.model.clone(),
+    );
+    child.id = child_id.to_string();
+    SessionRepository::insert(&db, &child)?;
+    drop(db);
+
+    let session_service = SessionService::new(db_path);
+    let conversation_service = ConversationService::new(conversation_dir.path().to_path_buf());
+    conversation_service.create_conversation(child_id)?;
+
+    Ok(EphemeralChildRuntime {
+        runtime: ToolRuntime {
+            caller_session_id: child_id.to_string(),
+            session_service,
+            conversation_service,
+            providers: Arc::clone(&runtime.providers),
+            subagent_registry: Arc::clone(&runtime.subagent_registry),
+            mode: runtime.mode,
+            turn_id: runtime.turn_id,
+            project_root: runtime.project_root.clone(),
+        },
+        _db_dir: db_dir,
+        _conversation_dir: conversation_dir,
+    })
 }
 
 fn child_provider_registry(_runtime: &ToolRuntime) -> Arc<ProviderRegistry> {

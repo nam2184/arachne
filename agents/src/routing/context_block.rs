@@ -75,7 +75,7 @@ impl PeersContextBlock {
         if let Some(group_id) = &self.group_id {
             out.push_str(&format!("Connected group: {group_id}\n"));
         }
-        out.push_str("The following real sessions are connected to you. In plan mode, you may pass `peer_session_id` to read, glob, or grep to inspect a different connected session. Omit `peer_session_id` for local/current-repo work. Do not target subsessions.\n\n");
+        out.push_str("The following real sessions are connected to you. In plan mode, you may pass `peer_session_id` to read, glob, or grep to inspect a different connected session. Omit `peer_session_id` for local/current-repo work. Do not target child sessions spawned by `task`.\n\n");
         for peer in &self.peers {
             out.push_str(&format!("- peer_session_id=\"{}\"\n", peer.session_id));
             out.push_str(&format!("  directory: {}\n", peer.directory));

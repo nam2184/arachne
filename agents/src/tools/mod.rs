@@ -509,8 +509,7 @@ async fn dispatch_peer_tool_if_requested(
         return Some(failure(&call.name, error));
     }
 
-    let (peer_directory, subsession_id) = match resolve_peer_tool_target(runtime, &peer_session_id)
-    {
+    let peer_directory = match resolve_peer_tool_target(runtime, &peer_session_id) {
         Ok(target) => target,
         Err(error) => return Some(failure(&call.name, error)),
     };
@@ -518,14 +517,14 @@ async fn dispatch_peer_tool_if_requested(
     tracing::info!(
         caller_session_id = %runtime.caller_session_id,
         peer_session_id = %peer_session_id,
-        subsession_id = %subsession_id,
         tool = %call.name,
         peer_directory = %peer_directory.display(),
-        "dispatching peer-targeted tool call through subsession"
+        "dispatching peer-targeted tool call through temporary peer sandbox"
     );
 
     let mut peer_call = call.clone();
     peer_call.arguments.remove("peer_session_id");
+    normalize_peer_path_argument(&mut peer_call, &peer_directory);
 
     let result = if let Some(parent_ctx) = sandboxed {
         let peer_ctx = SandboxedContext::new(
@@ -544,7 +543,7 @@ async fn dispatch_peer_tool_if_requested(
 fn resolve_peer_tool_target(
     runtime: &ToolRuntime,
     peer_session_id: &str,
-) -> Result<(PathBuf, String), String> {
+) -> Result<PathBuf, String> {
     let caller = runtime
         .session_service
         .get_session(&runtime.caller_session_id)?
@@ -573,7 +572,7 @@ fn resolve_peer_tool_target(
     {
         let message = match deny {
             crate::llm::DenyReason::DepthExceeded => {
-                "subsessions cannot spawn subsessions (depth cap exceeded)".to_string()
+                "child sessions cannot target peer sessions (depth cap exceeded)".to_string()
             }
             crate::llm::DenyReason::AncestorCycle => {
                 "cannot target an ancestor session (cycle prevented)".to_string()
@@ -586,26 +585,104 @@ fn resolve_peer_tool_target(
         return Err(message);
     }
 
-    let peer_directory = PathBuf::from(&peer.directory);
-    let child_id = runtime.subagent_registry.get_or_create_peer_subsession(
-        &caller.id,
-        &peer.id,
-        runtime.turn_id,
-        || {
-            runtime
-                .session_service
-                .create_session_with_parent(
-                    peer.project_id.clone(),
-                    peer.directory.clone(),
-                    caller.provider.clone(),
-                    caller.model.clone(),
-                    Some(caller.id.clone()),
-                )
-                .map(|(id, _created)| id)
-        },
-    )?;
+    Ok(PathBuf::from(&peer.directory))
+}
 
-    Ok((peer_directory, child_id))
+fn normalize_peer_path_argument(call: &mut ToolCall, peer_directory: &std::path::Path) {
+    let Some(value) = call.arguments.get_mut("path") else {
+        return;
+    };
+    let Some(requested) = value.as_str() else {
+        return;
+    };
+    let normalized = normalize_peer_requested_path(requested, peer_directory);
+    if normalized != requested {
+        *value = serde_json::Value::String(normalized);
+    }
+}
+
+fn normalize_peer_requested_path(requested: &str, peer_directory: &std::path::Path) -> String {
+    let requested = requested.trim();
+    if requested.is_empty() || requested == "." {
+        return requested.to_string();
+    }
+
+    let requested_path = std::path::Path::new(requested);
+    if requested_path == peer_directory {
+        return ".".to_string();
+    }
+    if let Ok(relative) = requested_path.strip_prefix(peer_directory) {
+        return path_for_tool_arg(relative);
+    }
+
+    let requested_norm = normalize_path_text(requested);
+    let peer_norm = normalize_path_text(&peer_directory.display().to_string());
+    if requested_norm == peer_norm {
+        return ".".to_string();
+    }
+    let peer_prefix = format!("{peer_norm}/");
+    if let Some(rest) = requested_norm.strip_prefix(&peer_prefix) {
+        return if rest.is_empty() {
+            ".".to_string()
+        } else {
+            rest.to_string()
+        };
+    }
+
+    // Models sometimes copy a Windows peer path from the prompt without the
+    // drive prefix (e.g. \Users\name\repo). On Windows that is rooted on the
+    // current drive; on Unix it is just a relative path containing backslashes.
+    // If that drive-less form points at the peer root, normalize it too.
+    let requested_suffix = requested_norm.trim_start_matches('/');
+    for peer_suffix in peer_root_suffixes(&peer_norm) {
+        if requested_suffix == peer_suffix {
+            return ".".to_string();
+        }
+        let peer_suffix_prefix = format!("{peer_suffix}/");
+        if let Some(rest) = requested_suffix.strip_prefix(&peer_suffix_prefix) {
+            return if rest.is_empty() {
+                ".".to_string()
+            } else {
+                rest.to_string()
+            };
+        }
+    }
+
+    requested.to_string()
+}
+
+fn peer_root_suffixes(peer_norm: &str) -> Vec<&str> {
+    let mut suffixes = Vec::new();
+    if let Some((_, rest)) = peer_norm.split_once(":/") {
+        suffixes.push(rest);
+    }
+    if let Some(rest) = peer_norm.strip_prefix("/mnt/") {
+        if let Some((drive, suffix)) = rest.split_once('/') {
+            if drive.len() == 1 && !suffix.is_empty() {
+                suffixes.push(suffix);
+            }
+        }
+    }
+    if suffixes.is_empty() {
+        suffixes.push(peer_norm);
+    }
+    suffixes
+}
+
+fn normalize_path_text(path: &str) -> String {
+    let mut path = path.trim().replace('\\', "/");
+    while path.contains("//") {
+        path = path.replace("//", "/");
+    }
+    path.trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn path_for_tool_arg(path: &std::path::Path) -> String {
+    if path.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        path.to_string_lossy().replace('\\', "/")
+    }
 }
 
 fn supports_peer_session_id(tool: &str) -> bool {
@@ -970,8 +1047,8 @@ mod tests {
     use crate::ToolCall;
 
     use super::{
-        resolve_session_path, run_tool_async_sandboxed, run_tool_sandboxed, run_tool_with_mode,
-        SandboxedContext, ToolContext, ToolRuntime,
+        normalize_peer_requested_path, resolve_session_path, run_tool_async_sandboxed,
+        run_tool_sandboxed, run_tool_with_mode, SandboxedContext, ToolContext, ToolRuntime,
     };
 
     #[test]
@@ -1344,7 +1421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_session_id_read_uses_peer_directory_and_reuses_subsession() {
+    async fn peer_session_id_read_uses_peer_directory_without_persisting_child_session() {
         let db_dir = tempfile::tempdir().unwrap();
         let conv_dir = tempfile::tempdir().unwrap();
         let caller_dir = tempfile::tempdir().unwrap();
@@ -1443,7 +1520,11 @@ mod tests {
         )
         .await;
         assert!(second.success, "result: {second:?}");
-        assert_eq!(registry.live_children(&caller_id).len(), 1);
+        assert_eq!(registry.live_children(&caller_id).len(), 0);
+        let sessions = session_service.get_all_sessions().unwrap();
+        assert!(sessions
+            .iter()
+            .all(|session| session.parent_session_id.as_deref() != Some(caller_id.as_str())));
     }
 
     #[tokio::test]
@@ -1495,6 +1576,93 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("outside peer session directory"));
+    }
+
+    #[test]
+    fn normalize_peer_requested_path_accepts_wsl_peer_root_without_drive() {
+        let peer_root = std::path::Path::new("/mnt/c/Users/caona/Documents/static-websites");
+
+        assert_eq!(
+            normalize_peer_requested_path(r"\Users\caona\Documents\static-websites", peer_root),
+            "."
+        );
+        assert_eq!(
+            normalize_peer_requested_path(
+                r"\Users\caona\Documents\static-websites\index.html",
+                peer_root
+            ),
+            "index.html"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_glob_accepts_peer_root_path_argument() {
+        let fixture = make_peer_fixture();
+        std::fs::write(fixture.peer_dir.path().join("index.html"), "<h1>peer</h1>").unwrap();
+
+        let result = run_tool_async_sandboxed(
+            &call(
+                "glob",
+                &[
+                    ("path", fixture.peer_dir.path().to_str().unwrap()),
+                    ("pattern", "**/*"),
+                    ("peer_session_id", fixture.peer_id.as_str()),
+                ],
+            ),
+            &fixture.runtime,
+            &fixture.ctx,
+        )
+        .await;
+
+        assert!(result.success, "result: {result:?}");
+        assert!(result.output.contains("index.html"));
+    }
+
+    #[tokio::test]
+    async fn peer_tools_do_not_persist_child_sessions_across_turns() {
+        let fixture = make_peer_fixture();
+        std::fs::write(fixture.peer_dir.path().join("note.txt"), "peer").unwrap();
+
+        let first = run_tool_async_sandboxed(
+            &call(
+                "read",
+                &[
+                    ("path", "note.txt"),
+                    ("peer_session_id", fixture.peer_id.as_str()),
+                ],
+            ),
+            &fixture.runtime,
+            &fixture.ctx,
+        )
+        .await;
+        assert!(first.success, "result: {first:?}");
+        let mut next_runtime = fixture.runtime.clone();
+        next_runtime.turn_id += 1;
+        let second = run_tool_async_sandboxed(
+            &call(
+                "read",
+                &[
+                    ("path", "note.txt"),
+                    ("peer_session_id", fixture.peer_id.as_str()),
+                ],
+            ),
+            &next_runtime,
+            &fixture.ctx,
+        )
+        .await;
+
+        assert!(second.success, "result: {second:?}");
+        assert_eq!(
+            next_runtime
+                .subagent_registry
+                .live_children(&next_runtime.caller_session_id)
+                .len(),
+            0
+        );
+        let sessions = next_runtime.session_service.get_all_sessions().unwrap();
+        assert!(sessions.iter().all(|session| {
+            session.parent_session_id.as_deref() != Some(next_runtime.caller_session_id.as_str())
+        }));
     }
 
     #[tokio::test]
@@ -1590,6 +1758,14 @@ pub(crate) fn not_implemented(tool: &str, detail: &str) -> ToolResult {
 pub(crate) fn wildcard_match(pattern: &str, value: &str) -> bool {
     if pattern == "*" || pattern == "**" {
         return true;
+    }
+    if let Some(root_optional_pattern) = pattern.strip_prefix("**/") {
+        return wildcard_match(root_optional_pattern, value)
+            || value.contains('/')
+                && wildcard_match(
+                    root_optional_pattern,
+                    value.rsplit('/').next().unwrap_or(value),
+                );
     }
     if !pattern.contains('*') {
         return value.contains(pattern);

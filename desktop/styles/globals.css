@@ -28,6 +28,9 @@
     --input-border: #2a2a2a;
     --accent: #2a2a2a;
     --accent-hover: #3a3a3a;
+    --scrollbar-track: transparent;
+    --scrollbar-thumb: #2d2d2d;
+    --scrollbar-thumb-hover: #5a5a5a;
   }
 
   :root.light {
@@ -55,6 +58,9 @@
     --input-border: #d4d4d4;
     --accent: #f5f5f5;
     --accent-hover: #e5e5e5;
+    --scrollbar-track: transparent;
+    --scrollbar-thumb: #c9beb0;
+    --scrollbar-thumb-hover: #9b8f7f;
   }
 
   :root {
@@ -83,6 +89,36 @@
   select,
   textarea {
     font: inherit;
+  }
+
+  * {
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+    scrollbar-width: thin;
+  }
+
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: var(--scrollbar-track);
+  }
+
+  *::-webkit-scrollbar-thumb {
+    min-height: 36px;
+    border: 3px solid transparent;
+    border-radius: 999px;
+    background-clip: content-box;
+    background-color: var(--scrollbar-thumb);
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: var(--scrollbar-thumb-hover);
+  }
+
+  *::-webkit-scrollbar-corner {
+    background: transparent;
   }
 
 }

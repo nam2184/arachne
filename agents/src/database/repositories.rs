@@ -94,13 +94,14 @@ impl SessionRepository {
     pub fn insert(db: &Database, session: &AgentSession) -> Result<(), String> {
         db.connection()
             .execute(
-                "INSERT INTO agent_sessions (id, project_id, directory, provider, model, summary_json, parent_session_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO agent_sessions (id, project_id, directory, provider, model, title, summary_json, parent_session_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     session.id,
                     session.project_id,
                     session.directory,
                     session.provider,
                     session.model,
+                    session.title,
                     session.summary_json,
                     session.parent_session_id,
                     session.created_at.to_rfc3339()
@@ -117,7 +118,8 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id
+                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       s.title
                 FROM agent_sessions s
                 ",
             )
@@ -139,7 +141,8 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id
+                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       s.title
                 FROM agent_sessions s
                 WHERE s.id = ?1
                 ",
@@ -158,7 +161,8 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id
+                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       s.title
                 FROM agent_sessions s
                 WHERE s.project_id = ?1
                 ",
@@ -185,7 +189,8 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id
+                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       s.title
                 FROM agent_sessions s
                 WHERE s.project_id = ?1
                   AND s.directory = ?2
@@ -248,7 +253,8 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id
+                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       s.title
                 FROM agent_sessions s
                 WHERE s.parent_session_id = ?1
                 ORDER BY s.created_at ASC
@@ -287,6 +293,30 @@ impl SessionRepository {
             .execute(
                 "UPDATE agent_sessions SET summary_json = ?1 WHERE id = ?2",
                 params![summary_json, id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn update_title(db: &Database, id: &str, title: Option<&str>) -> Result<(), String> {
+        db.connection()
+            .execute(
+                "UPDATE agent_sessions SET title = ?1 WHERE id = ?2",
+                params![title, id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn update_parent(
+        db: &Database,
+        id: &str,
+        parent_session_id: Option<&str>,
+    ) -> Result<(), String> {
+        db.connection()
+            .execute(
+                "UPDATE agent_sessions SET parent_session_id = ?1 WHERE id = ?2",
+                params![parent_session_id, id],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -373,6 +403,20 @@ impl SessionGroupRepository {
             .execute(
                 "INSERT OR IGNORE INTO session_group_sessions (group_id, session_id) VALUES (?1, ?2)",
                 params![group_id, session_id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn replace_session(
+        db: &Database,
+        old_session_id: &str,
+        new_session_id: &str,
+    ) -> Result<(), String> {
+        db.connection()
+            .execute(
+                "UPDATE session_group_sessions SET session_id = ?1 WHERE session_id = ?2",
+                params![new_session_id, old_session_id],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -485,6 +529,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
         directory: row.get(2)?,
         provider: row.get(3)?,
         model: row.get(4)?,
+        title: row.get(9)?,
         summary_json: row.get(7)?,
         group_id: row.get(8)?,
         parent_session_id: if parent_session_id.as_deref() == Some("") {
@@ -544,6 +589,7 @@ mod tests {
             directory: "/tmp/work".to_string(),
             provider: "anthropic".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
+            title: None,
             group_id: None,
             summary_json: None,
             parent_session_id: None,

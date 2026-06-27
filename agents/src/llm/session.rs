@@ -2428,10 +2428,6 @@ impl SessionRunner {
 
             );
 
-            if let Some(registry) = &self.subagent_registry {
-                registry.complete_peer_subsessions(session_id, step as u64);
-            }
-
             return Ok(needs_continuation);
         }
 
@@ -2496,10 +2492,6 @@ impl SessionRunner {
         // LLM turn can see the persisted call/result transcript.
 
         let continue_loop = needs_continuation;
-
-        if let Some(registry) = &self.subagent_registry {
-            registry.complete_peer_subsessions(session_id, step as u64);
-        }
 
         Ok(continue_loop)
     }
@@ -2899,7 +2891,7 @@ pub fn readonly_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
             object_schema(
                 serde_json::json!({
 
-                    "path": { "type": "string", "description": "Root directory" },
+                    "path": { "type": "string", "description": "Root directory. For peer_session_id, use '.' or a path relative to that peer root; do not copy the peer's absolute directory." },
 
                     "pattern": { "type": "string", "description": "Glob pattern" },
 
@@ -2915,7 +2907,7 @@ pub fn readonly_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
             object_schema(
                 serde_json::json!({
 
-                    "path": { "type": "string" },
+                    "path": { "type": "string", "description": "Directory to search. For peer_session_id, use '.' or a path relative to that peer root; do not copy the peer's absolute directory." },
 
                     "pattern": { "type": "string" },
 
@@ -2933,7 +2925,7 @@ pub fn readonly_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
             object_schema(
                 serde_json::json!({
 
-                    "path": { "type": "string", "description": "Path to a file to read" },
+                    "path": { "type": "string", "description": "Path to a file to read. For peer_session_id, use a path relative to that peer root; do not copy the peer's absolute directory." },
 
                     "offset": { "type": "integer", "minimum": 1 },
 

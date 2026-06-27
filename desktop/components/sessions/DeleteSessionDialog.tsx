@@ -7,11 +7,12 @@ export interface DeleteSessionDialogProps {
   open: boolean;
   sessionId: string | null;
   sessionLabel?: string | null;
+  kind?: "session" | "chat";
   onCancel: () => void;
   onConfirm: (id: string) => Promise<void> | void;
 }
 
-export function DeleteSessionDialog({ open, sessionId, sessionLabel, onCancel, onConfirm }: DeleteSessionDialogProps) {
+export function DeleteSessionDialog({ open, sessionId, sessionLabel, kind = "session", onCancel, onConfirm }: DeleteSessionDialogProps) {
   const [isDeleting, setIsDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -37,11 +38,11 @@ export function DeleteSessionDialog({ open, sessionId, sessionLabel, onCancel, o
   return (
     <Dialog
       open={open}
-      title="Delete session"
+      title={kind === "chat" ? "Delete chat" : "Delete session"}
       description={
         sessionLabel
           ? `This will permanently delete “${sessionLabel}” and its conversation history. This action cannot be undone.`
-          : "This will permanently delete the selected session and its conversation history. This action cannot be undone."
+          : `This will permanently delete the selected ${kind} and its conversation history. This action cannot be undone.`
       }
       onClose={isDeleting ? () => undefined : onCancel}
       footer={

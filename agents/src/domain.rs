@@ -117,6 +117,7 @@ pub struct AgentSession {
     pub directory: String,
     pub provider: String,
     pub model: String,
+    pub title: Option<String>,
     pub group_id: Option<String>,
     pub summary_json: Option<String>,
     pub parent_session_id: Option<String>,
@@ -131,6 +132,7 @@ impl AgentSession {
             directory,
             provider,
             model,
+            title: None,
             group_id: None,
             summary_json: None,
             parent_session_id: None,
@@ -141,8 +143,8 @@ impl AgentSession {
     /// Construct a child session. Children inherit the parent's project, but
     /// get a fresh id and a `parent_session_id` link. The directory can be
     /// either the same as the parent (for subagent calls into the parent's own
-    /// codebase) or a different one (for peer-tool subsessions or subagent
-    /// worktrees, though we don't enforce worktrees today).
+    /// codebase) or a different one (for subagent worktrees, though we don't
+    /// enforce worktrees today).
     pub fn child_of(
         parent: &AgentSession,
         directory: String,
@@ -155,6 +157,7 @@ impl AgentSession {
             directory,
             provider,
             model,
+            title: None,
             group_id: None,
             summary_json: None,
             parent_session_id: Some(parent.id.clone()),

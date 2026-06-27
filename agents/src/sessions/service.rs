@@ -5,6 +5,13 @@ use crate::database::{Database, ProjectRepository, SessionGroupRepository, Sessi
 use crate::sandbox::path::strip_verbatim_prefix;
 use crate::{AgentSession, SessionGroup};
 
+#[derive(Debug, Clone)]
+pub struct CreatedSessionChat {
+    pub root_session_id: String,
+    pub chat_session_id: String,
+    pub created_root_session_id: Option<String>,
+}
+
 /// Canonicalize session directories at the DB boundary so UI display,
 /// prompts, tool cwd, and sandbox roots use one path identity.
 pub(crate) fn canonicalize_directory(input: &str) -> PathBuf {
@@ -67,9 +74,8 @@ impl SessionService {
     }
 
     /// Same as `create_session` but with an optional `parent_session_id` for
-    /// sub-agents and peer-tool subsessions. When `parent.is_some()` the
-    /// directory is allowed to differ from the caller's but it still must
-    /// exist.
+    /// sub-agents. When `parent.is_some()` the directory is allowed to differ
+    /// from the caller's but it still must exist.
     pub fn create_session_with_parent(
         &self,
         project_id: String,
@@ -81,6 +87,16 @@ impl SessionService {
         let db = self.db()?;
         if ProjectRepository::find_by_id(&db, &project_id)?.is_none() {
             return Err("Project must exist before creating sessions".to_string());
+        }
+
+        if let Some(parent_id) = parent.as_deref() {
+            let parent_session = SessionRepository::find_by_id(&db, parent_id)?
+                .ok_or_else(|| format!("parent session not found: {parent_id}"))?;
+            if parent_session.parent_session_id.is_some() {
+                return Err(
+                    "persistent session chats can only be created under a root session".to_string(),
+                );
+            }
         }
 
         // Validate the raw input first so the error preserves the user's path.
@@ -105,6 +121,78 @@ impl SessionService {
         Ok((id, true))
     }
 
+    pub fn root_session_id(&self, session_id: &str) -> Result<String, String> {
+        let session = self
+            .get_session(session_id)?
+            .ok_or_else(|| format!("session not found: {session_id}"))?;
+        Ok(session.parent_session_id.unwrap_or(session.id))
+    }
+
+    pub fn root_session(&self, session_id: &str) -> Result<AgentSession, String> {
+        let root_id = self.root_session_id(session_id)?;
+        self.get_session(&root_id)?
+            .ok_or_else(|| format!("root session not found: {root_id}"))
+    }
+
+    pub fn session_chats(&self, root_session_id: &str) -> Result<Vec<AgentSession>, String> {
+        let db = self.db()?;
+        let root = SessionRepository::find_by_id(&db, root_session_id)?
+            .ok_or_else(|| format!("root session not found: {root_session_id}"))?;
+        if root.parent_session_id.is_some() {
+            return Err("session_chats requires a root session id".to_string());
+        }
+        SessionRepository::children_of(&db, root_session_id)
+    }
+
+    pub fn create_session_chat(&self, session_id: &str) -> Result<CreatedSessionChat, String> {
+        let db = self.db()?;
+        let session = SessionRepository::find_by_id(&db, session_id)?
+            .ok_or_else(|| format!("session not found: {session_id}"))?;
+
+        let (root, converted_root_id) =
+            if let Some(parent_id) = session.parent_session_id.as_deref() {
+                let root = SessionRepository::find_by_id(&db, parent_id)?
+                    .ok_or_else(|| format!("root session not found: {parent_id}"))?;
+                if root.parent_session_id.is_some() {
+                    return Err("persistent chats cannot be nested below another chat".to_string());
+                }
+                (root, None)
+            } else {
+                let existing_chats = SessionRepository::children_of(&db, &session.id)?;
+                if existing_chats.is_empty() {
+                    let mut new_root = AgentSession::new(
+                        session.project_id.clone(),
+                        session.directory.clone(),
+                        session.provider.clone(),
+                        session.model.clone(),
+                    );
+                    new_root.summary_json = session.summary_json.clone();
+                    let new_root_id = new_root.id.clone();
+                    SessionRepository::insert(&db, &new_root)?;
+                    SessionGroupRepository::replace_session(&db, &session.id, &new_root_id)?;
+                    SessionRepository::update_parent(&db, &session.id, Some(&new_root_id))?;
+                    (new_root, Some(new_root_id))
+                } else {
+                    (session.clone(), None)
+                }
+            };
+
+        let chat = AgentSession::child_of(
+            &root,
+            root.directory.clone(),
+            root.provider.clone(),
+            root.model.clone(),
+        );
+        let chat_id = chat.id.clone();
+        SessionRepository::insert(&db, &chat)?;
+
+        Ok(CreatedSessionChat {
+            root_session_id: root.id,
+            chat_session_id: chat_id,
+            created_root_session_id: converted_root_id,
+        })
+    }
+
     pub fn get_session(&self, id: &str) -> Result<Option<AgentSession>, String> {
         SessionRepository::find_by_id(&self.db()?, id)
     }
@@ -120,7 +208,8 @@ impl SessionService {
         };
         let mut sessions = Vec::new();
         for session_id in group.session_ids {
-            if let Some(session) = self.get_session(&session_id)? {
+            let root_id = self.root_session_id(&session_id).unwrap_or(session_id);
+            if let Some(session) = self.get_session(&root_id)? {
                 sessions.push(session);
             }
         }
@@ -133,7 +222,8 @@ impl SessionService {
 
     pub fn create_group(&self, session_ids: Vec<String>) -> Result<String, String> {
         let db = self.db()?;
-        let group = SessionGroup::new(session_ids);
+        let root_ids = self.normalize_session_ids_to_roots(session_ids)?;
+        let group = SessionGroup::new(root_ids);
         let id = group.id.clone();
         SessionGroupRepository::insert(&db, &group)?;
         Ok(id)
@@ -152,11 +242,13 @@ impl SessionService {
     }
 
     pub fn add_session_to_group(&self, session_id: &str, group_id: &str) -> Result<(), String> {
-        SessionGroupRepository::add_session(&self.db()?, group_id, session_id)
+        let root_id = self.root_session_id(session_id)?;
+        SessionGroupRepository::add_session(&self.db()?, group_id, &root_id)
     }
 
     pub fn remove_session_from_group(&self, session_id: &str) -> Result<(), String> {
-        SessionGroupRepository::remove_session(&self.db()?, session_id)
+        let root_id = self.root_session_id(session_id)?;
+        SessionGroupRepository::remove_session(&self.db()?, &root_id)
     }
 
     pub fn update_session_provider(
@@ -174,6 +266,17 @@ impl SessionService {
         summary_json: Option<&str>,
     ) -> Result<(), String> {
         SessionRepository::update_summary(&self.db()?, session_id, summary_json)
+    }
+
+    pub fn update_session_title(
+        &self,
+        session_id: &str,
+        title: Option<&str>,
+    ) -> Result<(), String> {
+        if self.get_session(session_id)?.is_none() {
+            return Err(format!("session not found: {session_id}"));
+        }
+        SessionRepository::update_title(&self.db()?, session_id, title)
     }
 
     pub fn refresh_session_summary(&self, session_id: &str) -> Result<(), String> {
@@ -194,6 +297,20 @@ impl SessionService {
         let db = Database::new(self.db_path.clone()).map_err(|e| e.to_string())?;
         db.init()?;
         Ok(db)
+    }
+
+    fn normalize_session_ids_to_roots(
+        &self,
+        session_ids: Vec<String>,
+    ) -> Result<Vec<String>, String> {
+        let mut roots = Vec::new();
+        for session_id in session_ids {
+            let root_id = self.root_session_id(&session_id)?;
+            if !roots.contains(&root_id) {
+                roots.push(root_id);
+            }
+        }
+        Ok(roots)
     }
 }
 
@@ -393,6 +510,66 @@ mod tests {
         assert!(!created_b);
         assert_eq!(id_a, id_b);
         assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn create_session_chat_converts_root_and_transfers_group() {
+        let (service, work, _db) = make_service();
+        seed_project(&service, "p1", "arachne");
+        let root_id = service
+            .create_session(
+                "p1".to_string(),
+                work.path().to_string_lossy().to_string(),
+                "anthropic".to_string(),
+                "claude-sonnet-4-20250514".to_string(),
+            )
+            .unwrap();
+        let group_id = service.create_group(vec![root_id.clone()]).unwrap();
+
+        let created = service.create_session_chat(&root_id).unwrap();
+
+        assert_ne!(created.root_session_id, root_id);
+        assert_ne!(created.chat_session_id, root_id);
+        let old_root = service.get_session(&root_id).unwrap().unwrap();
+        let new_chat = service
+            .get_session(&created.chat_session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            old_root.parent_session_id.as_deref(),
+            Some(created.root_session_id.as_str())
+        );
+        assert_eq!(
+            new_chat.parent_session_id.as_deref(),
+            Some(created.root_session_id.as_str())
+        );
+
+        let groups = service.get_all_groups().unwrap();
+        let group = groups.iter().find(|group| group.id == group_id).unwrap();
+        assert_eq!(group.session_ids, vec![created.root_session_id.clone()]);
+    }
+
+    #[test]
+    fn create_session_chat_from_child_creates_sibling_under_root() {
+        let (service, work, _db) = make_service();
+        seed_project(&service, "p1", "arachne");
+        let root_id = service
+            .create_session(
+                "p1".to_string(),
+                work.path().to_string_lossy().to_string(),
+                "anthropic".to_string(),
+                "claude-sonnet-4-20250514".to_string(),
+            )
+            .unwrap();
+        let first = service.create_session_chat(&root_id).unwrap();
+        let second = service.create_session_chat(&first.chat_session_id).unwrap();
+
+        assert_eq!(second.root_session_id, first.root_session_id);
+        let chats = service.session_chats(&first.root_session_id).unwrap();
+        assert_eq!(chats.len(), 3);
+        assert!(chats
+            .iter()
+            .all(|chat| chat.parent_session_id.as_deref() == Some(first.root_session_id.as_str())));
     }
 
     #[test]
@@ -661,8 +838,7 @@ mod tests {
             )
             .unwrap();
 
-        // A different directory for the child (e.g. peer-tool subsession use
-        // case).
+        // A different directory for the child (e.g. a subagent worktree).
         let peer_dir = tempfile::tempdir().unwrap();
         let (child_id, child_created) = service
             .create_session_with_parent(

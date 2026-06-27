@@ -8,6 +8,7 @@ pub fn validate_connected_peer(
     peer_id: &str,
     session_service: &Arc<SessionService>,
 ) -> Result<(), String> {
+    let peer_root_id = session_service.root_session_id(peer_id)?;
     let (group_id, group) = build_virtual_group(caller_session_id, session_service)?;
     if group.members().is_empty() {
         return Err(
@@ -17,7 +18,7 @@ pub fn validate_connected_peer(
     if group
         .members()
         .iter()
-        .any(|member| member.session_id == peer_id)
+        .any(|member| member.session_id == peer_root_id)
     {
         return Ok(());
     }

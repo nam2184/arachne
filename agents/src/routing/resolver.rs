@@ -10,9 +10,7 @@ pub fn build_virtual_group(
     caller_session_id: &str,
     session_service: &Arc<SessionService>,
 ) -> Result<(Option<String>, VirtualGroup), String> {
-    let caller = session_service
-        .get_session(caller_session_id)?
-        .ok_or_else(|| format!("caller session not found: {caller_session_id}"))?;
+    let caller = session_service.root_session(caller_session_id)?;
     let Some(group_id) = caller.group_id.clone() else {
         return Ok((None, VirtualGroup::default()));
     };
@@ -41,9 +39,7 @@ pub fn build_context_block(
     caller_session_id: &str,
     session_service: &Arc<SessionService>,
 ) -> Result<PeersContextBlock, String> {
-    let caller = session_service
-        .get_session(caller_session_id)?
-        .ok_or_else(|| format!("caller session not found: {caller_session_id}"))?;
+    let caller = session_service.root_session(caller_session_id)?;
     let (group_id, group) = build_virtual_group(caller_session_id, session_service)?;
     let peers = group
         .members()

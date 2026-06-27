@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Check, ChevronDown, ChevronRight, FolderSearch, GripHorizontal, Search, Terminal, Wrench, X } from "lucide-react";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, FolderSearch, GripHorizontal, MoreHorizontal, Plus, Search, Terminal, Wrench, X } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -32,19 +32,33 @@ interface UiCommandResult {
   conversationChanged: boolean;
 }
 
+interface ChatMenuOption {
+  id: string;
+  label: string;
+  tone?: "default" | "danger";
+  onSelect: () => void;
+}
+
 interface SessionChatProps {
   session: AgentSession;
+  rootSession: AgentSession;
+  chats: AgentSession[];
+  activeChatId: string;
   messages: SessionChatMessage[];
   isSending: boolean;
   queuedMessageCount: number;
   streamingMessageId: string | null;
   onSendMessage: (content: string, mode: ChatMode) => void | Promise<void>;
   onRunCommand: (input: string) => Promise<UiCommandResult>;
+  onSelectChat: (sessionId: string) => void;
+  onCreateChat: () => Promise<void> | void;
+  onDeleteChat: (sessionId: string) => Promise<void> | void;
   onUpdateSessionProvider: (sessionId: string, provider: string, model: string) => Promise<void>;
+  onUpdateSessionTitle: (sessionId: string, title: string) => Promise<void>;
   onClose: () => void;
 }
 
-const CHAT_WIDTH = 700;
+const CHAT_WIDTH = 760;
 const CHAT_HEIGHT = 600;
 const EDGE_PADDING = 16;
 const CONTROL_LABEL_CLASS = "text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]";
@@ -80,15 +94,79 @@ function ContextCheckpoint({ content }: { content: string }) {
   );
 }
 
+function ChatOptionsMenu({
+  options,
+  onClose,
+}: {
+  options: ChatMenuOption[];
+  onClose: () => void;
+}) {
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handlePointerDown = (event: globalThis.PointerEvent) => {
+      const menu = menuRef.current;
+      if (!menu || menu.contains(event.target as Node)) return;
+      onClose();
+    };
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      ref={menuRef}
+      role="menu"
+      className="absolute right-1 top-7 z-10 min-w-28 border border-[var(--border)] bg-[var(--surface-raised)] p-1 shadow-[0_12px_32px_rgba(0,0,0,0.22)]"
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      {options.map((option) => (
+        <button
+          key={option.id}
+          type="button"
+          role="menuitem"
+          className={cn(
+            "flex h-7 w-full items-center px-2 text-left text-[11px] hover:bg-[var(--surface-soft)]",
+            option.tone === "danger"
+              ? "text-[#d14d4d] hover:text-[#ff5f5f]"
+              : "text-[var(--text-muted)] hover:text-[var(--foreground)]",
+          )}
+          onClick={() => {
+            option.onSelect();
+            onClose();
+          }}
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export function SessionChat({
   session,
+  rootSession,
+  chats,
+  activeChatId,
   messages,
   isSending,
   queuedMessageCount,
   streamingMessageId,
   onSendMessage,
   onRunCommand,
+  onSelectChat,
+  onCreateChat,
+  onDeleteChat,
   onUpdateSessionProvider,
+  onUpdateSessionTitle,
   onClose,
 }: SessionChatProps) {
   const [input, setInput] = useState("");
@@ -103,6 +181,11 @@ export function SessionChat({
   const [configStatus, setConfigStatus] = useState<string | null>(null);
   const [configError, setConfigError] = useState<string | null>(null);
   const [isConfigSaving, setIsConfigSaving] = useState(false);
+  const [editingTitleId, setEditingTitleId] = useState<string | null>(null);
+  const [titleDraft, setTitleDraft] = useState("");
+  const [titleError, setTitleError] = useState<string | null>(null);
+  const [isChatSidebarOpen, setIsChatSidebarOpen] = useState(true);
+  const [openChatMenuId, setOpenChatMenuId] = useState<string | null>(null);
   // In-memory only; not persisted to settings or anywhere else. The
   // active mode is sent to the backend on each prompt and injected into
   // the LLM's context as a synthetic user message.
@@ -128,7 +211,7 @@ export function SessionChat({
     inputRef.current?.focus();
   }, []);
 
-useEffect(() => {
+  useEffect(() => {
     const el = inputRef.current;
     if (!el) return;
     el.style.height = "auto";
@@ -284,6 +367,49 @@ useEffect(() => {
     }
   };
 
+  const startTitleEdit = (chat: AgentSession) => {
+    setEditingTitleId(chat.id);
+    setTitleDraft(chat.title?.trim() ?? "");
+    setTitleError(null);
+    setOpenChatMenuId(null);
+  };
+
+  const cancelTitleEdit = () => {
+    setEditingTitleId(null);
+    setTitleDraft("");
+    setTitleError(null);
+  };
+
+  const saveTitleEdit = async (chatId: string) => {
+    const currentTitle = chats.find((chat) => chat.id === chatId)?.title?.trim() ?? "";
+    const nextTitle = titleDraft.trim();
+    if (nextTitle === currentTitle) {
+      cancelTitleEdit();
+      return;
+    }
+
+    try {
+      await onUpdateSessionTitle(chatId, nextTitle);
+      cancelTitleEdit();
+    } catch (error) {
+      setTitleError(formatError(error));
+    }
+  };
+
+  const chatMenuOptions = (chat: AgentSession): ChatMenuOption[] => [
+    {
+      id: "rename",
+      label: "Rename",
+      onSelect: () => startTitleEdit(chat),
+    },
+    {
+      id: "delete",
+      label: "Delete",
+      tone: "danger",
+      onSelect: () => void onDeleteChat(chat.id),
+    },
+  ];
+
   const configChanged = providerDraft !== session.provider || modelDraft !== session.model;
   const providerOptions = providers.some((provider) => provider.name === providerDraft)
     ? providers
@@ -308,13 +434,13 @@ useEffect(() => {
     ? commandHints.filter((hint) => hint.name.startsWith(commandQuery))
     : [];
 
-  const directoryName = session.directory.split(/[\\/]/).filter(Boolean).pop() ?? session.directory;
+  const directoryName = rootSession.directory.split(/[\\/]/).filter(Boolean).pop() ?? rootSession.directory;
 
   return (
     <div className="pointer-events-none fixed inset-0 z-50">
       <div
         className={cn(
-          "pointer-events-auto fixed flex h-[600px] max-h-[calc(100vh-32px)] w-[700px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-none border border-[var(--border)] bg-[var(--surface-raised)] text-[var(--foreground)] shadow-none",
+          "pointer-events-auto fixed flex h-[600px] max-h-[calc(100vh-32px)] w-[760px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-none border border-[var(--border)] bg-[var(--surface-raised)] text-[var(--foreground)] shadow-none",
         )}
         role="dialog"
         aria-modal="false"
@@ -332,28 +458,157 @@ useEffect(() => {
             <GripHorizontal className="h-4 w-4 shrink-0 text-[var(--text-muted)]" />
             <div className="flex min-w-0 flex-col">
               <h2 className="truncate text-sm font-semibold text-[var(--foreground)]">{directoryName}</h2>
-              <p className="truncate text-xs text-[var(--text-muted)]">{session.directory}</p>
+              <p className="truncate text-xs text-[var(--text-muted)]">{rootSession.directory}</p>
             </div>
           </div>
-          <Button
-            variant="ghost"
-            size="icon"
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={onClose}
-          >
-            <X className="h-4 w-4" />
-          </Button>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              variant="ghost"
+              size="icon"
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={onClose}
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
         </div>
-        <ScrollArea className="flex-1 px-6 py-4" viewportRef={scrollViewportRef}>
-          <div className="space-y-4">
-            {messages.length === 0 ? (
-              <div className="flex h-full items-center justify-center">
-                <p className="text-sm text-[var(--text-muted)]">
-                  Chat with {directoryName} session. Ask about the codebase or files in this directory.
-                </p>
-              </div>
+        <div className="flex min-h-0 flex-1">
+          <aside
+            className={cn(
+              "flex shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] transition-[width] duration-150",
+              isChatSidebarOpen ? "w-40" : "w-10",
+            )}
+          >
+            {isChatSidebarOpen ? (
+              <>
+                <div className="flex items-center justify-between border-b border-[var(--border)] px-3 py-2">
+                  <span className="text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]">Sessions</span>
+                  <div className="flex items-center gap-1">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6"
+                      onClick={() => void onCreateChat()}
+                      title="New chat"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6"
+                      onClick={() => setIsChatSidebarOpen(false)}
+                      title="Collapse chats"
+                    >
+                      <ChevronLeft className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                </div>
+                <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
+                  {chats.map((chat) => {
+                    const isActive = chat.id === activeChatId;
+                    const isEditing = chat.id === editingTitleId;
+                    return (
+                      <div key={chat.id} className="group relative">
+                        {isEditing ? (
+                          <input
+                            autoFocus
+                            value={titleDraft}
+                            onChange={(event) => setTitleDraft(event.target.value)}
+                            onFocus={(event) => event.currentTarget.select()}
+                            onBlur={() => void saveTitleEdit(chat.id)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                                void saveTitleEdit(chat.id);
+                              } else if (event.key === "Escape") {
+                                event.preventDefault();
+                                cancelTitleEdit();
+                              }
+                            }}
+                            placeholder="Unknown"
+                            className="mb-1 h-11 w-full border border-[var(--node-border-hover)] bg-[var(--input-bg)] px-2 text-left text-xs text-[var(--foreground)] outline-none placeholder:text-[var(--text-muted)]"
+                          />
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => onSelectChat(chat.id)}
+                            onDoubleClick={() => startTitleEdit(chat)}
+                            className={cn(
+                              "mb-1 flex h-11 w-full min-w-0 flex-col items-start justify-center bg-transparent px-2 pr-7 text-left transition-colors",
+                              isActive
+                                ? "font-semibold text-[var(--foreground)]"
+                                : "text-[var(--text-muted)] hover:text-[var(--foreground)]",
+                            )}
+                          >
+                            <span className="w-full truncate text-xs font-medium">{chatTitle(chat)}</span>
+                          </button>
+                        )}
+                        {!isEditing && (
+                          <button
+                            type="button"
+                            onPointerDown={(event) => event.stopPropagation()}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setOpenChatMenuId((current) => current === chat.id ? null : chat.id);
+                            }}
+                            className={cn(
+                              "absolute right-1 top-1/2 hidden h-6 w-6 -translate-y-1/2 items-center justify-center bg-transparent text-[var(--text-muted)] hover:text-[var(--foreground)] group-hover:flex",
+                              openChatMenuId === chat.id && "flex",
+                            )}
+                            aria-haspopup="menu"
+                            aria-expanded={openChatMenuId === chat.id}
+                            title="Chat options"
+                          >
+                            <MoreHorizontal className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                        {openChatMenuId === chat.id && (
+                          <ChatOptionsMenu
+                            options={chatMenuOptions(chat)}
+                            onClose={() => setOpenChatMenuId(null)}
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+                {titleError && <p className="border-t border-[var(--border)] px-3 py-2 text-[11px] text-[#ff5f5f]">{titleError}</p>}
+              </>
             ) : (
-              messages.map((message, index) => {
+              <div className="flex h-full flex-col items-center gap-2 py-2">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7"
+                  onClick={() => setIsChatSidebarOpen(true)}
+                  title="Expand chats"
+                >
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7"
+                  onClick={() => void onCreateChat()}
+                  title="New chat"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            )}
+          </aside>
+          <div className="flex min-w-0 flex-1 flex-col">
+            <ScrollArea className="flex-1 px-6 py-4" viewportRef={scrollViewportRef}>
+              <div className="space-y-4">
+                {messages.length === 0 ? (
+                  <div className="flex h-full items-center justify-center">
+                    <p className="text-sm text-[var(--text-muted)]">
+                      Chat with {directoryName} session. Ask about the codebase or files in this directory.
+                    </p>
+                  </div>
+                ) : (
+                  messages.map((message, index) => {
                 const isAssistant = message.role === "assistant";
                 const reasoning = message.reasoning ?? "";
                 const content = message.content ?? "";
@@ -398,22 +653,22 @@ useEffect(() => {
                     </div>
                   </div>
                 );
-              })
-            )}
-            {isSending && messages.every((m) => !m.content && !m.reasoning) && (
-              <div className="flex justify-start">
-                <div className="flex items-center gap-2 rounded-none border border-[var(--border)] bg-[var(--surface-raised)] px-4 py-2 text-xs text-[var(--text-muted)]">
-                  <span>◌</span>
-                  <span>◌</span>
-                  <span>◌</span>
-                  <span>thinking</span>
-                </div>
+                  })
+                )}
+                {isSending && messages.every((m) => !m.content && !m.reasoning) && (
+                  <div className="flex justify-start">
+                    <div className="flex items-center gap-2 rounded-none border border-[var(--border)] bg-[var(--surface-raised)] px-4 py-2 text-xs text-[var(--text-muted)]">
+                      <span>◌</span>
+                      <span>◌</span>
+                      <span>◌</span>
+                      <span>thinking</span>
+                    </div>
+                  </div>
+                )}
               </div>
-            )}
-          </div>
-        </ScrollArea>
+            </ScrollArea>
 
-        <div className="border-t border-[var(--border)] px-6 py-4">
+            <div className="border-t border-[var(--border)] px-6 py-4">
           {visibleCommandHints.length > 0 && (
             <div className="mb-2 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1">
               {visibleCommandHints.map((hint) => (
@@ -552,10 +807,17 @@ useEffect(() => {
                 : "Running"}
             </p>
           )}
+            </div>
+          </div>
         </div>
       </div>
     </div>
   );
+}
+
+function chatTitle(chat: AgentSession) {
+  const title = chat.title?.trim();
+  return title || "Unknown";
 }
 
 function AssistantMessageParts({

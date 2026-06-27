@@ -29,6 +29,7 @@ impl Database {
                 directory TEXT NOT NULL,
                 provider TEXT NOT NULL,
                 model TEXT NOT NULL,
+                title TEXT,
                 summary_json TEXT,
                 parent_session_id TEXT,
                 created_at TEXT NOT NULL,
@@ -106,6 +107,9 @@ impl Database {
             "ALTER TABLE agent_sessions ADD COLUMN summary_json TEXT",
             [],
         );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE agent_sessions ADD COLUMN title TEXT", []);
         let _ = self.conn.execute(
             "ALTER TABLE provider_configs ADD COLUMN protocol TEXT NOT NULL DEFAULT 'openai'",
             [],

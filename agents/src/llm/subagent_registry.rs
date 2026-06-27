@@ -1,9 +1,7 @@
 //! In-memory registry of live sub-agent sessions.
 //!
-//! Sub-agents (sessions spawned via the `task` tool) and peer-tool subsessions
-//! are persisted as normal `AgentSession` rows with a `parent_session_id`
-//! link. This registry mirrors that tree in memory for the lifetime of the
-//! process so we can:
+//! Sub-agents spawned via the `task` tool are ephemeral runs tracked only in
+//! memory for the lifetime of the process so we can:
 //!
 //! 1. Enforce a depth cap: only sessions that are not themselves a child of
 //!    a child can spawn new sub-agents. (Concretely: a child of a child
@@ -20,7 +18,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use rusqlite::Connection;
 
 /// A `task` result delivered to a parent after its child
 /// finishes. The parent's `SessionRunner` drains these before the next
@@ -53,34 +50,23 @@ pub const MAX_DEPTH: u32 = 1;
 
 #[derive(Default)]
 struct State {
-    /// In-flight children per parent. A child may be either a foreground
-    /// `task` (the parent is blocked on it), a peer-tool subsession, or a
-    /// background `task` (parent has already returned). All register here so
-    /// we can cancel them on parent abort.
+    /// In-flight task children per parent. Peer read/glob/grep calls are
+    /// temporary tool executions and must not create canvas sessions.
     children_by_parent: HashMap<String, HashSet<String>>,
     /// Reverse map for fast ancestor walks and cancel-tree.
     parent_of: HashMap<String, String>,
     /// Completed child results waiting to be drained by the parent.
     completions: HashMap<String, Vec<ChildCompletion>>,
-    /// Turn-scoped peer-tool subsessions keyed by caller, peer, and turn.
-    peer_subsessions: HashMap<(String, String, u64), String>,
-    /// Reverse lookup for diagnostics/tests.
-    peer_by_subsession: HashMap<String, String>,
 }
 
 pub struct SubagentRegistry {
     state: RwLock<State>,
-    /// Path to the SQLite file. We open a fresh `Connection` per call so
-    /// the registry itself stays `Send`+`Sync` (rusqlite's
-    /// `Connection` is not `Sync`).
-    db_path: PathBuf,
 }
 
 impl SubagentRegistry {
-    pub fn new(db_path: PathBuf) -> Arc<Self> {
+    pub fn new(_db_path: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             state: RwLock::new(State::default()),
-            db_path,
         })
     }
 
@@ -98,47 +84,21 @@ impl SubagentRegistry {
     pub fn new_noop() -> Arc<Self> {
         Arc::new(Self {
             state: RwLock::new(State::default()),
-            db_path: PathBuf::from(":memory:"), // not opened unless someone calls `check_spawn`
         })
     }
 
-    fn open(&self) -> Result<Connection, String> {
-        Connection::open(&self.db_path).map_err(|e| format!("db open: {e}"))
-    }
-
-    /// Decide whether a new child may be spawned under `parent_id`.
-    /// The rules are checked in order:
-    ///
-    /// 1. `parent_id` must itself be a primary (i.e. its `parent_session_id`
-    ///    in the DB is NULL or absent). This caps tree depth at 2 —
-    ///    grandchildren are forbidden, so sub-agents can't recursively
-    ///    spawn sub-agents of their own.
-    /// 2. `target_session_id`, if Some (used by peer tools to point at an
-    ///    existing session), must not be `parent_id` itself.
+    /// Decide whether a new ephemeral child may be spawned under `parent_id`.
+    /// Persistent chat ancestry (`agent_sessions.parent_session_id`) is not
+    /// considered here; only in-memory task ancestry counts toward depth.
     pub fn check_spawn(
         &self,
         parent_id: &str,
         target_session_id: Option<&str>,
     ) -> Result<(), DenyReason> {
-        let conn = match self.open() {
-            Ok(c) => c,
-            Err(_) => return Ok(()), // open failures are non-fatal for checks
-        };
-
-        // 1. Depth cap.
-        let parent_parent: Option<String> = conn
-            .query_row(
-                "SELECT parent_session_id FROM agent_sessions WHERE id = ?1",
-                rusqlite::params![parent_id],
-                |row| row.get(0),
-            )
-            .ok()
-            .flatten();
-        if parent_parent.as_deref().is_some_and(|s| !s.is_empty()) {
+        if self.state.read().parent_of.contains_key(parent_id) {
             return Err(DenyReason::DepthExceeded);
         }
 
-        // 2. Self-target.
         if let Some(target) = target_session_id {
             if target == parent_id {
                 return Err(DenyReason::SelfTarget);
@@ -160,6 +120,17 @@ impl SubagentRegistry {
         state
             .parent_of
             .insert(child_id.to_string(), parent_id.to_string());
+    }
+
+    pub fn complete_child(&self, parent_id: &str, child_id: &str) {
+        let mut state = self.state.write();
+        if let Some(children) = state.children_by_parent.get_mut(parent_id) {
+            children.remove(child_id);
+            if children.is_empty() {
+                state.children_by_parent.remove(parent_id);
+            }
+        }
+        state.parent_of.remove(child_id);
     }
 
     /// Push a completion for a child. The parent drains via
@@ -221,66 +192,6 @@ impl SubagentRegistry {
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default()
     }
-
-    /// Create or reuse the subsession used to execute a peer-targeted tool
-    /// call for one caller/peer/turn tuple.
-    pub fn get_or_create_peer_subsession<F>(
-        &self,
-        caller_id: &str,
-        peer_id: &str,
-        turn_id: u64,
-        create: F,
-    ) -> Result<String, String>
-    where
-        F: FnOnce() -> Result<String, String>,
-    {
-        let key = (caller_id.to_string(), peer_id.to_string(), turn_id);
-        let mut state = self.state.write();
-        if let Some(existing) = state.peer_subsessions.get(&key) {
-            return Ok(existing.clone());
-        }
-
-        let child_id = create()?;
-        state
-            .children_by_parent
-            .entry(caller_id.to_string())
-            .or_default()
-            .insert(child_id.clone());
-        state
-            .parent_of
-            .insert(child_id.clone(), caller_id.to_string());
-        state.peer_subsessions.insert(key, child_id.clone());
-        state
-            .peer_by_subsession
-            .insert(child_id.clone(), peer_id.to_string());
-        Ok(child_id)
-    }
-
-    pub fn peer_for_subsession(&self, subsession_id: &str) -> Option<String> {
-        self.state
-            .read()
-            .peer_by_subsession
-            .get(subsession_id)
-            .cloned()
-    }
-
-    /// Drop the turn-scoped peer-subsession cache entries. The session rows
-    /// remain persisted for audit/canvas visibility, but a future turn gets a
-    /// fresh subsession.
-    pub fn complete_peer_subsessions(&self, caller_id: &str, turn_id: u64) {
-        let mut state = self.state.write();
-        let keys: Vec<_> = state
-            .peer_subsessions
-            .keys()
-            .filter(|(caller, _, turn)| caller == caller_id && *turn == turn_id)
-            .cloned()
-            .collect();
-        for key in keys {
-            if let Some(child_id) = state.peer_subsessions.remove(&key) {
-                state.peer_by_subsession.remove(&child_id);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -288,6 +199,7 @@ mod tests {
     use super::*;
     use crate::Project;
     use chrono::Utc;
+    use rusqlite::Connection;
 
     fn seed_path() -> (std::path::PathBuf, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -356,6 +268,7 @@ mod tests {
         insert_session_at(&path, "child", Some("primary"));
 
         let reg = SubagentRegistry::new(path);
+        reg.register_child("primary", "child");
         assert_eq!(
             reg.check_spawn("child", None),
             Err(DenyReason::DepthExceeded)

@@ -14,7 +14,9 @@ export interface AgentSession {
   directory: string;
   provider: string;
   model: string;
+  title?: string | null;
   group_id?: string;
+  parent_session_id?: string | null;
   created_at: string;
 }
 
@@ -38,8 +40,10 @@ interface SessionState {
   activeSessionId: string | null;
   initialize: () => Promise<void>;
   createSession: (projectId: string, directory: string) => Promise<string>;
+  createSessionChat: (sessionId: string) => Promise<{ rootSessionId: string; chatSessionId: string }>;
   setActiveSession: (id: string) => void;
   updateSessionProvider: (id: string, provider: string, model: string) => Promise<void>;
+  updateSessionTitle: (id: string, title: string) => Promise<void>;
   deleteSession: (id: string) => Promise<void>;
   createGroup: (sessionIds: string[]) => Promise<string>;
   deleteGroup: (id: string) => Promise<void>;
@@ -108,6 +112,13 @@ export const useSessionStore = create<SessionState>((set, get) => {
       }
     },
 
+    createSessionChat: async (sessionId) => {
+      const result = await invoke<{ rootSessionId: string; chatSessionId: string }>("create_session_chat", { sessionId });
+      await refreshAll();
+      set({ activeSessionId: result.rootSessionId });
+      return result;
+    },
+
     setActiveSession: (id) => set({ activeSessionId: id }),
 
     updateSessionProvider: async (id, provider, model) => {
@@ -116,6 +127,11 @@ export const useSessionStore = create<SessionState>((set, get) => {
         provider,
         model,
       });
+      await refreshSessions();
+    },
+
+    updateSessionTitle: async (id, title) => {
+      await invoke("update_session_title", { sessionId: id, title });
       await refreshSessions();
     },
 
