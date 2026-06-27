@@ -59,22 +59,12 @@
 
   :root {
     font-family:
-      "JetBrainsMono Nerd Font",
-      "JetBrains Mono Nerd Font",
-      "CaskaydiaCove Nerd Font",
-      "CaskaydiaMono Nerd Font",
-      "FiraCode Nerd Font",
-      "Fira Code Nerd Font",
-      "Hack Nerd Font",
-      "MesloLGS NF",
-      "Symbols Nerd Font",
-      ui-monospace,
-      SFMono-Regular,
-      Menlo,
-      Monaco,
-      Consolas,
-      "Liberation Mono",
-      monospace;
+      "Segoe WPC",
+      "Segoe UI",
+      system-ui,
+      -apple-system,
+      BlinkMacSystemFont,
+      sans-serif;
     color: var(--foreground);
     background: var(--background);
     font-synthesis: none;

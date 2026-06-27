@@ -2,7 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { Check, ChevronDown, ChevronRight, FolderSearch, GripHorizontal, Search, Terminal, Wrench, X } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { getDefaultModel, getModelOptions } from "@/features/sessions/providerModels";
@@ -37,6 +36,9 @@ interface SessionChatProps {
 const CHAT_WIDTH = 700;
 const CHAT_HEIGHT = 600;
 const EDGE_PADDING = 16;
+const CONTROL_LABEL_CLASS = "text-[10px] uppercase tracking-[0.18em] text-[#4a4a4a]";
+const TRANSPARENT_CONTROL_CLASS =
+  "min-w-0 bg-transparent py-1 text-[11px] text-[#8a8a8a] outline-none transition-colors hover:text-[#f5f5f5] focus:text-[#f5f5f5] disabled:cursor-not-allowed disabled:opacity-40 [&>option]:bg-[#0a0a0a] [&>option]:text-[#f5f5f5]";
 
 function ContextCheckpoint({ content }: { content: string }) {
   const [open, setOpen] = useState(false);
@@ -306,108 +308,6 @@ useEffect(() => {
             <X className="h-4 w-4" />
           </Button>
         </div>
-        <div className="border-b border-[#1f1f1f] bg-[#0a0a0a] px-6 py-3">
-          <div className="grid grid-cols-1 gap-2 md:grid-cols-[minmax(140px,0.8fr)_minmax(220px,1fr)_auto_auto]">
-            <label className="space-y-1">
-              <span className="text-[10px] font-medium uppercase tracking-[0.18em] text-[#737373]">Provider</span>
-              {providers.length > 0 ? (
-                <select
-                  value={providerDraft}
-                  onChange={(event) => {
-                    const nextProvider = event.target.value;
-                    const provider = providerOptions.find((config) => config.name === event.target.value);
-                    setProviderDraft(nextProvider);
-                    setModelDraft(provider?.model ?? getDefaultModel(nextProvider, modelDraft));
-                    setConfigStatus(null);
-                    setConfigError(null);
-                  }}
-                  className="h-9 w-full rounded-none border border-[#1f1f1f] bg-black px-3 text-sm text-white outline-none transition-colors hover:border-[#2a2a2a] focus:border-white"
-                >
-                  {providerOptions.map((provider) => (
-                    <option key={provider.name} value={provider.name}>{provider.name}</option>
-                  ))}
-                </select>
-              ) : (
-                <Input
-                  value={providerDraft}
-                  onChange={(event) => setProviderDraft(event.target.value)}
-                  placeholder="anthropic"
-                />
-              )}
-            </label>
-            <label className="space-y-1">
-              <span className="text-[10px] font-medium uppercase tracking-[0.18em] text-[#737373]">Model</span>
-              <select
-                value={modelDraft}
-                onChange={(event) => {
-                  setModelDraft(event.target.value);
-                  setConfigStatus(null);
-                  setConfigError(null);
-                }}
-                className="h-9 w-full rounded-none border border-[#1f1f1f] bg-black px-3 text-sm text-white outline-none transition-colors hover:border-[#2a2a2a] focus:border-white disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={modelOptions.length === 0}
-              >
-                {modelOptions.length === 0 ? (
-                  <option value="">Add models in src/config/provider-models.json</option>
-                ) : (
-                  modelOptions.map((model) => (
-                    <option key={model} value={model}>{model}</option>
-                  ))
-                )}
-              </select>
-            </label>
-            <div className="space-y-1">
-              <span className="text-[10px] font-medium uppercase tracking-[0.18em] text-[#737373]">Mode</span>
-              <div
-                className="flex h-9 w-full rounded-none border border-[#1f1f1f] bg-black text-sm"
-                role="radiogroup"
-                aria-label="Permission mode"
-              >
-                {(["plan", "build"] as const).map((option) => {
-                  const active = mode === option;
-                  return (
-                    <button
-                      key={option}
-                      type="button"
-                      role="radio"
-                      aria-checked={active}
-                      onClick={() => setMode(option)}
-                      className={cn(
-                        "flex-1 select-none px-3 uppercase tracking-[0.18em] text-[11px] transition-colors",
-                        active
-                          ? option === "plan"
-                            ? "bg-[#1a1a1a] text-white"
-                            : "bg-[#2a2a2a] text-white"
-                          : "text-[#737373] hover:text-[#bdbdbd]",
-                      )}
-                      title={
-                        option === "plan"
-                          ? "Read-only: shell, write, edit, apply_patch are blocked"
-                          : "All tools allowed"
-                      }
-                    >
-                      {option}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-            <div className="flex items-end gap-2">
-              <Button
-                variant="secondary"
-                className="h-9 border border-[#2a2a2a]"
-                onClick={saveSessionConfig}
-                disabled={isConfigSaving || !configChanged}
-              >
-                <Check className="h-4 w-4" />
-                {isConfigSaving ? "Saving" : "Save"}
-              </Button>
-            </div>
-          </div>
-          {(configStatus || configError) && (
-            <p className={cn("mt-2 text-xs", configError ? "text-[#ff5f5f]" : "text-[#bdbdbd]")}>{configError ?? configStatus}</p>
-          )}
-        </div>
         <ScrollArea className="flex-1 px-6 py-4" viewportRef={scrollViewportRef}>
           <div className="space-y-4">
             {messages.length === 0 ? (
@@ -433,17 +333,14 @@ useEffect(() => {
                 return (
                   <div
                     key={message.id ?? `${message.timestamp}-${index}`}
-                    className={cn(
-                      "flex",
-                      message.role === "user" ? "justify-end" : "justify-start",
-                    )}
+                    className={cn("flex", message.role === "user" ? "justify-end" : "justify-start")}
                   >
                     <div
                       className={cn(
-                        "min-w-0 max-w-[80%] rounded-none px-4 py-2 text-sm",
+                        "min-w-0 max-w-[80%] text-[12px] leading-relaxed text-[#f5f5f5]",
                         message.role === "user"
-                          ? "whitespace-pre-wrap break-words bg-white text-black"
-                          : "overflow-hidden border border-[#2a2a2a] bg-[#111111] text-[#f5f5f5]",
+                          ? "rounded-2xl bg-[#f5f5f5] px-3 py-2 text-black whitespace-pre-wrap break-words"
+                          : "overflow-hidden",
                       )}
                     >
                       {isAssistant && reasoning && !hasReasoningPart && (
@@ -488,7 +385,7 @@ useEffect(() => {
         </ScrollArea>
 
         <div className="border-t border-[#1f1f1f] px-6 py-4">
-          <div className="flex items-end gap-2">
+          <div className="rounded-2xl border border-[#1f1f1f] bg-black px-3 py-2 transition-colors focus-within:border-[#3a3a3a]">
             <textarea
               ref={inputRef}
               value={input}
@@ -496,12 +393,107 @@ useEffect(() => {
               onKeyDown={handleKeyDown}
               placeholder="Ask about the codebase..."
               rows={1}
-              className="box-border min-h-[44px] min-w-0 max-h-32 flex-1 resize-none whitespace-pre-wrap break-words break-all overflow-y-auto rounded-none border border-[#1f1f1f] bg-black px-3 py-2.5 font-sans text-sm leading-[1.5] text-white shadow-none transition-colors placeholder:text-[#737373] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white disabled:cursor-not-allowed disabled:opacity-50"
+              className="box-border max-h-32 min-h-[42px] w-full resize-none whitespace-pre-wrap break-words break-all bg-transparent py-1 font-sans text-[12px] leading-[1.5] text-white shadow-none outline-none placeholder:text-[#737373] disabled:cursor-not-allowed disabled:opacity-50"
             />
-            <Button onClick={handleSend} disabled={!input.trim()}>
-              {isSending ? "Queue" : "Send"}
-            </Button>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
+                <label className="flex min-w-0 items-center gap-1">
+                  <span className={CONTROL_LABEL_CLASS}>Mode</span>
+                  <select
+                    value={mode}
+                    onChange={(event) => setMode(event.target.value as ChatMode)}
+                    className={cn(TRANSPARENT_CONTROL_CLASS, "w-[4.25rem] uppercase tracking-[0.12em]")}
+                    title={
+                      mode === "plan"
+                        ? "Read-only: shell, write, edit, apply_patch are blocked"
+                        : "All tools allowed"
+                    }
+                  >
+                    <option value="plan">Plan</option>
+                    <option value="build">Build</option>
+                  </select>
+                </label>
+                <label className="flex min-w-0 items-center gap-1">
+                  <span className={CONTROL_LABEL_CLASS}>Provider</span>
+                  {providers.length > 0 ? (
+                    <select
+                      value={providerDraft}
+                      onChange={(event) => {
+                        const nextProvider = event.target.value;
+                        const provider = providerOptions.find((config) => config.name === event.target.value);
+                        setProviderDraft(nextProvider);
+                        setModelDraft(provider?.model ?? getDefaultModel(nextProvider, modelDraft));
+                        setConfigStatus(null);
+                        setConfigError(null);
+                      }}
+                      className={cn(TRANSPARENT_CONTROL_CLASS, "max-w-[7.5rem]")}
+                    >
+                      {providerOptions.map((provider) => (
+                        <option key={provider.name} value={provider.name}>
+                          {provider.name}
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      value={providerDraft}
+                      onChange={(event) => {
+                        setProviderDraft(event.target.value);
+                        setConfigStatus(null);
+                        setConfigError(null);
+                      }}
+                      placeholder="anthropic"
+                      className={cn(TRANSPARENT_CONTROL_CLASS, "w-[7.5rem] placeholder:text-[#4a4a4a]")}
+                    />
+                  )}
+                </label>
+                <label className="flex min-w-0 items-center gap-1">
+                  <span className={CONTROL_LABEL_CLASS}>Model</span>
+                  <select
+                    value={modelDraft}
+                    onChange={(event) => {
+                      setModelDraft(event.target.value);
+                      setConfigStatus(null);
+                      setConfigError(null);
+                    }}
+                    className={cn(TRANSPARENT_CONTROL_CLASS, "max-w-[13rem]")}
+                    disabled={modelOptions.length === 0}
+                  >
+                    {modelOptions.length === 0 ? (
+                      <option value="">Add models in src/config/provider-models.json</option>
+                    ) : (
+                      modelOptions.map((model) => (
+                        <option key={model} value={model}>
+                          {model}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </label>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 px-1 text-[11px] text-[#737373] hover:bg-transparent hover:text-white disabled:hidden"
+                  onClick={saveSessionConfig}
+                  disabled={isConfigSaving || !configChanged}
+                >
+                  <Check className="h-3 w-3" />
+                  {isConfigSaving ? "Saving" : "Save"}
+                </Button>
+              </div>
+              <Button
+                size="sm"
+                className="h-7 shrink-0 rounded-full px-3 text-[11px]"
+                onClick={handleSend}
+                disabled={!input.trim()}
+              >
+                {isSending ? "Queue" : "Send"}
+              </Button>
+            </div>
           </div>
+          {(configStatus || configError) && (
+            <p className={cn("mt-1 text-[11px]", configError ? "text-[#ff5f5f]" : "text-[#737373]")}>{configError ?? configStatus}</p>
+          )}
           {(isSending || queuedMessageCount > 0) && (
             <p className="mt-2 text-xs text-[#737373]">
               {queuedMessageCount > 0

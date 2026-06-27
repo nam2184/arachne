@@ -129,23 +129,6 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
         let (abort_tx, mut abort_rx) = oneshot::channel();
         let abort_tx = Arc::new(abort_tx);
         let auth_header = format!("Bearer {api_key}");
-        let body_bytes = serde_json::to_vec(&body)
-            .map(|body| body.len())
-            .unwrap_or(0);
-        log_http_request_body(
-            &self.provider_name,
-            &self.chat_completions_url(),
-            &request.model,
-            &body,
-            body_bytes,
-        );
-        log_request_structure_and_input(
-            &self.provider_name,
-            &request.model,
-            &body,
-            extract_last_user_input(&body),
-        );
-
         let response = self
             .http_client
             .post(self.chat_completions_url())
@@ -222,17 +205,53 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
             // ends abruptly (truncated response, network drop)
             // after the per-chunk branch already emitted one.
             let mut finished = false;
+            let mut termination_path = "upstream_eof_without_finish";
+            let mut stream_error: Option<String> = None;
 
             // The HTTP stream is the single source of truth for this
             // provider turn. Tool results are produced by the runner
             // after the stream ends and are included in the next request
             // via persisted conversation history.
             while let Some(chunk) = event_stream.next().await {
-                if matches!(abort_rx.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)) {
-                    break;
+                match abort_rx.try_recv() {
+                    Ok(()) => {
+                        termination_path = "local_abort_signal";
+                        tracing::warn!(
+                            provider = %stream_provider,
+                            model = %stream_model,
+                            termination_path,
+                            "llm http stream stopping because local abort signal was received"
+                        );
+                        break;
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        termination_path = "local_abort_sender_dropped";
+                        tracing::warn!(
+                            provider = %stream_provider,
+                            model = %stream_model,
+                            termination_path,
+                            "llm http stream stopping because local abort sender was dropped"
+                        );
+                        break;
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                 }
 
-                let Ok(bytes) = chunk else { continue };
+                let bytes = match chunk {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        termination_path = "byte_stream_error";
+                        stream_error = Some(error.to_string());
+                        tracing::warn!(
+                            provider = %stream_provider,
+                            model = %stream_model,
+                            error = stream_error.as_deref().unwrap_or(""),
+                            termination_path,
+                            "llm http stream stopping because response byte stream returned an error"
+                        );
+                        break;
+                    }
+                };
                 let text = String::from_utf8_lossy(&bytes);
 
                 let mut saw_done = false;
@@ -248,6 +267,12 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
                     if line == "data: [DONE]" || line == "[DONE]" {
                         log_sse_event_body(&stream_provider, &stream_model, line);
                         saw_done = true;
+                        tracing::info!(
+                            provider = %stream_provider,
+                            model = %stream_model,
+                            sse_done = true,
+                            "llm http stream observed SSE [DONE] terminal event"
+                        );
                         break;
                     }
 
@@ -267,6 +292,12 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
                         let parsed = parse_openai_chunk_into_events(data, &mut tool_state);
                         if let Some(reason) = parsed.finish_reason {
                             finish_reason_seen = Some(reason);
+                            tracing::info!(
+                                provider = %stream_provider,
+                                model = %stream_model,
+                                finish_reason = ?reason,
+                                "llm http stream observed provider finish_reason in SSE payload"
+                            );
                         }
                         if parsed.usage.is_some() {
                             usage_seen = parsed.usage;
@@ -278,6 +309,13 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
                 }
 
                 if saw_done || finish_reason_seen.is_some() {
+                    termination_path = if saw_done && finish_reason_seen.is_some() {
+                        "sse_done_and_finish_reason"
+                    } else if saw_done {
+                        "sse_done"
+                    } else {
+                        "finish_reason"
+                    };
                     // Flush any tool calls the model streamed but
                     // didn't terminate. OpenAI's wire format only
                     // completes a tool call when the arguments JSON
@@ -288,6 +326,14 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
                         yield event;
                     }
                     let reason = finish_reason_seen.unwrap_or(FinishReason::Stop);
+                    tracing::info!(
+                        provider = %stream_provider,
+                        model = %stream_model,
+                        termination_path,
+                        sse_done = saw_done,
+                        finish_reason = ?reason,
+                        "llm http stream emitting Finish after provider terminal signal"
+                    );
                     yield LlmEvent::Finish { reason, usage: usage_seen };
                     finished = true;
                     break;
@@ -305,10 +351,24 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
                 yield event;
             }
             if !finished {
+                tracing::warn!(
+                    provider = %stream_provider,
+                    model = %stream_model,
+                    termination_path,
+                    stream_error = stream_error.as_deref().unwrap_or(""),
+                    "llm http stream ended without SSE [DONE] or finish_reason; emitting synthetic Finish(stop)"
+                );
                 yield LlmEvent::Finish {
                     reason: FinishReason::Stop,
                     usage: None,
                 };
+            } else {
+                tracing::info!(
+                    provider = %stream_provider,
+                    model = %stream_model,
+                    termination_path,
+                    "llm http stream closed after provider terminal signal"
+                );
             }
         };
 
@@ -698,140 +758,6 @@ fn parse_openai_usage(value: &Value) -> Option<crate::llm::events::Usage> {
             .and_then(|v| v.as_u64()),
         cache_write_input_tokens: None,
     })
-}
-
-fn log_http_request_body(
-    provider: &str,
-    url: &str,
-    model: &str,
-    body: &serde_json::Value,
-    body_bytes: usize,
-) {
-    let body =
-        serde_json::to_string_pretty(body).unwrap_or_else(|_| "<unserializable>".to_string());
-
-    tracing::info!(
-        provider,
-        url,
-        model,
-        body_bytes,
-        body = %body,
-        "llm http request body prepared (full)"
-    );
-}
-
-/// Pull the most recent user-role entry's content out of the
-/// request body. We log it (truncated) on every send so the
-/// developer can confirm what the model actually sees as the
-/// latest instruction, including any `role: "tool"` results
-/// that the renderer turned into structured entries.
-fn extract_last_user_input(body: &serde_json::Value) -> Option<String> {
-    let messages = body.get("messages")?.as_array()?;
-    for entry in messages.iter().rev() {
-        let role = entry.get("role").and_then(|value| value.as_str());
-        if role == Some("user") {
-            return Some(stringify_message_content(&entry["content"]));
-        }
-    }
-    None
-}
-
-fn stringify_message_content(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Array(parts) => parts
-            .iter()
-            .filter_map(|part| {
-                if part.get("type").and_then(|value| value.as_str()) == Some("text") {
-                    part.get("text")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string)
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
-    }
-}
-
-/// Debug-level dump of the JSON structure and the latest user
-/// input content, truncated. The shape log is intentionally
-/// cheap (counts of messages and roles + tool-call ids) so the
-/// full payload stays inspectable in the structured `body`
-/// field of the same line; the input log is what the developer
-/// usually wants to inspect first.
-fn log_request_structure_and_input(
-    provider: &str,
-    model: &str,
-    body: &serde_json::Value,
-    last_user_input: Option<String>,
-) {
-    let mut role_counts: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
-    let mut tool_call_ids: Vec<String> = Vec::new();
-    let mut last_tool_result: Option<String> = None;
-
-    if let Some(messages) = body.get("messages").and_then(|value| value.as_array()) {
-        for entry in messages {
-            let role = entry
-                .get("role")
-                .and_then(|value| value.as_str())
-                .unwrap_or("?")
-                .to_string();
-            *role_counts.entry(role).or_insert(0) += 1;
-            if let Some(tool_calls) = entry.get("tool_calls").and_then(|value| value.as_array()) {
-                for call in tool_calls {
-                    if let Some(id) = call.get("id").and_then(|value| value.as_str()) {
-                        tool_call_ids.push(id.to_string());
-                    }
-                }
-            }
-            if entry.get("role").and_then(|value| value.as_str()) == Some("tool") {
-                last_tool_result = Some(stringify_message_content(&entry["content"]));
-            }
-        }
-    }
-
-    const INPUT_LOG_CHARS: usize = 1024;
-    let last_user_input = last_user_input.map(|text| {
-        if text.chars().count() > INPUT_LOG_CHARS {
-            let mut truncated = text.chars().take(INPUT_LOG_CHARS).collect::<String>();
-            truncated.push_str("…[truncated]");
-            truncated
-        } else {
-            text
-        }
-    });
-    const TOOL_RESULT_LOG_CHARS: usize = 512;
-    let last_tool_result = last_tool_result.map(|text| {
-        if text.chars().count() > TOOL_RESULT_LOG_CHARS {
-            let mut truncated = text.chars().take(TOOL_RESULT_LOG_CHARS).collect::<String>();
-            truncated.push_str("…[truncated]");
-            truncated
-        } else {
-            text
-        }
-    });
-
-    tracing::debug!(
-        provider = %provider,
-        model = %model,
-        role_counts = ?role_counts,
-        tool_call_ids = ?tool_call_ids,
-        message_count = body
-            .get("messages")
-            .and_then(|value| value.as_array())
-            .map(|arr| arr.len())
-            .unwrap_or(0),
-        last_user_input = %last_user_input.as_deref().unwrap_or(""),
-        last_user_input_chars = last_user_input.as_deref().map(str::len).unwrap_or(0),
-        last_tool_result = %last_tool_result.as_deref().unwrap_or(""),
-        last_tool_result_chars = last_tool_result.as_deref().map(str::len).unwrap_or(0),
-        "llm request structure + truncated input"
-    );
 }
 
 fn build_request_body(

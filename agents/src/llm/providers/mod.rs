@@ -16,24 +16,19 @@ use super::request::{LlmError, LlmRequest, LlmResponse};
 /// tool error so it can self-correct.
 pub type ToolDispatcherFn = dyn Fn(&str, serde_json::Value) -> Result<String, String> + Send + Sync;
 
-mod aisdk_provider;
-mod aisdk_wrappers;
 pub(crate) mod error_parsing;
+mod http;
 pub mod minimax_token_plan;
 mod openai_compatible_backend;
-mod openai_compatible_http;
-mod openai_compatible_sdk;
-pub(crate) mod sdk_tool_registry;
+mod sdk;
+pub mod sse_proxy;
 
-pub use aisdk_provider::{
-    api_key_env as aisdk_api_key_env, docs_url as aisdk_docs_url,
-    provider_base_url_env as aisdk_provider_base_url_env,
-    provider_model_env as aisdk_provider_model_env,
-    supported_provider_names as aisdk_supported_provider_names,
-};
-pub use aisdk_wrappers::provider_from_config as aisdk_provider_from_config;
-pub use aisdk_wrappers::*;
 pub use minimax_token_plan::MiniMaxTokenPlanProvider;
+pub use sdk::*;
+pub use sdk::{
+    aisdk_api_key_env, aisdk_docs_url, aisdk_provider_base_url_env, aisdk_provider_from_config,
+    aisdk_provider_model_env, aisdk_supported_provider_names,
+};
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -105,6 +100,8 @@ pub(super) fn log_sse_event_body(provider: &str, model: &str, body: &str) {
         model = %model,
         body_bytes = body.len(),
         body_truncated,
+        sse_done = body == "[DONE]" || body == "data: [DONE]",
+        has_finish_reason = body.contains("\"finish_reason\""),
         body = %body_display,
         "llm sse response body"
     );

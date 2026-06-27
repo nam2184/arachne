@@ -3,8 +3,8 @@ use std::sync::Arc;
 use super::{LlmError, LlmProvider, LlmStream, ToolDispatcherFn};
 use crate::llm::request::LlmRequest;
 
-use super::openai_compatible_http::OpenAiCompatibleHttpProvider;
-use super::openai_compatible_sdk::OpenAiCompatibleSdkProvider;
+use super::http::OpenAiCompatibleHttpProvider;
+use super::sdk::OpenAiCompatibleSdkProvider;
 
 pub enum OpenAiCompatibleBackend {
     Http(OpenAiCompatibleHttpProvider),

@@ -10,7 +10,7 @@ use aisdk::core::{
 use aisdk::providers::OpenAICompatible;
 
 use super::error_parsing::{format_provider_error, parse_provider_error_body};
-use super::sdk_tool_registry::build_sdk_tool;
+use super::tool_registry::build_sdk_tool;
 use super::{LlmError, LlmProvider, LlmStream, ToolDispatcherFn};
 use crate::llm::events::{FinishReason, LlmEvent, ToolResultValue};
 use crate::llm::request::{ContentPart, LlmRequest};
@@ -193,13 +193,6 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
                 .unwrap_or(false),
             "aisdk request starting"
         );
-        log_sdk_request_structure(
-            &self.provider_name,
-            &request.model,
-            &request,
-            &system,
-            &messages,
-        );
         let mut builder = if system.is_empty() {
             LanguageModelRequest::<SdkModel>::builder()
                 .model(model)
@@ -303,12 +296,31 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
         let stream = async_stream::stream! {
             let mut response = response;
             let mut saw_provider_error = false;
+            let mut saw_end_chunk = false;
+            let mut text_chunks = 0_u64;
+            let mut text_bytes = 0_usize;
 
             while let Some(chunk) = response.stream.next().await {
                 match chunk {
-                    LanguageModelStreamChunkType::Start => {}
+                    LanguageModelStreamChunkType::Start => {
+                        tracing::debug!(
+                            provider = %stream_provider,
+                            model = %stream_model,
+                            "sdk llm stream chunk: start"
+                        );
+                    }
                     LanguageModelStreamChunkType::Text(text) => {
                         if !text.is_empty() {
+                            text_chunks += 1;
+                            text_bytes += text.len();
+                            tracing::trace!(
+                                provider = %stream_provider,
+                                model = %stream_model,
+                                chunk_bytes = text.len(),
+                                text_chunks,
+                                text_bytes,
+                                "sdk llm stream chunk: text"
+                            );
                             yield LlmEvent::TextDelta {
                                 id: "text".to_string(),
                                 text,
@@ -332,12 +344,34 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
                     // doesn't need them, and downstream
                     // consumers care about the resolved call.
                     LanguageModelStreamChunkType::ToolCall(_) => {}
-                    LanguageModelStreamChunkType::End(_) => {}
+                    LanguageModelStreamChunkType::End(_) => {
+                        saw_end_chunk = true;
+                        tracing::info!(
+                            provider = %stream_provider,
+                            model = %stream_model,
+                            text_chunks,
+                            text_bytes,
+                            "sdk llm stream chunk: end"
+                        );
+                    }
                     LanguageModelStreamChunkType::Failed(message) => {
                         saw_provider_error = true;
+                        tracing::warn!(
+                            provider = %stream_provider,
+                            model = %stream_model,
+                            error = %message,
+                            "sdk llm stream chunk: failed"
+                        );
                         yield LlmEvent::ProviderError { message };
                     }
                     LanguageModelStreamChunkType::Incomplete(message) => {
+                        tracing::warn!(
+                            provider = %stream_provider,
+                            model = %stream_model,
+                            message = %message,
+                            stopped_by_hook = message == "Stopped by hook",
+                            "sdk llm stream chunk: incomplete"
+                        );
                         if message != "Stopped by hook" {
                             saw_provider_error = true;
                             yield LlmEvent::ProviderError { message };
@@ -345,10 +379,26 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
                     }
                     LanguageModelStreamChunkType::NotSupported(message) => {
                         saw_provider_error = true;
+                        tracing::warn!(
+                            provider = %stream_provider,
+                            model = %stream_model,
+                            error = %message,
+                            "sdk llm stream chunk: not_supported"
+                        );
                         yield LlmEvent::ProviderError { message };
                     }
                 }
             }
+
+            tracing::info!(
+                provider = %stream_provider,
+                model = %stream_model,
+                saw_end_chunk,
+                saw_provider_error,
+                text_chunks,
+                text_bytes,
+                "sdk llm stream exhausted"
+            );
 
             // The SDK's `handle_tool_call` already ran the
             // executor and inserted the `Message::Tool` for
@@ -369,21 +419,28 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
             }
 
             let usage = Some(sdk_usage(response.usage().await));
+            let raw_stop_reason = response.stop_reason().await;
+            let raw_stop_reason_debug = format!("{raw_stop_reason:?}");
             let reason = if !tool_calls.is_empty() {
                 FinishReason::ToolCalls
             } else if saw_provider_error {
                 FinishReason::Error
             } else {
-                sdk_finish_reason(response.stop_reason().await)
+                sdk_finish_reason(raw_stop_reason)
             };
 
-            tracing::debug!(
-                "sdk llm stream finished: provider={} model={} reason={} tool_calls={} tool_results={}",
-                stream_provider,
-                stream_model,
-                reason,
-                tool_calls.len(),
-                tool_results.len(),
+            tracing::info!(
+                provider = %stream_provider,
+                model = %stream_model,
+                reason = %reason,
+                raw_stop_reason = %raw_stop_reason_debug,
+                saw_end_chunk,
+                saw_provider_error,
+                text_chunks,
+                text_bytes,
+                tool_calls = tool_calls.len(),
+                tool_results = tool_results.len(),
+                "sdk llm stream finished"
             );
 
             yield LlmEvent::Finish { reason, usage };
@@ -1064,96 +1121,6 @@ mod tests {
     }
 }
 
-/// Dump of the SDK-bound request structure and the last user-role
-/// input text. Mirrors the HTTP-side `log_request_structure_and_input`
-/// so the developer gets the same inspection surface on both backends.
-///
-/// We read the user/tool content straight off our own
-/// `LlmRequest` instead of the SDK's `Message` enum so the log
-/// doesn't depend on the SDK's internal field names (which
-/// aren't visible from this crate).
-fn log_sdk_request_structure(
-    provider: &str,
-    model: &str,
-    request: &LlmRequest,
-    system: &str,
-    sdk_messages: &[Message],
-) {
-    let mut role_counts: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
-    let mut sdk_role_counts: std::collections::BTreeMap<&'static str, usize> =
-        std::collections::BTreeMap::new();
-    let mut tool_call_ids: Vec<String> = Vec::new();
-    let mut last_user_input: Option<String> = None;
-    let mut last_tool_result: Option<String> = None;
-
-    for message in &request.messages {
-        *role_counts.entry(message.role.clone()).or_insert(0) += 1;
-        for part in &message.content {
-            if let ContentPart::ToolCall { id, .. } = part {
-                tool_call_ids.push(id.clone());
-            }
-            if let ContentPart::ToolResult { result, .. } = part {
-                last_tool_result = Some(serde_json::to_string(result).unwrap_or_default());
-            }
-        }
-    }
-
-    for message in sdk_messages {
-        let role = match message {
-            Message::System(_) => "system",
-            Message::User(_) => "user",
-            Message::Assistant(_) => "assistant",
-            Message::Tool(_) => "tool",
-            Message::Developer(_) => "developer",
-        };
-        *sdk_role_counts.entry(role).or_insert(0) += 1;
-    }
-
-    for message in request.messages.iter().rev() {
-        if message.role == "user" {
-            last_user_input = Some(prompt_text(&message.content));
-            break;
-        }
-    }
-
-    // `sdk_messages` is the same vector handed to the SDK. We log
-    // its length for symmetry with the HTTP path; the structural
-    // breakdown above is sourced from `request.messages` so we
-    // don't depend on the SDK's internal field names.
-    const INPUT_LOG_CHARS: usize = 1024;
-    let last_user_input = last_user_input.map(|text| truncate_chars(&text, INPUT_LOG_CHARS));
-    const TOOL_RESULT_LOG_CHARS: usize = 512;
-    let last_tool_result =
-        last_tool_result.map(|text| truncate_chars(&text, TOOL_RESULT_LOG_CHARS));
-
-    tracing::debug!(
-        provider = %provider,
-        model = %model,
-        role_counts = ?role_counts,
-        sdk_role_counts = ?sdk_role_counts,
-        tool_call_ids = ?tool_call_ids,
-        system_chars = system.chars().count(),
-        message_count = sdk_messages.len(),
-        last_user_input = %last_user_input.as_deref().unwrap_or(""),
-        last_user_input_chars = last_user_input.as_deref().map(str::len).unwrap_or(0),
-        last_tool_result = %last_tool_result.as_deref().unwrap_or(""),
-        last_tool_result_chars = last_tool_result.as_deref().map(str::len).unwrap_or(0),
-        "aisdk request structure + truncated input"
-    );
-
-    let body = build_sdk_wire_shape(request, system, sdk_messages);
-    let body_pretty =
-        serde_json::to_string_pretty(&body).unwrap_or_else(|_| "<unserializable>".to_string());
-    tracing::info!(
-        provider = %provider,
-        model = %model,
-        body_bytes = body_pretty.len(),
-        body = %body_pretty,
-        "aisdk wire-shape request body prepared (full)"
-    );
-}
-
 /// Build the exact JSON shape the AI SDK's OpenAI-compatible
 /// provider serializes on the wire for chat-completions. We
 /// can't read the SDK's internal `options` struct, so we
@@ -1161,6 +1128,7 @@ fn log_sdk_request_structure(
 /// system prompt, and tool definitions the SDK builder consumed. The
 /// shape matches `OpenAIChatCompletionsOptions` in
 /// `aisdk-0.5.2/src/providers/openai_chat_completions.rs`.
+#[cfg(test)]
 fn build_sdk_wire_shape(
     request: &LlmRequest,
     system: &str,
@@ -1248,6 +1216,7 @@ fn build_sdk_wire_shape(
     serde_json::Value::Object(body)
 }
 
+#[cfg(test)]
 fn sdk_assistant_wire_message(message: &AssistantMessage) -> serde_json::Value {
     match &message.content {
         LanguageModelResponseContentType::Text(text) => serde_json::json!({
@@ -1300,13 +1269,4 @@ async fn stream_text_with_retry(
         }
         Err(other) => Err(other),
     }
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let mut truncated = text.chars().take(max_chars).collect::<String>();
-    truncated.push_str("…[truncated]");
-    truncated
 }

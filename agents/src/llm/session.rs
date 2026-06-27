@@ -1679,6 +1679,12 @@ impl SessionRunner {
 
                 LlmEvent::Finish { reason, .. } => {
                     finish_reason = reason;
+                    tracing::info!(
+                        session_id = %session_id,
+                        step = step,
+                        finish_reason = ?reason,
+                        "runner received terminal LLM Finish event"
+                    );
                 }
 
                 LlmEvent::ToolError { id, name, message } => {
@@ -2691,6 +2697,28 @@ fn project_name_from_directory(directory: &str) -> &str {
 
 /// thinking).
 
+const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
+const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
+
+fn strip_system_reminder_blocks(input: &str) -> String {
+    let mut rest = input;
+    let mut output = String::with_capacity(input.len());
+
+    while let Some(open_idx) = rest.find(SYSTEM_REMINDER_OPEN) {
+        output.push_str(&rest[..open_idx]);
+
+        let after_open = &rest[open_idx + SYSTEM_REMINDER_OPEN.len()..];
+        let Some(close_idx) = after_open.find(SYSTEM_REMINDER_CLOSE) else {
+            return output;
+        };
+
+        rest = &after_open[close_idx + SYSTEM_REMINDER_CLOSE.len()..];
+    }
+
+    output.push_str(rest);
+    output
+}
+
 fn flush_text_buffer(
     buffer: &mut String,
 
@@ -2702,7 +2730,7 @@ fn flush_text_buffer(
         return;
     }
 
-    let mut rest = std::mem::take(buffer);
+    let mut rest = strip_system_reminder_blocks(&std::mem::take(buffer));
 
     *in_think_block = false;
 
@@ -3802,7 +3830,7 @@ mod tests {
 
     #[test]
 
-    fn flush_text_buffer_preserves_system_reminder_as_text() {
+    fn flush_text_buffer_strips_system_reminder_blocks() {
         let parts = flush_for_test("before <system-reminder>secret</system-reminder> after");
 
         let visible: String = parts
@@ -3815,7 +3843,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
 
-        assert!(visible.contains("<system-reminder>secret</system-reminder>"));
+        assert_eq!(visible, "before  after");
+
+        assert!(!visible.contains("<system-reminder>"));
+
+        assert!(!visible.contains("secret"));
 
         assert!(parts
             .iter()
@@ -4299,6 +4331,58 @@ mod tests {
             msgs.iter().all(|m| m.role != "assistant"),
             "finish-only turn should not persist an empty assistant message: {msgs:#?}"
         );
+    }
+
+    #[tokio::test]
+
+    async fn finish_without_text_end_strips_system_reminder_from_final_flush() {
+        init_tracing();
+
+        let model_text = "Visible before <system-reminder>secret</system-reminder> visible after";
+
+        let (runner, _tmp, session_id) =
+            run_with_scripted("scripted", vec![text_delta_chunks(model_text, 5)], "/tmp").await;
+
+        let result = runner.run(&session_id).await.expect("run failed");
+
+        assert_eq!(
+            result.steps, 1,
+            "stop finish should not force an extra provider call"
+        );
+
+        let msgs = runner
+            .conversation_service
+            .get_messages(&session_id)
+            .expect("get_messages");
+
+        let assistant = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant")
+            .expect("assistant message");
+
+        assert!(
+            !assistant.content.contains("<system-reminder>")
+                && !assistant.content.contains("</system-reminder>")
+                && !assistant.content.contains("secret"),
+            "system reminder must not be persisted in final flush: {}",
+            assistant.content
+        );
+
+        let parts: Vec<ContentPart> = serde_json::from_str(&assistant.content)
+            .expect("assistant content should be a parts JSON array");
+
+        let visible: String = parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert_eq!(visible, "Visible before  visible after");
     }
 
     #[tokio::test]

@@ -1,13 +1,19 @@
 use std::sync::Arc;
 
 use arachne_agents::{
-    llm::providers::{aisdk_provider_from_config, MiniMaxTokenPlanProvider},
+    llm::providers::{
+        aisdk_provider_from_config,
+        minimax_token_plan::{
+            MiniMaxTokenPlanProvider, DEFAULT_BASE_URL as MINIMAX_DEFAULT_BASE_URL,
+        },
+        sse_proxy::SseProxyManager,
+    },
     llm::{ContentPart, SubagentRegistry},
     sandbox::SandboxPolicy,
     tools::SandboxedContext,
     CompactionConfig, CompactionOutcome, CompactionRequest, CompactionService, ConversationService,
-    LlmProvider, MessageRole, ModelRegistry, ProviderProtocol, ProviderRegistry, ProviderService,
-    SessionError, SessionRunEvent, SessionRunner, SessionService,
+    LlmProvider, MessageRole, ModelRegistry, ProviderConfig, ProviderProtocol, ProviderRegistry,
+    ProviderService, SessionError, SessionRunEvent, SessionRunner, SessionService,
 };
 use tauri::{AppHandle, Emitter};
 
@@ -44,6 +50,7 @@ pub struct AgentService {
     subagent_registry: Arc<SubagentRegistry>,
     permission_map: Arc<PermissionMap>,
     compactor: Arc<CompactionService>,
+    sse_proxy: Arc<SseProxyManager>,
 }
 
 impl AgentService {
@@ -62,6 +69,7 @@ impl AgentService {
             Arc::new(ModelRegistry::from_embedded_json()),
             CompactionConfig::default(),
         );
+        let sse_proxy = Arc::new(SseProxyManager::new());
 
         Arc::new(Self {
             providers,
@@ -71,7 +79,12 @@ impl AgentService {
             subagent_registry,
             permission_map,
             compactor,
+            sse_proxy,
         })
+    }
+
+    pub fn sse_proxy(&self) -> Arc<SseProxyManager> {
+        Arc::clone(&self.sse_proxy)
     }
 
     pub fn compactor(&self) -> &Arc<CompactionService> {
@@ -130,10 +143,38 @@ impl AgentService {
     }
 
     pub async fn refresh_provider(&self, name: &str) {
-        let config = match self.provider_service.get_config(name) {
+        let mut config = match self.provider_service.get_config(name) {
             Some(c) if c.enabled => c,
             _ => return,
         };
+
+        // Opt-in routing through the in-process SSE proxy. The proxy
+        // forwards bytes unchanged, but records raw SSE terminal data
+        // for unstable providers such as MiniMax.
+        if SseProxyManager::env_enabled(&config.name) {
+            let upstream = config
+                .base_url
+                .clone()
+                .unwrap_or_else(|| default_upstream_base_url(&config.name).to_string());
+            match self.sse_proxy.ensure_for_provider(&config.name, &upstream) {
+                Ok((local_base_url, _instance)) => {
+                    tracing::info!(
+                        provider = %config.name,
+                        upstream_base_url = %upstream,
+                        local_base_url = %local_base_url,
+                        "routing provider through sse_proxy"
+                    );
+                    config.base_url = Some(local_base_url);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        provider = %config.name,
+                        error = %error,
+                        "failed to start sse_proxy; falling back to direct upstream"
+                    );
+                }
+            }
+        }
 
         let provider: Arc<dyn LlmProvider> = match &config.protocol {
             ProviderProtocol::OpenAI if config.name == "minimax" => {
@@ -244,6 +285,13 @@ fn emit_agent_event(app: &AppHandle, event: AgentUiEvent) {
     if let Err(error) = app.emit(AGENT_EVENT, event) {
         tracing::warn!("failed to emit agent event: {}", error);
     }
+}
+
+fn default_upstream_base_url(provider: &str) -> &'static str {
+    if provider.eq_ignore_ascii_case("minimax") {
+        return MINIMAX_DEFAULT_BASE_URL;
+    }
+    "https://api.openai.com/v1"
 }
 
 fn chat_error_message(error: &SessionError) -> String {
