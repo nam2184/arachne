@@ -16,6 +16,7 @@ use services::permission_map::PermissionMap;
 use services::project_service::ProjectService;
 use services::settings_service::SettingsService;
 use services::stack_detector::StackDetector;
+use services::ui_command_service::UiCommandService;
 
 pub struct AppState {
     pub project_service: Arc<ProjectService>,
@@ -26,6 +27,7 @@ pub struct AppState {
     pub memory_service: Arc<MemoryService>,
     pub stack_detector: Arc<StackDetector>,
     pub permission_map: Arc<PermissionMap>,
+    pub ui_command_service: Arc<UiCommandService>,
 }
 
 fn setup_logging() {
@@ -138,6 +140,7 @@ pub fn run() {
     }
 
     let permission_map = Arc::new(PermissionMap::new());
+    let ui_command_service = Arc::new(UiCommandService::new());
     let subagent_registry = SubagentRegistry::new(db_path.clone());
 
     let agent_service = AgentService::new(
@@ -161,8 +164,10 @@ pub fn run() {
             memory_service: Arc::clone(&memory_service),
             stack_detector: Arc::clone(&stack_detector),
             permission_map: Arc::clone(&permission_map),
+            ui_command_service: Arc::clone(&ui_command_service),
         })
         .manage(permission_map)
+        .manage(ui_command_service)
         .manage(agent_service)
         .manage(provider_service)
         .manage(conversation_service)
@@ -210,6 +215,8 @@ pub fn run() {
             commands::permission_commands::permission_list_pending,
             commands::permission_commands::permission_reply,
             commands::compaction_commands::compact_now,
+            commands::ui_commands::list_ui_commands,
+            commands::ui_commands::execute_ui_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

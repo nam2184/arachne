@@ -12,6 +12,12 @@ import { usePermissionStore } from "@/features/permissions/permissionStore";
 import { useConversationStore, type AgentStreamEvent } from "@/features/sessions/conversationStore";
 import { useSessionStore } from "@/features/sessions/sessionStore";
 
+interface UiCommandResult {
+  status: string;
+  message: string;
+  conversationChanged: boolean;
+}
+
 export function SessionWorkspace() {
   const currentProject = useProjectStore((state) => state.currentProject);
   const {
@@ -43,8 +49,6 @@ export function SessionWorkspace() {
     finishStreamingMessage,
     streamingMessageId,
   } = useConversationStore();
-  const compactNow = useConversationStore((state) => state.compactNow);
-  const isCompacting = useConversationStore((state) => state.isCompacting);
   const initializePermissions = usePermissionStore((state) => state.initialize);
   const [isCreating, setIsCreating] = useState(false);
   const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set());
@@ -346,15 +350,23 @@ export function SessionWorkspace() {
     clearConversation();
   }, [clearConversation]);
 
-  const compactChat = useCallback(async () => {
-    if (!chatSessionId || runningSessionIds.has(chatSessionId) || isCompacting) return;
-    try {
-      await compactNow(chatSessionId);
-    } catch (compactError) {
-      setError(formatError(compactError));
-      console.error("Failed to compact conversation:", compactError);
+  const runUiCommand = useCallback(async (input: string): Promise<UiCommandResult> => {
+    if (!chatSessionId) {
+      throw new Error("No active chat session.");
     }
-  }, [chatSessionId, compactNow, runningSessionIds, isCompacting]);
+    if (runningSessionIds.has(chatSessionId)) {
+      throw new Error("Wait for the current run to finish before running a UI command.");
+    }
+
+    const result = await invoke<UiCommandResult>("execute_ui_command", {
+      sessionId: chatSessionId,
+      input,
+    });
+    if (result.conversationChanged) {
+      await loadUiConversation(chatSessionId);
+    }
+    return result;
+  }, [chatSessionId, loadUiConversation, runningSessionIds]);
 
   const chatSession = chatSessionId ? sessions.get(chatSessionId) ?? null : null;
   const isChatSending = chatSessionId ? runningSessionIds.has(chatSessionId) : false;
@@ -453,11 +465,10 @@ export function SessionWorkspace() {
           messages={chatMessages}
           isSending={isChatSending}
           queuedMessageCount={queuedMessageCount}
-          isCompacting={isCompacting}
           streamingMessageId={streamingMessageId}
           onSendMessage={sendChatMessage}
+          onRunCommand={runUiCommand}
           onUpdateSessionProvider={updateSessionProvider}
-          onCompact={compactChat}
           onClose={closeChat}
         />
       )}

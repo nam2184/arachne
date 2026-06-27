@@ -44,6 +44,25 @@ impl SessionService {
         provider: String,
         model: String,
     ) -> Result<(String, bool), String> {
+        let db = self.db()?;
+        if ProjectRepository::find_by_id(&db, &project_id)?.is_none() {
+            return Err("Project must exist before creating sessions".to_string());
+        }
+
+        let raw_path = PathBuf::from(&directory);
+        if !raw_path.exists() || !raw_path.is_dir() {
+            return Err(format!("Session directory does not exist: {directory}"));
+        }
+
+        let canonical = canonicalize_directory(&directory)
+            .to_string_lossy()
+            .to_string();
+        if let Some(existing) =
+            SessionRepository::find_top_level_by_project_directory(&db, &project_id, &canonical)?
+        {
+            return Ok((existing.id, false));
+        }
+
         self.create_session_with_parent(project_id, directory, provider, model, None)
     }
 
@@ -346,6 +365,34 @@ mod tests {
         let sessions = service.get_all_sessions().expect("get_all_sessions");
         assert_ne!(id_a, id_b);
         assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn create_top_level_session_reuses_same_project_directory() {
+        let (service, work, _db) = make_service();
+        seed_project(&service, "p1", "arachne");
+        let (id_a, created_a) = service
+            .create_top_level_session(
+                "p1".to_string(),
+                work.path().to_string_lossy().to_string(),
+                "anthropic".to_string(),
+                "claude-sonnet-4-20250514".to_string(),
+            )
+            .unwrap();
+        let (id_b, created_b) = service
+            .create_top_level_session(
+                "p1".to_string(),
+                work.path().to_string_lossy().to_string(),
+                "openai".to_string(),
+                "gpt-4.1".to_string(),
+            )
+            .unwrap();
+
+        let sessions = service.get_all_sessions().expect("get_all_sessions");
+        assert!(created_a);
+        assert!(!created_b);
+        assert_eq!(id_a, id_b);
+        assert_eq!(sessions.len(), 1);
     }
 
     #[test]

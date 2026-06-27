@@ -174,6 +174,33 @@ impl SessionRepository {
         Ok(sessions)
     }
 
+    pub fn find_top_level_by_project_directory(
+        db: &Database,
+        project_id: &str,
+        directory: &str,
+    ) -> Result<Option<AgentSession>, String> {
+        let mut stmt = db
+            .connection()
+            .prepare(
+                "
+                SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
+                       s.parent_session_id, s.summary_json,
+                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id
+                FROM agent_sessions s
+                WHERE s.project_id = ?1
+                  AND s.directory = ?2
+                  AND s.parent_session_id IS NULL
+                ORDER BY s.created_at ASC
+                LIMIT 1
+                ",
+            )
+            .map_err(|e| e.to_string())?;
+
+        Ok(stmt
+            .query_row(params![project_id, directory], |row| session_from_row(row))
+            .ok())
+    }
+
     /// Walk the `parent_session_id` chain starting at `id` and return each
     /// ancestor's id, nearest-first. Stops at the first row whose
     /// `parent_session_id` is NULL. Bounded to `max_hops` iterations as a

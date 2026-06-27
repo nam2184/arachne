@@ -53,6 +53,8 @@ function mapById<T extends { id: string }>(items: T[]) {
 }
 
 export const useSessionStore = create<SessionState>((set, get) => {
+  const pendingCreates = new Map<string, Promise<string>>();
+
   const refreshSessions = async () => {
     const sessions = await invoke<AgentSession[]>("get_all_sessions");
     set({ sessions: mapById(sessions) });
@@ -76,6 +78,11 @@ export const useSessionStore = create<SessionState>((set, get) => {
     initialize: refreshAll,
 
     createSession: async (projectId, directory) => {
+      const createKey = `${projectId}:${directory}`;
+      const pending = pendingCreates.get(createKey);
+      if (pending) return pending;
+
+      const createPromise = (async () => {
       const providerConfigs = await invoke<ProviderConfig[]>("get_provider_configs");
       const activeConfig = providerConfigs.find((config) => config.enabled) ?? providerConfigs[0];
       const provider = activeConfig?.name ?? "anthropic";
@@ -91,6 +98,14 @@ export const useSessionStore = create<SessionState>((set, get) => {
       await refreshSessions();
       set({ activeSessionId: id });
       return id;
+      })();
+
+      pendingCreates.set(createKey, createPromise);
+      try {
+        return await createPromise;
+      } finally {
+        pendingCreates.delete(createKey);
+      }
     },
 
     setActiveSession: (id) => set({ activeSessionId: id }),

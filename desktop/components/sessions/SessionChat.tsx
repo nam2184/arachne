@@ -20,25 +20,37 @@ export interface SessionChatMessage {
 
 export type ChatMode = "plan" | "build";
 
+interface UiCommandHint {
+  name: string;
+  usage: string;
+  description: string;
+}
+
+interface UiCommandResult {
+  status: string;
+  message: string;
+  conversationChanged: boolean;
+}
+
 interface SessionChatProps {
   session: AgentSession;
   messages: SessionChatMessage[];
   isSending: boolean;
   queuedMessageCount: number;
-  isCompacting: boolean;
   streamingMessageId: string | null;
   onSendMessage: (content: string, mode: ChatMode) => void | Promise<void>;
+  onRunCommand: (input: string) => Promise<UiCommandResult>;
   onUpdateSessionProvider: (sessionId: string, provider: string, model: string) => Promise<void>;
-  onCompact: () => void | Promise<void>;
   onClose: () => void;
 }
 
 const CHAT_WIDTH = 700;
 const CHAT_HEIGHT = 600;
 const EDGE_PADDING = 16;
-const CONTROL_LABEL_CLASS = "text-[10px] uppercase tracking-[0.18em] text-[#4a4a4a]";
+const CONTROL_LABEL_CLASS = "text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]";
 const TRANSPARENT_CONTROL_CLASS =
-  "min-w-0 bg-transparent py-1 text-[11px] text-[#8a8a8a] outline-none transition-colors hover:text-[#f5f5f5] focus:text-[#f5f5f5] disabled:cursor-not-allowed disabled:opacity-40 [&>option]:bg-[#0a0a0a] [&>option]:text-[#f5f5f5]";
+  "min-w-0 bg-transparent py-1 text-[11px] text-[var(--text-muted)] outline-none transition-colors hover:text-[var(--foreground)] focus:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-40 [&>option]:bg-[var(--surface-raised)] [&>option]:text-[var(--foreground)]";
+const COMPOSER_SELECT_CLASS = "w-[5.75rem]";
 
 function ContextCheckpoint({ content }: { content: string }) {
   const [open, setOpen] = useState(false);
@@ -46,20 +58,20 @@ function ContextCheckpoint({ content }: { content: string }) {
   const summary = match ? match[1].trim() : content;
   return (
     <div className="flex justify-center" data-testid="context-checkpoint">
-      <div className="w-full max-w-[80%] rounded-none border border-dashed border-[#3a3a3a] bg-[#0d0d0d] px-4 py-2 text-xs text-[#a0a0a0]">
+      <div className="w-full max-w-[80%] rounded-none border border-dashed border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-xs text-[var(--text-subtle)]">
         <button
           type="button"
           onClick={() => setOpen((value) => !value)}
           className="flex w-full items-center justify-between gap-2 text-left"
         >
-          <span className="flex items-center gap-2 text-[#f5f5f5]">
+          <span className="flex items-center gap-2 text-[var(--foreground)]">
             {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
             Context compacted
           </span>
-          <span className="text-[10px] uppercase tracking-wide text-[#737373]">summary</span>
+          <span className="text-[10px] uppercase tracking-wide text-[var(--text-muted)]">summary</span>
         </button>
         {open && (
-          <pre className="mt-2 max-h-64 overflow-y-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-[#cfcfcf]">
+          <pre className="mt-2 max-h-64 overflow-y-auto whitespace-pre-wrap break-words text-[11px] leading-relaxed text-[var(--text-secondary)]">
             {summary}
           </pre>
         )}
@@ -73,14 +85,17 @@ export function SessionChat({
   messages,
   isSending,
   queuedMessageCount,
-  isCompacting,
   streamingMessageId,
   onSendMessage,
+  onRunCommand,
   onUpdateSessionProvider,
-  onCompact,
   onClose,
 }: SessionChatProps) {
   const [input, setInput] = useState("");
+  const [commandHints, setCommandHints] = useState<UiCommandHint[]>([]);
+  const [commandStatus, setCommandStatus] = useState<string | null>(null);
+  const [commandError, setCommandError] = useState<string | null>(null);
+  const [isCommandRunning, setIsCommandRunning] = useState(false);
   const [position, setPosition] = useState(() => initialChatPosition());
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [providerDraft, setProviderDraft] = useState(session.provider);
@@ -124,6 +139,12 @@ useEffect(() => {
     invoke<ProviderConfig[]>("get_provider_configs")
       .then((configs) => setProviders(configs))
       .catch((error) => setConfigError(formatError(error)));
+  }, []);
+
+  useEffect(() => {
+    invoke<UiCommandHint[]>("list_ui_commands")
+      .then((hints) => setCommandHints(hints))
+      .catch((error) => setCommandError(formatError(error)));
   }, []);
 
   useEffect(() => {
@@ -185,6 +206,24 @@ useEffect(() => {
     const content = input.trim();
     if (!content) return;
 
+    if (content.startsWith("/")) {
+      setCommandStatus(null);
+      setCommandError(null);
+      try {
+        setIsCommandRunning(true);
+        const result = await onRunCommand(content);
+        setInput("");
+        setCommandStatus(result.message);
+      } catch (error) {
+        setCommandError(formatError(error));
+      } finally {
+        setIsCommandRunning(false);
+      }
+      return;
+    }
+
+    setCommandStatus(null);
+    setCommandError(null);
     setInput("");
     await onSendMessage(content, mode);
   };
@@ -261,6 +300,13 @@ useEffect(() => {
         ]
       : providers;
   const modelOptions = getModelOptions(providerDraft, modelDraft);
+  const trimmedInput = input.trimStart();
+  const commandBufferActive = trimmedInput.startsWith("/");
+  const commandHasArgs = /^\/\S+\s/.test(trimmedInput);
+  const commandQuery = commandBufferActive ? trimmedInput.slice(1).split(/\s+/, 1)[0].toLowerCase() : "";
+  const visibleCommandHints = commandBufferActive && !commandHasArgs
+    ? commandHints.filter((hint) => hint.name.startsWith(commandQuery))
+    : [];
 
   const directoryName = session.directory.split(/[\\/]/).filter(Boolean).pop() ?? session.directory;
 
@@ -268,7 +314,7 @@ useEffect(() => {
     <div className="pointer-events-none fixed inset-0 z-50">
       <div
         className={cn(
-          "pointer-events-auto fixed flex h-[600px] max-h-[calc(100vh-32px)] w-[700px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-none border border-[#1f1f1f] bg-[#0a0a0a] text-white shadow-none",
+          "pointer-events-auto fixed flex h-[600px] max-h-[calc(100vh-32px)] w-[700px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-none border border-[var(--border)] bg-[var(--surface-raised)] text-[var(--foreground)] shadow-none",
         )}
         role="dialog"
         aria-modal="false"
@@ -276,29 +322,19 @@ useEffect(() => {
         style={{ left: position.x, top: position.y }}
       >
         <div
-          className="flex cursor-grab items-center justify-between border-b border-[#1f1f1f] px-6 py-4 active:cursor-grabbing"
+          className="flex cursor-grab items-center justify-between border-b border-[var(--border)] px-6 py-4 active:cursor-grabbing"
           onPointerDown={handleDragStart}
           onPointerMove={handleDragMove}
           onPointerUp={handleDragEnd}
           onPointerCancel={handleDragEnd}
         >
           <div className="flex min-w-0 items-center gap-3">
-            <GripHorizontal className="h-4 w-4 shrink-0 text-[#737373]" />
+            <GripHorizontal className="h-4 w-4 shrink-0 text-[var(--text-muted)]" />
             <div className="flex min-w-0 flex-col">
-              <h2 className="truncate text-sm font-semibold text-white">{directoryName}</h2>
-              <p className="truncate text-xs text-[#8a8a8a]">{session.directory}</p>
+              <h2 className="truncate text-sm font-semibold text-[var(--foreground)]">{directoryName}</h2>
+              <p className="truncate text-xs text-[var(--text-muted)]">{session.directory}</p>
             </div>
           </div>
-          <Button
-            variant="secondary"
-            size="sm"
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={onCompact}
-            disabled={isCompacting || isSending}
-            title="Summarize the conversation so the next prompt fits the model context"
-          >
-            {isCompacting ? "Compacting…" : "Compact"}
-          </Button>
           <Button
             variant="ghost"
             size="icon"
@@ -312,7 +348,7 @@ useEffect(() => {
           <div className="space-y-4">
             {messages.length === 0 ? (
               <div className="flex h-full items-center justify-center">
-                <p className="text-sm text-[#737373]">
+                <p className="text-sm text-[var(--text-muted)]">
                   Chat with {directoryName} session. Ask about the codebase or files in this directory.
                 </p>
               </div>
@@ -337,9 +373,9 @@ useEffect(() => {
                   >
                     <div
                       className={cn(
-                        "min-w-0 max-w-[80%] text-[12px] leading-relaxed text-[#f5f5f5]",
+                        "min-w-0 max-w-[80%] text-[12px] leading-relaxed text-[var(--foreground)]",
                         message.role === "user"
-                          ? "rounded-2xl bg-[#f5f5f5] px-3 py-2 text-black whitespace-pre-wrap break-words"
+                          ? "rounded-2xl bg-[var(--foreground)] px-3 py-2 text-[var(--background)] whitespace-pre-wrap break-words"
                           : "overflow-hidden",
                       )}
                     >
@@ -366,7 +402,7 @@ useEffect(() => {
             )}
             {isSending && messages.every((m) => !m.content && !m.reasoning) && (
               <div className="flex justify-start">
-                <div className="flex items-center gap-2 rounded-none border border-[#1f1f1f] bg-[#0a0a0a] px-4 py-2 text-xs text-[#737373]">
+                <div className="flex items-center gap-2 rounded-none border border-[var(--border)] bg-[var(--surface-raised)] px-4 py-2 text-xs text-[var(--text-muted)]">
                   <span>◌</span>
                   <span>◌</span>
                   <span>◌</span>
@@ -374,18 +410,30 @@ useEffect(() => {
                 </div>
               </div>
             )}
-            {isSending && streamingMessageId && (
-              <div className="flex justify-start">
-                <div className="rounded-none border border-[#2a2a2a] bg-[#111111] px-4 py-2 text-xs text-[#737373]">
-                  <span className="mr-1">◌</span>Thinking
-                </div>
-              </div>
-            )}
           </div>
         </ScrollArea>
 
-        <div className="border-t border-[#1f1f1f] px-6 py-4">
-          <div className="rounded-2xl border border-[#1f1f1f] bg-black px-3 py-2 transition-colors focus-within:border-[#3a3a3a]">
+        <div className="border-t border-[var(--border)] px-6 py-4">
+          {visibleCommandHints.length > 0 && (
+            <div className="mb-2 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1">
+              {visibleCommandHints.map((hint) => (
+                <button
+                  key={hint.name}
+                  type="button"
+                  className="flex w-full items-center gap-3 rounded-lg px-2 py-1.5 text-left text-[11px] text-[var(--text-muted)] hover:bg-[var(--surface-soft)] hover:text-[var(--foreground)]"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => {
+                    setInput(hint.usage);
+                    inputRef.current?.focus();
+                  }}
+                >
+                  <span className="w-20 shrink-0 text-[var(--foreground)]">{hint.usage}</span>
+                  <span className="min-w-0 truncate">{hint.description}</span>
+                </button>
+              ))}
+            </div>
+          )}
+          <div className="rounded-2xl border border-[var(--input-border)] bg-[var(--input-bg)] px-3 py-2 transition-colors focus-within:border-[var(--node-border-hover)]">
             <textarea
               ref={inputRef}
               value={input}
@@ -393,16 +441,16 @@ useEffect(() => {
               onKeyDown={handleKeyDown}
               placeholder="Ask about the codebase..."
               rows={1}
-              className="box-border max-h-32 min-h-[42px] w-full resize-none whitespace-pre-wrap break-words break-all bg-transparent py-1 font-sans text-[12px] leading-[1.5] text-white shadow-none outline-none placeholder:text-[#737373] disabled:cursor-not-allowed disabled:opacity-50"
+              className="box-border max-h-32 min-h-[42px] w-full resize-none whitespace-pre-wrap break-words break-all bg-transparent py-1 font-sans text-[12px] leading-[1.5] text-[var(--foreground)] shadow-none outline-none placeholder:text-[var(--text-muted)] disabled:cursor-not-allowed disabled:opacity-50"
             />
             <div className="flex min-w-0 items-center justify-between gap-2">
-              <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px]">
+              <div className="flex min-w-0 flex-wrap items-center gap-x-1 gap-y-1 text-[11px]">
                 <label className="flex min-w-0 items-center gap-1">
                   <span className={CONTROL_LABEL_CLASS}>Mode</span>
                   <select
                     value={mode}
                     onChange={(event) => setMode(event.target.value as ChatMode)}
-                    className={cn(TRANSPARENT_CONTROL_CLASS, "w-[4.25rem] uppercase tracking-[0.12em]")}
+                    className={cn(TRANSPARENT_CONTROL_CLASS, COMPOSER_SELECT_CLASS, "uppercase tracking-[0.12em]")}
                     title={
                       mode === "plan"
                         ? "Read-only: shell, write, edit, apply_patch are blocked"
@@ -426,7 +474,7 @@ useEffect(() => {
                         setConfigStatus(null);
                         setConfigError(null);
                       }}
-                      className={cn(TRANSPARENT_CONTROL_CLASS, "max-w-[7.5rem]")}
+                      className={cn(TRANSPARENT_CONTROL_CLASS, COMPOSER_SELECT_CLASS)}
                     >
                       {providerOptions.map((provider) => (
                         <option key={provider.name} value={provider.name}>
@@ -443,7 +491,7 @@ useEffect(() => {
                         setConfigError(null);
                       }}
                       placeholder="anthropic"
-                      className={cn(TRANSPARENT_CONTROL_CLASS, "w-[7.5rem] placeholder:text-[#4a4a4a]")}
+                      className={cn(TRANSPARENT_CONTROL_CLASS, COMPOSER_SELECT_CLASS, "placeholder:text-[var(--text-muted)]")}
                     />
                   )}
                 </label>
@@ -456,7 +504,7 @@ useEffect(() => {
                       setConfigStatus(null);
                       setConfigError(null);
                     }}
-                    className={cn(TRANSPARENT_CONTROL_CLASS, "max-w-[13rem]")}
+                    className={cn(TRANSPARENT_CONTROL_CLASS, COMPOSER_SELECT_CLASS)}
                     disabled={modelOptions.length === 0}
                   >
                     {modelOptions.length === 0 ? (
@@ -473,7 +521,7 @@ useEffect(() => {
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="h-6 px-1 text-[11px] text-[#737373] hover:bg-transparent hover:text-white disabled:hidden"
+                  className="h-6 px-1 text-[11px] text-[var(--text-muted)] hover:bg-transparent hover:text-[var(--foreground)] disabled:hidden"
                   onClick={saveSessionConfig}
                   disabled={isConfigSaving || !configChanged}
                 >
@@ -485,17 +533,20 @@ useEffect(() => {
                 size="sm"
                 className="h-7 shrink-0 rounded-full px-3 text-[11px]"
                 onClick={handleSend}
-                disabled={!input.trim()}
+                disabled={!input.trim() || isCommandRunning}
               >
-                {isSending ? "Queue" : "Send"}
+                {isCommandRunning ? "Run" : commandBufferActive ? "Run" : isSending ? "Queue" : "Send"}
               </Button>
             </div>
           </div>
           {(configStatus || configError) && (
-            <p className={cn("mt-1 text-[11px]", configError ? "text-[#ff5f5f]" : "text-[#737373]")}>{configError ?? configStatus}</p>
+            <p className={cn("mt-1 text-[11px]", configError ? "text-[#ff5f5f]" : "text-[var(--text-muted)]")}>{configError ?? configStatus}</p>
+          )}
+          {(commandStatus || commandError) && (
+            <p className={cn("mt-1 whitespace-pre-wrap text-[11px]", commandError ? "text-[#ff5f5f]" : "text-[var(--text-muted)]")}>{commandError ?? commandStatus}</p>
           )}
           {(isSending || queuedMessageCount > 0) && (
-            <p className="mt-2 text-xs text-[#737373]">
+            <p className="mt-2 text-xs text-[var(--text-muted)]">
               {queuedMessageCount > 0
                 ? `${queuedMessageCount} message${queuedMessageCount === 1 ? "" : "s"} queued`
                 : "Running"}
@@ -572,12 +623,12 @@ function ToolCallBlock({
   const Icon = details.icon;
 
   return (
-    <div className="min-w-0 max-w-full overflow-hidden rounded-none border border-[#2a2a2a] bg-black font-mono text-xs">
-      <div className="flex items-center justify-between border-b border-[#1f1f1f] bg-[#080808] px-3 py-2">
+    <div className="min-w-0 max-w-full overflow-hidden rounded-none border border-[var(--node-border)] bg-[var(--input-bg)] font-mono text-xs">
+      <div className="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
-          <Icon className="h-3.5 w-3.5 shrink-0 text-[#8a8a8a]" />
-          <span className="truncate text-[#f5f5f5]">{call.name}</span>
-          <span className="text-[#4a4a4a]">{details.label}</span>
+          <Icon className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]" />
+          <span className="truncate text-[var(--foreground)]">{call.name}</span>
+          <span className="text-[var(--text-muted)]">{details.label}</span>
         </div>
         <span
           className={cn(
@@ -589,9 +640,9 @@ function ToolCallBlock({
         </span>
       </div>
       <div className="space-y-2 px-3 py-2">
-        <pre className="max-w-full whitespace-pre-wrap break-all text-[#d4d4d4]">{details.command}</pre>
+        <pre className="max-w-full whitespace-pre-wrap break-all text-[var(--text-secondary)]">{details.command}</pre>
         {resultSummary?.text && (
-          <pre className="max-h-40 max-w-full overflow-auto whitespace-pre-wrap break-all border-t border-[#1f1f1f] pt-2 text-[#8a8a8a]">
+          <pre className="max-h-40 max-w-full overflow-auto whitespace-pre-wrap break-all border-t border-[var(--border)] pt-2 text-[var(--text-muted)]">
             {resultSummary.text}
           </pre>
         )}
@@ -602,7 +653,7 @@ function ToolCallBlock({
 
 function ToolErrorBlock({ error }: { error: Extract<ChatMessagePart, { type: "tool_error" }> }) {
   return (
-    <div className="rounded-none border border-[#3a1f1f] bg-[#120808] px-3 py-2 font-mono text-xs text-[#ff8a8a]">
+    <div className="rounded-none border border-[#8a2f2f] bg-[var(--surface)] px-3 py-2 font-mono text-xs text-[#d14d4d]">
       <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-[#ff5f5f]">{error.name ?? "tool"} failed</div>
       <pre className="whitespace-pre-wrap break-words">{error.message}</pre>
     </div>
