@@ -66,6 +66,7 @@ export function SessionWorkspace() {
   const processingSessionsRef = useRef(new Set<string>());
   const creatingSessionRef = useRef(false);
   const chatSessionIdRef = useRef<string | null>(null);
+  const pendingPromptKeysRef = useRef(new Map<string, Set<string>>());
 
   useEffect(() => {
     chatSessionIdRef.current = chatSessionId;
@@ -324,6 +325,7 @@ export function SessionWorkspace() {
         }
         setSessionQueuedCount(sessionId, queue.length);
         if (!next) break;
+        const promptKey = promptQueueKey(next.content, next.mode);
 
         setError(null);
         try {
@@ -347,6 +349,7 @@ export function SessionWorkspace() {
           setError(message);
           console.error("Failed to send chat message:", chatError);
         } finally {
+          pendingPromptKeysRef.current.get(sessionId)?.delete(promptKey);
           if (chatSessionIdRef.current === sessionId) {
             finishStreamingMessage(sessionId);
           }
@@ -360,6 +363,12 @@ export function SessionWorkspace() {
 
   const sendChatMessage = useCallback((content: string, mode: "plan" | "build") => {
     if (!chatSessionId) return;
+    const promptKey = promptQueueKey(content, mode);
+    const pendingKeys = pendingPromptKeysRef.current.get(chatSessionId) ?? new Set<string>();
+    if (pendingKeys.has(promptKey)) return;
+    pendingKeys.add(promptKey);
+    pendingPromptKeysRef.current.set(chatSessionId, pendingKeys);
+
     const queue = sendQueuesRef.current.get(chatSessionId) ?? [];
     queue.push({ content, mode });
     sendQueuesRef.current.set(chatSessionId, queue);
@@ -442,6 +451,7 @@ export function SessionWorkspace() {
         : null;
 
       sendQueuesRef.current.delete(id);
+      pendingPromptKeysRef.current.delete(id);
       setSessionQueuedCount(id, 0);
       setSessionRunning(id, false);
       await deleteSession(id);
@@ -567,4 +577,8 @@ function formatError(error: unknown) {
 function chatDisplayTitle(session: AgentSession) {
   const title = session.title?.trim();
   return title || "Unknown";
+}
+
+function promptQueueKey(content: string, mode: "plan" | "build") {
+  return `${mode}\0${content.trim()}`;
 }

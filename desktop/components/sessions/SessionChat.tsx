@@ -790,6 +790,7 @@ export function SessionChat({
                 onClick={handleSend}
                 disabled={!input.trim() || isCommandRunning}
               >
+                {isSending && !isCommandRunning && <span className="mr-1.5 h-3 w-3 animate-spin rounded-full border border-current border-t-transparent" />}
                 {isCommandRunning ? "Run" : commandBufferActive ? "Run" : isSending ? "Queue" : "Send"}
               </Button>
             </div>
@@ -800,11 +801,9 @@ export function SessionChat({
           {(commandStatus || commandError) && (
             <p className={cn("mt-1 whitespace-pre-wrap text-[11px]", commandError ? "text-[#ff5f5f]" : "text-[var(--text-muted)]")}>{commandError ?? commandStatus}</p>
           )}
-          {(isSending || queuedMessageCount > 0) && (
+          {queuedMessageCount > 0 && (
             <p className="mt-2 text-xs text-[var(--text-muted)]">
-              {queuedMessageCount > 0
-                ? `${queuedMessageCount} message${queuedMessageCount === 1 ? "" : "s"} queued`
-                : "Running"}
+              {`${queuedMessageCount} message${queuedMessageCount === 1 ? "" : "s"} queued`}
             </p>
           )}
             </div>
