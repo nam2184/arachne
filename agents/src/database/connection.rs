@@ -96,7 +96,7 @@ impl Database {
             [],
         );
         let _ = self.conn.execute(
-            "ALTER TABLE agent_sessions ADD COLUMN model TEXT NOT NULL DEFAULT 'claude-3-5-sonnet-20241022'",
+            "ALTER TABLE agent_sessions ADD COLUMN model TEXT NOT NULL DEFAULT 'claude-opus-4-8'",
             [],
         );
         let _ = self.conn.execute(

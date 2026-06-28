@@ -132,6 +132,16 @@ async fn handle_request(
         }
     };
 
+    tracing::debug!(
+        provider = %provider,
+        model = %model.as_deref().unwrap_or(""),
+        method = %parts.method,
+        upstream_base_url = %upstream_base_url,
+        upstream_url = %upstream_uri,
+        request_key = key,
+        "sse_proxy formulated upstream url"
+    );
+
     let client = match reqwest_client() {
         Ok(c) => c,
         Err(error) => {
@@ -147,6 +157,7 @@ async fn handle_request(
         if matches!(
             *name,
             http::header::CONNECTION
+                | http::header::HOST
                 | http::header::TRANSFER_ENCODING
                 | http::header::UPGRADE
                 | http::header::CONTENT_LENGTH

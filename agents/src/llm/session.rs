@@ -1303,11 +1303,21 @@ impl SessionRunner {
 
         );
 
-        let request = LlmRequest::new(&session.model, &session.provider)
+        let max_tokens = if session.provider.eq_ignore_ascii_case("minimax") {
+            Some(spec.max_output.min(u32::MAX as usize) as u32)
+        } else {
+            None
+        };
+
+        let mut request = LlmRequest::new(&session.model, &session.provider)
             .with_system(system_prompt.clone())
             .with_messages(messages)
             .with_tools(tools)
             .with_session_id(session_id.to_string());
+
+        if let Some(max_tokens) = max_tokens {
+            request = request.max_tokens(max_tokens);
+        }
 
         let provider = self
             .providers
@@ -3897,7 +3907,7 @@ mod tests {
                 "p1".to_string(),
                 "/tmp".to_string(),
                 "anthropic".to_string(),
-                "claude-3-5-sonnet-20241022".to_string(),
+                "claude-sonnet-4-20250514".to_string(),
             )
             .expect("create_session");
 
@@ -5332,6 +5342,44 @@ mod tests {
         assert!(names.contains(&"write"));
 
         assert!(!names.contains(&"apply_patch"));
+    }
+
+    #[tokio::test]
+
+    async fn e2e_minimax_session_sets_model_max_output_tokens() {
+        init_tracing();
+
+        let model_id = "MiniMax-M3";
+
+        let (runner, _tmp, session_id, capture) = run_with_scripted_capture(
+            "minimax",
+            vec![vec![LlmEvent::Finish {
+                reason: FinishReason::Stop,
+
+                usage: None,
+            }]],
+            "/tmp",
+            model_id,
+        )
+        .await;
+
+        let result = runner.run(&session_id).await;
+
+        assert!(result.is_ok(), "run failed: {:?}", result.err());
+
+        let captured: Vec<LlmRequest> = capture.lock().unwrap().clone();
+
+        assert_eq!(captured.len(), 1);
+
+        let registry = crate::model_spec::ModelRegistry::from_embedded_json();
+
+        let spec = registry.lookup("minimax", model_id);
+
+        assert_eq!(
+            captured[0].max_tokens,
+            Some(spec.max_output.min(u32::MAX as usize) as u32),
+            "MiniMax requests must cap output with the model registry max_output"
+        );
     }
 
     /// Plan mode (read-only) on a GPT-5 model must not surface

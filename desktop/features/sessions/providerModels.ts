@@ -1,4 +1,4 @@
-import providerModels from "@/config/provider-models.json";
+import providerModels from "../../../config/provider-models.json";
 
 interface ModelSpec {
   id: string;

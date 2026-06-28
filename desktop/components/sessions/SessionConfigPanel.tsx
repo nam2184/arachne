@@ -221,7 +221,7 @@ export function SessionConfigPanel({ onClose }: SessionConfigPanelProps) {
               disabled={modelOptions.length === 0}
             >
               {modelOptions.length === 0 ? (
-                <option value="">Add models in src/config/provider-models.json</option>
+                <option value="">Add models in config/provider-models.json</option>
               ) : (
                 modelOptions.map((model) => (
                   <option key={model} value={model}>{model}</option>

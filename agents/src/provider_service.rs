@@ -35,10 +35,11 @@ impl ProviderService {
     }
 
     fn default_configs() -> Vec<ProviderConfig> {
+        let anthropic_model = default_model_for_provider("anthropic");
         let mut configs = vec![
             provider_config(
                 "anthropic",
-                "claude-3-5-sonnet-20241022",
+                &anthropic_model,
                 ProviderProtocol::Anthropic,
                 true,
             ),
@@ -76,7 +77,10 @@ impl ProviderService {
             return Ok(());
         }
         let db = self.db()?;
-        let mut configs = ProviderConfigRepository::list(&db)?;
+        let mut configs = ProviderConfigRepository::list(&db)?
+            .into_iter()
+            .map(normalize_config)
+            .collect::<Vec<_>>();
         if configs.is_empty() {
             configs = Self::default_configs();
             for config in &configs {
@@ -121,6 +125,7 @@ impl ProviderService {
     }
 
     pub fn upsert_config(&self, config: ProviderConfig) -> Result<(), String> {
+        let config = normalize_config(config);
         {
             let mut configs = self.configs.write();
             if let Some(existing) = configs.iter_mut().find(|c| c.name == config.name) {
@@ -167,14 +172,43 @@ fn provider_config(
 ) -> ProviderConfig {
     let mut config = ProviderConfig::new(name.to_string(), model.to_string(), protocol);
     config.enabled = enabled;
-    config.base_url = std::env::var(aisdk_provider_base_url_env(name)).ok();
+    config.base_url = env_non_empty(&aisdk_provider_base_url_env(name));
     config
 }
 
+fn normalize_config(mut config: ProviderConfig) -> ProviderConfig {
+    config.base_url = config.base_url.and_then(non_empty);
+    config.api_key = config.api_key.and_then(non_empty);
+    if config.model.trim().is_empty() {
+        config.model = default_model_for_provider(&config.name);
+    }
+    config
+}
+
+fn env_non_empty(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(non_empty)
+}
+
+fn non_empty(value: String) -> Option<String> {
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
 fn default_model_for_provider(provider_name: &str) -> String {
+    if provider_name == "anthropic" {
+        return std::env::var(aisdk_provider_model_env(provider_name))
+            .ok()
+            .and_then(non_empty)
+            .unwrap_or_else(|| "claude-opus-4-8".to_string());
+    }
+
     std::env::var(aisdk_provider_model_env(provider_name))
         .ok()
-        .filter(|model| !model.trim().is_empty())
+        .and_then(non_empty)
         .unwrap_or_else(|| "default".to_string())
 }
 

@@ -90,7 +90,7 @@ export const useSessionStore = create<SessionState>((set, get) => {
       const providerConfigs = await invoke<ProviderConfig[]>("get_provider_configs");
       const activeConfig = providerConfigs.find((config) => config.enabled) ?? providerConfigs[0];
       const provider = activeConfig?.name ?? "anthropic";
-      const model = activeConfig?.model ?? "claude-3-5-sonnet-20241022";
+      const model = activeConfig?.model ?? "claude-opus-4-8";
 
       const id = await invoke<string>("create_session", {
         projectId,

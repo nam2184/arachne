@@ -43,7 +43,7 @@ impl ModelRegistry {
     }
 
     pub fn from_embedded_json() -> Self {
-        let raw = include_str!("../config/provider-models.json");
+        let raw = include_str!("../../config/provider-models.json");
         match serde_json::from_str::<ProviderSpecFile>(raw) {
             Ok(file) => {
                 let mut specs = HashMap::new();
@@ -108,9 +108,9 @@ mod tests {
             (
                 "anthropic".to_string(),
                 ModelSpec {
-                    id: "claude-sonnet-4-20250514".to_string(),
-                    context_window: 200_000,
-                    max_output: 64_000,
+                    id: "claude-opus-4-8".to_string(),
+                    context_window: 1_000_000,
+                    max_output: 128_000,
                 },
             ),
             (
@@ -136,9 +136,9 @@ mod tests {
     #[test]
     fn lookup_returns_specific_spec() {
         let registry = sample_registry();
-        let spec = registry.lookup("anthropic", "claude-sonnet-4-20250514");
-        assert_eq!(spec.context_window, 200_000);
-        assert_eq!(spec.max_output, 64_000);
+        let spec = registry.lookup("anthropic", "claude-opus-4-8");
+        assert_eq!(spec.context_window, 1_000_000);
+        assert_eq!(spec.max_output, 128_000);
     }
 
     #[test]
@@ -160,7 +160,7 @@ mod tests {
     fn try_lookup_returns_none_for_unknown() {
         let registry = sample_registry();
         assert!(registry
-            .try_lookup("anthropic", "claude-sonnet-4-20250514")
+            .try_lookup("anthropic", "claude-opus-4-8")
             .is_some());
         assert!(registry.try_lookup("anthropic", "unknown").is_none());
     }
@@ -168,8 +168,8 @@ mod tests {
     #[test]
     fn embedded_json_loads_specs() {
         let registry = ModelRegistry::from_embedded_json();
-        let spec = registry.try_lookup("anthropic", "claude-sonnet-4-20250514");
-        assert!(spec.is_some(), "claude-sonnet-4 should be in embedded JSON");
+        let spec = registry.try_lookup("anthropic", "claude-opus-4-8");
+        assert!(spec.is_some(), "claude-opus-4-8 should be in embedded JSON");
         let spec = spec.unwrap();
         assert!(spec.context_window >= 200_000);
         assert!(spec.max_output > 0);
