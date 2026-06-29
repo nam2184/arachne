@@ -1,4 +1,4 @@
-/// Wildcard matching compatible with opencode's semantics:
+/// Wildcard matching for permission rules:
 /// `*` matches zero or more of any character
 /// `?` matches exactly one character
 /// All other characters match literally
@@ -44,7 +44,7 @@ fn wildcard_match_inner(pattern: &[u8], value: &[u8]) -> bool {
     if pattern[p..].iter().all(|c| *c == b'*') {
         return true;
     }
-    // Special case: opencode treats a trailing ` *` (space + star) as optional,
+    // Special case: a trailing ` *` (space + star) is optional,
     // so `git *` matches `git` even though the literal space is in the pattern.
     if p + 1 < pattern.len()
         && pattern[p] == b' '
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn trailing_optional_space_star() {
-        // opencode-style: `git *` matches both `git` and `git status`.
+        // `git *` matches both `git` and `git status`.
         assert!(wildcard_match("git *", "git"));
         assert!(wildcard_match("git *", "git status"));
         assert!(!wildcard_match("git *", "got status"));

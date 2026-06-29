@@ -1,10 +1,10 @@
 //! UI ask flow for out-of-sandbox path access.
 //!
-//! Mirrors opencode's `assertExternalDirectoryEffect` (tool/external-directory.ts):
-//! when a tool resolves a path that lives outside the session's project root,
+//! When a tool resolves a path that lives outside the session's project root,
 //! we ask the user for an `external_directory` allow, and on approval we
 //! promote the relevant directory into the sandbox's `external_roots` so
-//! subsequent calls in the same session pass without re-asking.
+//! subsequent calls in the same running session pass without re-asking. The
+//! approval is kept in memory only; it is not written to config or disk.
 //!
 //! The agents crate doesn't depend on Tauri. The UI ask is exposed via the
 //! v2 `PermissionService` which publishes the `PermissionRequest` over an
@@ -22,9 +22,9 @@
 //!    permission request whose pattern is `<dir>/**`.
 //! 3. The Tauri layer surfaces the request in the UI (the existing
 //!    `permission-changed` event already carries the `session_id`).
-//! 4. The user clicks Allow once / Always / Reject in the UI; the Tauri
+//! 4. The user clicks Yes or No in the UI; the Tauri
 //!    command `permission_reply` invokes `PermissionService::reply`.
-//! 5. `trigger_access` resumes: on Allow/Always, it canonicalizes the
+//! 5. `trigger_access` resumes: on Yes, it canonicalizes the
 //!    chosen directory and pushes it into `external_roots` so the same
 //!    access succeeds on the next try without a prompt.
 
@@ -36,6 +36,7 @@ use parking_lot::Mutex;
 use crate::permission_v2::{
     CheckError, CheckOutcome, CheckRequest, PermissionAction, PermissionService,
 };
+use crate::sandbox::path::strip_verbatim_prefix;
 use crate::sandbox::path::PathContainmentError;
 use crate::sandbox::SandboxPolicy;
 
@@ -101,8 +102,19 @@ pub async fn trigger_access(
     } else {
         project_root.join(request.requested)
     };
-    let canonical_target = absolute.canonicalize().unwrap_or(absolute);
-    let promote_dir = pick_promote_dir(&canonical_target);
+    let canonical_target = strip_verbatim_prefix(absolute.canonicalize().unwrap_or(absolute));
+    let promote_dir = strip_verbatim_prefix({
+        let dir = pick_promote_dir(&canonical_target);
+        dir.canonicalize().unwrap_or(dir)
+    });
+    let approved_target = if canonical_target.is_dir() {
+        promote_dir.clone()
+    } else {
+        canonical_target
+            .file_name()
+            .map(|name| promote_dir.join(name))
+            .unwrap_or_else(|| canonical_target.clone())
+    };
 
     let pattern = format!("{}/**", promote_dir.display());
 
@@ -127,12 +139,9 @@ pub async fn trigger_access(
 
     match check {
         Ok(CheckOutcome::Allowed) => {
-            // The v2 service stores an `allow` rule when the user
-            // replied `Always`; for `Once` it just lets the call
-            // through this once. We additionally promote the
-            // directory into the sandbox's `external_roots` so the
-            // caller can re-resolve the same path (or a sibling)
-            // without re-asking.
+            // Promote the directory into this runner's sandbox and the
+            // session's in-memory external roots. This is intentionally not
+            // persisted; a process restart or session removal drops it.
             let is_always = permissions
                 .base_ruleset()
                 .evaluate("external_directory", &pattern)
@@ -149,10 +158,12 @@ pub async fn trigger_access(
                     policy_guard.external_roots.push(promote_dir.clone());
                 }
             }
-            let resolved = policy.lock().resolve(request.requested).map_err(|e| {
+            permissions.add_external_root(&promote_dir);
+            let resolved = policy.lock().resolve(&approved_target).map_err(|e| {
                 format!(
-                    "external_directory approved for {} but re-resolve failed: {e}",
-                    promote_dir.display()
+                    "external_directory approved for {} but approved target {} still failed sandbox resolve: {e}",
+                    promote_dir.display(),
+                    approved_target.display()
                 )
             })?;
             tracing::info!(
@@ -350,12 +361,54 @@ mod tests {
         )
         .await
         .expect("trigger_access");
-        assert!(matches!(decision, AccessDecision::Allowed { .. }));
+        match decision {
+            AccessDecision::Allowed { path, .. } => assert_eq!(path, new_file),
+            AccessDecision::Rejected { message } => panic!("unexpected reject: {message}"),
+        }
         let canonical_parent = external.path().canonicalize().unwrap();
         assert!(policy
             .lock()
             .external_roots
             .iter()
             .any(|root| root == &canonical_parent));
+    }
+
+    #[tokio::test]
+    async fn trigger_access_remembers_external_root_in_session_memory() {
+        let project = TempDir::new().unwrap();
+        let external = TempDir::new().unwrap();
+        let file = external.path().join("remembered.txt");
+        fs::write(&file, "ok").unwrap();
+        let policy = Arc::new(Mutex::new(SandboxPolicy::new(project.path().to_path_buf())));
+        let (svc, mut rx) = PermissionService::new("test", default_ruleset());
+        let svc_clone = svc.clone();
+        tokio::spawn(async move {
+            let req = rx.recv().await.expect("request");
+            svc_clone.reply(&req.id, UserReply::Once).ok();
+        });
+
+        let decision = trigger_access(
+            &policy,
+            &svc,
+            AccessRequest {
+                requested: file.to_str().unwrap(),
+                tool: "read",
+            },
+        )
+        .await
+        .expect("trigger_access");
+        assert!(matches!(decision, AccessDecision::Allowed { .. }));
+
+        let remembered = svc.external_roots();
+        assert_eq!(remembered, vec![external.path().canonicalize().unwrap()]);
+
+        let mut next_policy = SandboxPolicy::new(project.path().to_path_buf());
+        for root in remembered {
+            next_policy = next_policy.with_external(root);
+        }
+        assert_eq!(
+            next_policy.resolve(&file).unwrap(),
+            file.canonicalize().unwrap()
+        );
     }
 }

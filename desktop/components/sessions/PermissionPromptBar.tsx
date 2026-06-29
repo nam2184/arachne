@@ -1,20 +1,23 @@
-import { Shield } from "lucide-react";
 import { useMemo } from "react";
 import {
   type PermissionPrompt,
   usePermissionStore,
 } from "@/features/permissions/permissionStore";
 import { Button } from "@/components/ui/button";
-import { Card } from "@/components/ui/card";
 
 interface PermissionPromptBarProps {
   /** The session whose prompts to show. If null, no bar is rendered. */
   sessionId: string | null;
+  sessionDirectory?: string | null;
 }
 
-export function PermissionPromptBar({ sessionId }: PermissionPromptBarProps) {
+export function PermissionPromptBar({ sessionId, sessionDirectory }: PermissionPromptBarProps) {
   const pending = usePermissionStore((state) => state.pending);
   const reply = usePermissionStore((state) => state.reply);
+  const sessionName = useMemo(
+    () => directoryName(sessionDirectory),
+    [sessionDirectory],
+  );
 
   const prompts = useMemo(
     () => pending.filter((p) => p.sessionId === sessionId),
@@ -31,6 +34,7 @@ export function PermissionPromptBar({ sessionId }: PermissionPromptBarProps) {
         <PermissionPromptCard
           key={prompt.id}
           prompt={prompt}
+          sessionName={sessionName}
           onReply={(replyKind) => reply(prompt.sessionId, prompt.id, replyKind)}
         />
       ))}
@@ -40,55 +44,42 @@ export function PermissionPromptBar({ sessionId }: PermissionPromptBarProps) {
 
 function PermissionPromptCard({
   prompt,
+  sessionName,
   onReply,
 }: {
   prompt: PermissionPrompt;
-  onReply: (reply: "once" | "always" | "reject") => void;
+  sessionName: string;
+  onReply: (reply: "once" | "reject") => void;
 }) {
-  const suggestedPatterns = prompt.always.length > 0 ? prompt.always : prompt.patterns;
+  const label =
+    prompt.permission === "external_directory"
+      ? `Allow session ${sessionName} agent to access external directory?`
+      : "Allow agent to do this?";
 
   return (
-    <Card className="pointer-events-auto w-full max-w-2xl border-[#1f1f1f] bg-[#0a0a0a] p-4 shadow-none">
-      <div className="flex items-start gap-3">
-        <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-none border border-[#1f1f1f] bg-[#050505]">
-          <Shield className="h-4 w-4 text-white" />
-        </div>
-        <div className="min-w-0 flex-1 space-y-2">
-          <div>
-            <p className="text-sm font-medium text-white">
-              Allow <span className="text-[#bdbdbd]">{prompt.tool}</span> to run?
-            </p>
-            <ul className="mt-1 space-y-0.5 text-xs text-[#8a8a8a]">
-              {prompt.patterns.map((pattern) => (
-                <li key={pattern} className="truncate font-mono">
-                  {prompt.permission} {pattern}
-                </li>
-              ))}
-            </ul>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 pt-1">
-            <Button size="sm" onClick={() => onReply("once")}>
-              Allow once
-            </Button>
-            {suggestedPatterns.length > 0 && (
-              <Button size="sm" variant="secondary" onClick={() => onReply("always")}>
-                Always allow {suggestedPatterns[0]}
-              </Button>
-            )}
-            <Button size="sm" variant="ghost" onClick={() => onReply("reject")}>
-              Reject
-            </Button>
-          </div>
-
-          {suggestedPatterns.length > 1 && (
-            <p className="text-[10px] text-[#737373]">
-              +{suggestedPatterns.length - 1} more pattern
-              {suggestedPatterns.length - 1 === 1 ? "" : "s"} will be remembered
-            </p>
-          )}
-        </div>
+    <div className="pointer-events-auto flex w-full max-w-xl items-center gap-3 border border-[#2a2a2a] bg-[#050505] px-3 py-2 shadow-none">
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-medium text-white">{label}</p>
+        <p className="truncate font-mono text-xs text-[#8a8a8a]">
+          {prompt.tool}: {prompt.patterns[0] ?? prompt.permission}
+        </p>
       </div>
-    </Card>
+      <div className="flex shrink-0 items-center gap-2">
+        <Button size="sm" onClick={() => onReply("once")}>
+          Yes
+        </Button>
+        <Button size="sm" variant="ghost" onClick={() => onReply("reject")}>
+          No
+        </Button>
+      </div>
+    </div>
   );
+}
+
+function directoryName(path: string | null | undefined): string {
+  if (!path) {
+    return "this";
+  }
+  const trimmed = path.replace(/[\\/]+$/, "");
+  return trimmed.split(/[\\/]/).pop() || "this";
 }

@@ -12,7 +12,9 @@ pub struct PendingPermissionsResponse {
 /// Request body for the `permission_reply` command.
 #[derive(serde::Deserialize)]
 pub struct ReplyPermissionRequest {
+    #[serde(alias = "sessionId")]
     pub session_id: String,
+    #[serde(alias = "requestId")]
     pub request_id: String,
     pub reply: UserReply,
 }
@@ -33,7 +35,7 @@ pub async fn permission_list_pending(
 }
 
 /// Reply to a pending permission request. Called by the UI after the user
-/// clicks Allow once / Always / Reject.
+/// clicks Yes or No.
 #[tauri::command]
 pub async fn permission_reply(
     request: ReplyPermissionRequest,

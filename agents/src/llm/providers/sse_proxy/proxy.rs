@@ -262,7 +262,6 @@ async fn handle_request(
         let mut finish_reason_raw: Option<String> = None;
         let mut terminal_payload: Option<String> = None;
         let mut termination: Option<ProxyTermination> = None;
-        let mut saw_done = false;
 
         while let Some(frame) = upstream_stream.next().await {
             match frame {
@@ -292,7 +291,6 @@ async fn handle_request(
                                 }
                             }
                             SseEvent::Done => {
-                                saw_done = true;
                                 if terminal_at.is_none() {
                                     terminal_at = Some(elapsed_ms(relay_started));
                                 }
@@ -317,7 +315,6 @@ async fn handle_request(
         let tail = parser.flush();
         for event in tail {
             if let SseEvent::Done = event {
-                saw_done = true;
                 if terminal_at.is_none() {
                     terminal_at = Some(elapsed_ms(relay_started));
                 }
@@ -338,7 +335,6 @@ async fn handle_request(
             finish_reason_raw,
             termination,
             terminal_data_payload: terminal_payload,
-            saw_done,
             text_delta_count,
             text_byte_count,
             tool_call_delta_count,
@@ -351,7 +347,6 @@ async fn handle_request(
             provider = %relay_provider,
             model = %info.model,
             request_key = relay_key,
-            saw_done = info.saw_done,
             finish_reason_raw = ?info.finish_reason_raw,
             text_delta_count = info.text_delta_count,
             text_byte_count = info.text_byte_count,

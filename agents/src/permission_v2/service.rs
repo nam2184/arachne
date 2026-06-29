@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -47,6 +48,7 @@ pub struct PermissionService {
     session_id: String,
     base_ruleset: PermissionRuleset,
     approved: RwLock<Vec<PermissionRule>>,
+    external_roots: RwLock<Vec<PathBuf>>,
     pending: RwLock<HashMap<RequestId, PendingEntry>>,
     /// Channel used by the frontend/Tauri layer to receive new requests.
     request_tx: mpsc::UnboundedSender<PermissionRequest>,
@@ -62,6 +64,7 @@ impl PermissionService {
             session_id: session_id.into(),
             base_ruleset,
             approved: RwLock::new(Vec::new()),
+            external_roots: RwLock::new(Vec::new()),
             pending: RwLock::new(HashMap::new()),
             request_tx,
         });
@@ -261,6 +264,18 @@ impl PermissionService {
     /// Number of approved rules accumulated so far.
     pub fn approved_rule_count(&self) -> usize {
         self.approved.read().len()
+    }
+
+    pub fn add_external_root(&self, root: impl AsRef<Path>) {
+        let root = root.as_ref().to_path_buf();
+        let mut external_roots = self.external_roots.write();
+        if !external_roots.iter().any(|existing| existing == &root) {
+            external_roots.push(root);
+        }
+    }
+
+    pub fn external_roots(&self) -> Vec<PathBuf> {
+        self.external_roots.read().clone()
     }
 
     pub fn session_id(&self) -> &str {

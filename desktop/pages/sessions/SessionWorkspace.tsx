@@ -551,7 +551,7 @@ export function SessionWorkspace() {
           onClose={closeChat}
         />
       )}
-      <PermissionPromptBar sessionId={chatSessionId} />
+      <PermissionPromptBar sessionId={chatSessionId} sessionDirectory={chatRoot?.directory ?? chatSession?.directory} />
       <DeleteSessionDialog
         open={sessionPendingDelete !== null}
         sessionId={sessionPendingDelete}

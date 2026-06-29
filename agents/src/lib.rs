@@ -8,6 +8,7 @@ pub mod memory;
 pub mod message_bus;
 pub mod model_spec;
 pub mod patch;
+pub mod paths;
 pub mod permission;
 pub mod permission_v2;
 pub mod provider_service;

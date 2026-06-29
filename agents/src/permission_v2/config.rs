@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::paths;
+
 use super::rule::{PermissionAction, PermissionRule};
 use super::ruleset::PermissionRuleset;
 
-/// Top-level config file shape. Matches opencode's `opencode.json` schema for
-/// the `permission` key.
+/// Top-level config file shape for the `permission` key.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PermissionConfigFile {
     #[serde(default)]
@@ -50,8 +51,8 @@ impl PermissionConfigFile {
     pub fn load_default(cwd: impl AsRef<Path>) -> Result<Self, String> {
         let cwd = cwd.as_ref();
         let candidates = [
+            paths::project_config_file(cwd),
             cwd.join("arachne.json"),
-            cwd.join("opencode.json"),
             home_config_path(),
         ];
         for path in &candidates {
@@ -106,18 +107,12 @@ impl PermissionConfigFile {
     }
 }
 
-/// Standard home-directory config path: `~/.config/arachne/config.json`.
+/// Standard global config path for the current platform.
 pub fn home_config_path() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join(".config")
-            .join("arachne")
-            .join("config.json");
-    }
-    PathBuf::new()
+    paths::config_file()
 }
 
-/// Opencode-compatible home expansion: `~` and `$HOME` at the start of a
+/// Home expansion for permission patterns. `~` and `$HOME` at the start of a
 /// pattern are replaced with the user's home directory.
 pub fn expand(pattern: &str) -> String {
     expand_with(pattern, std::env::var_os("HOME").as_deref())
@@ -143,11 +138,11 @@ pub fn expand_with(pattern: &str, home: Option<&std::ffi::OsStr>) -> String {
     pattern.to_string()
 }
 
-/// Default ruleset when no config is found. Mirrors opencode's defaults:
-/// most tools allow, doom_loop/external_directory ask, `.env*` files denied.
+/// Default ruleset when no config is found: normal tools allow,
+/// doom_loop/external_directory ask, and `.env*` files are denied.
 pub fn default_ruleset() -> PermissionRuleset {
     let rules = vec![
-        // Most tools allow by default.
+        // Normal tools allow by default.
         PermissionRule::allow("read", "*"),
         PermissionRule::allow("glob", "*"),
         PermissionRule::allow("grep", "*"),
@@ -161,6 +156,9 @@ pub fn default_ruleset() -> PermissionRuleset {
         PermissionRule::allow("webfetch", "*"),
         PermissionRule::allow("websearch", "*"),
         PermissionRule::allow("question", "*"),
+        PermissionRule::allow("todo", "*"),
+        PermissionRule::allow("todowrite", "*"),
+        PermissionRule::allow("plan", "*"),
         // Deny .env* by default for read.
         PermissionRule::deny("read", "*.env"),
         PermissionRule::deny("read", "*.env.*"),
@@ -350,6 +348,15 @@ mod tests {
             ("glob", "**/*.rs"),
             ("grep", "TODO"),
             ("webfetch", "https://example.com"),
+            ("websearch", "rust mcp sdk"),
+            ("question", "confirm"),
+            ("todo", "update"),
+            ("todowrite", "update"),
+            ("plan", "build"),
+            ("skill", "rust"),
+            ("lsp", "hover"),
+            ("task", "explore"),
+            ("apply_patch", "patch"),
         ] {
             let result = ruleset.evaluate(permission, pattern);
             assert_eq!(

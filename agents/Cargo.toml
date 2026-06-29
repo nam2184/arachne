@@ -9,6 +9,7 @@ async-stream = "0.3"
 async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
+directories = "6.0.0"
 futures-util = "0.3"
 http = "1"
 http-body-util = "0.1"

@@ -255,6 +255,7 @@ where
             tracing::info!(
                 provider = %stream_provider,
                 model = %stream_model,
+                stream_exhausted = true,
                 reason = %reason,
                 raw_stop_reason = %raw_stop_reason_debug,
                 saw_end_chunk,
@@ -262,7 +263,7 @@ where
                 text_chunks,
                 text_bytes,
                 tool_calls = tool_calls.len(),
-                "sdk llm stream finished"
+                "sdk llm stream finished after stream exhaustion"
             );
 
             yield LlmEvent::Finish { reason, usage };

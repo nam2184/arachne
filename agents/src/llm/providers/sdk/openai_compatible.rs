@@ -432,6 +432,7 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
             tracing::info!(
                 provider = %stream_provider,
                 model = %stream_model,
+                stream_exhausted = true,
                 reason = %reason,
                 raw_stop_reason = %raw_stop_reason_debug,
                 saw_end_chunk,
@@ -440,7 +441,7 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
                 text_bytes,
                 tool_calls = tool_calls.len(),
                 tool_results = tool_results.len(),
-                "sdk llm stream finished"
+                "sdk llm stream finished after stream exhaustion"
             );
 
             yield LlmEvent::Finish { reason, usage };

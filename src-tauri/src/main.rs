@@ -7,8 +7,8 @@ mod error;
 mod services;
 
 use arachne_agents::{
-    create_conversation_service, llm::SubagentRegistry, ConversationService, ProviderService,
-    SessionService,
+    create_conversation_service, llm::SubagentRegistry, paths, ConversationService,
+    ProviderService, SessionService,
 };
 use services::agent_service::AgentService;
 use services::memory_service::MemoryService;
@@ -78,19 +78,15 @@ fn setup_logging() {
 fn log_file_path() -> PathBuf {
     std::env::var_os("ARACHNE_LOG_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_app_data_dir().join("logs").join("arachne.log"))
+        .unwrap_or_else(paths::log_file)
 }
 
 fn default_app_data_dir() -> PathBuf {
-    directories::ProjectDirs::from("ai", "arachne", "arachne")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| std::env::current_dir().unwrap().join("data"))
+    paths::data_dir()
 }
 
 fn default_app_config_dir() -> PathBuf {
-    directories::ProjectDirs::from("ai", "arachne", "arachne")
-        .map(|d| d.config_dir().to_path_buf())
-        .unwrap_or_else(|| std::env::current_dir().unwrap().join("config"))
+    paths::config_dir()
 }
 
 fn default_log_filter() -> &'static str {
@@ -140,6 +136,7 @@ pub fn run() {
     }
 
     let permission_map = Arc::new(PermissionMap::new());
+    let permission_map_for_setup = Arc::clone(&permission_map);
     let ui_command_service = Arc::new(UiCommandService::new());
     let subagent_registry = SubagentRegistry::new(db_path.clone());
 
@@ -152,6 +149,10 @@ pub fn run() {
     );
 
     tauri::Builder::default()
+        .setup(move |app| {
+            permission_map_for_setup.set_app_handle(app.handle().clone());
+            Ok(())
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())

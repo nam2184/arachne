@@ -107,7 +107,10 @@ impl AgentService {
     /// rooted at `directory` and enforced by the v2 sandbox path.
     pub fn build_runner_for_session(&self, session_id: &str, directory: &str) -> SessionRunner {
         let permissions = self.permission_map.get_or_create(session_id);
-        let sandbox = SandboxPolicy::new(std::path::PathBuf::from(directory));
+        let mut sandbox = SandboxPolicy::new(std::path::PathBuf::from(directory));
+        for root in permissions.external_roots() {
+            sandbox = sandbox.with_external(root);
+        }
         let sandboxed_ctx = Arc::new(
             SandboxedContext::new(sandbox, Arc::clone(&permissions))
                 .with_caller_session(session_id.to_string(), Arc::clone(&self.session_service)),

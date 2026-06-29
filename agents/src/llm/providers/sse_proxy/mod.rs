@@ -52,7 +52,6 @@ pub struct SseTerminalInfo {
     pub finish_reason_raw: Option<String>,
     pub termination: Option<ProxyTermination>,
     pub terminal_data_payload: Option<String>,
-    pub saw_done: bool,
     pub text_delta_count: u64,
     pub text_byte_count: u64,
     pub tool_call_delta_count: u64,

@@ -24,7 +24,7 @@ impl PermissionRuleset {
     }
 
     /// Evaluate a (permission, pattern) pair against the ruleset.
-    /// Last matching rule wins (opencode semantics).
+    /// Last matching rule wins.
     pub fn evaluate(&self, permission: &str, pattern: &str) -> PermissionRule {
         self.rules
             .iter()

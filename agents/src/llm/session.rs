@@ -3149,43 +3149,24 @@ pub enum SessionError {
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-
             SessionError::SessionNotFound(id) => write!(f, "session not found: {id}"),
-
             SessionError::NoProviderForSession => {
-
                 write!(f, "no provider configured for session")
-
             }
-
             SessionError::Conversation(msg) => write!(f, "conversation error: {msg}"),
-
             SessionError::Llm(err) => write!(f, "LLM error: {err}"),
-
             SessionError::Provider(msg) => write!(f, "provider error: {msg}"),
-
             SessionError::StepLimitExceeded { session_id, limit } => {
-
                 write!(f, "session {session_id} exceeded step limit {limit}")
-
             }
-
             SessionError::ContextOverflow {
-
                 session_id,
-
                 estimated_tokens,
-
                 context_window,
-
             } => write!(
-
                 f,
-
                 "session {session_id} request estimated at {estimated_tokens} tokens exceeds the {context_window}-token context window; compact the conversation before retrying"
-
             ),
-
         }
     }
 }

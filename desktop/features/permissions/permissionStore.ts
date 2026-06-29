@@ -68,7 +68,7 @@ export const usePermissionStore = create<PermissionState>((set, get) => ({
         { sessionId },
       );
       const prompts: PermissionPrompt[] = response.requests.map((wire) => ({
-        id: (wire.id as unknown as { 0: string })[0],
+        id: typeof wire.id === "string" ? wire.id : wire.id[0],
         sessionId: wire.session_id,
         permission: wire.permission,
         patterns: wire.patterns,
@@ -89,7 +89,7 @@ export const usePermissionStore = create<PermissionState>((set, get) => ({
   reply: async (sessionId: string, requestId: string, reply: PermissionReply) => {
     try {
       await invoke("permission_reply", {
-        request: { sessionId, requestId, reply },
+        request: { session_id: sessionId, request_id: requestId, reply },
       });
       // Optimistically remove the prompt from local state.
       set((state) => ({
@@ -101,11 +101,10 @@ export const usePermissionStore = create<PermissionState>((set, get) => ({
   },
 }));
 
-// Wire shape returned by the Tauri command (PermissionRequest as defined in
-// agents/src/permission_v2/service.rs). Serde flattens the RequestId
-// tuple into its inner String.
+// Wire shape returned by the Tauri command. RequestId serializes as a string,
+// but keeping the tuple fallback makes older dev builds harmless.
 type PendingPromptWire = {
-  id: { 0: string };
+  id: string | { 0: string };
   session_id: string;
   permission: string;
   patterns: string[];
