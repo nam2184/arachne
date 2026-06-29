@@ -13,6 +13,8 @@ pub struct AppSettings {
     pub editor_tab_size: u32,
     #[serde(default = "default_node_skin")]
     pub node_skin: String,
+    #[serde(default = "default_workspace_mode")]
+    pub workspace_mode: String,
     #[serde(default)]
     pub searxng_base_url: Option<String>,
     #[serde(default = "default_websearch_max_results")]
@@ -31,6 +33,9 @@ fn default_editor_tab_size() -> u32 {
 fn default_node_skin() -> String {
     "default".to_string()
 }
+fn default_workspace_mode() -> String {
+    "canvas".to_string()
+}
 fn default_websearch_max_results() -> u32 {
     5
 }
@@ -42,6 +47,7 @@ impl Default for AppSettings {
             editor_font_size: 14,
             editor_tab_size: 2,
             node_skin: "default".to_string(),
+            workspace_mode: "canvas".to_string(),
             searxng_base_url: None,
             websearch_max_results: default_websearch_max_results(),
         }

@@ -4,14 +4,17 @@ import { create } from "zustand";
 type View = "canvas" | "settings";
 
 export type NodeSkin = "default" | "minimal" | "tui";
+export type WorkspaceMode = "canvas" | "agent";
 
 export const NODE_SKINS: NodeSkin[] = ["default", "minimal", "tui"];
+export const WORKSPACE_MODES: WorkspaceMode[] = ["canvas", "agent"];
 
 export interface AppSettings {
   theme: "dark" | "light";
   editor_font_size: number;
   editor_tab_size: number;
   node_skin: NodeSkin;
+  workspace_mode: WorkspaceMode;
   searxng_base_url: string | null;
   websearch_max_results: number;
 }
@@ -23,6 +26,7 @@ interface AppState {
   loadSettings: () => Promise<void>;
   saveTheme: (theme: "dark" | "light") => Promise<void>;
   saveNodeSkin: (skin: NodeSkin) => Promise<void>;
+  saveWorkspaceMode: (mode: WorkspaceMode) => Promise<void>;
   saveWebSearchSettings: (baseUrl: string | null, maxResults: number) => Promise<void>;
 }
 
@@ -39,6 +43,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   editor_font_size: 14,
   editor_tab_size: 2,
   node_skin: "default",
+  workspace_mode: "canvas",
   searxng_base_url: null,
   websearch_max_results: 5,
 };
@@ -51,6 +56,9 @@ function normalize(settings: Partial<AppSettings> | null | undefined): AppSettin
     node_skin: NODE_SKINS.includes(settings?.node_skin as NodeSkin)
       ? (settings!.node_skin as NodeSkin)
       : "default",
+    workspace_mode: WORKSPACE_MODES.includes(settings?.workspace_mode as WorkspaceMode)
+      ? (settings!.workspace_mode as WorkspaceMode)
+      : "canvas",
     searxng_base_url: settings?.searxng_base_url?.trim() || null,
     websearch_max_results: clampWebSearchMax(settings?.websearch_max_results),
   };
@@ -89,6 +97,12 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   saveNodeSkin: async (node_skin) => {
     const next = { ...get().settings, node_skin };
+    set({ settings: next });
+    await invoke("save_settings", { settings: next });
+  },
+
+  saveWorkspaceMode: async (workspace_mode) => {
+    const next = { ...get().settings, workspace_mode };
     set({ settings: next });
     await invoke("save_settings", { settings: next });
   },

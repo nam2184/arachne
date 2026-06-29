@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LoopConfigDialog } from "@/components/loops";
 import { PermissionPromptBar, SessionCanvas, SessionChat, DeleteSessionDialog } from "@/components/sessions";
 import { Button } from "@/components/ui/button";
+import { useAppStore } from "@/features/app/appStore";
 import { useLoopStore, type LoopInput } from "@/features/loops/loopStore";
 import { useProjectStore } from "@/features/project/projectStore";
 import { usePermissionStore } from "@/features/permissions/permissionStore";
@@ -20,7 +21,9 @@ interface UiCommandResult {
 
 export function SessionWorkspace() {
   const currentProject = useProjectStore((state) => state.currentProject);
+  const workspaceMode = useAppStore((state) => state.settings.workspace_mode);
   const {
+    activeSessionId,
     addSessionToGroup,
     createGroup,
     createSession,
@@ -67,6 +70,7 @@ export function SessionWorkspace() {
   const creatingSessionRef = useRef(false);
   const chatSessionIdRef = useRef<string | null>(null);
   const pendingPromptKeysRef = useRef(new Map<string, Set<string>>());
+  const creatingChatForRootRef = useRef(new Set<string>());
 
   useEffect(() => {
     chatSessionIdRef.current = chatSessionId;
@@ -159,6 +163,39 @@ export function SessionWorkspace() {
     }
     return byRoot;
   }, [projectSessions]);
+
+  useEffect(() => {
+    if (workspaceMode !== "agent" || !activeSessionId) return;
+    const selectedSession = sessions.get(activeSessionId);
+    if (!selectedSession) return;
+
+    if (selectedSession.parent_session_id) {
+      setChatSessionId(selectedSession.id);
+      return;
+    }
+
+    const chats = chatsByRoot.get(selectedSession.id) ?? [];
+    const firstChat = chats[0];
+    if (firstChat) {
+      setChatSessionId(firstChat.id);
+      return;
+    }
+
+    if (creatingChatForRootRef.current.has(selectedSession.id)) return;
+    creatingChatForRootRef.current.add(selectedSession.id);
+    createSessionChat(selectedSession.id)
+      .then((result) => {
+        setChatSessionId(result.chatSessionId);
+        setActiveSession(result.chatSessionId);
+      })
+      .catch((createError) => {
+        setError(formatError(createError));
+        console.error("Failed to create chat:", createError);
+      })
+      .finally(() => {
+        creatingChatForRootRef.current.delete(selectedSession.id);
+      });
+  }, [activeSessionId, chatsByRoot, createSessionChat, sessions, setActiveSession, workspaceMode]);
 
   const projectLoops = useMemo(() => {
     if (!currentProject) return new Map();
@@ -476,6 +513,59 @@ export function SessionWorkspace() {
       throw deleteError;
     }
   }, [chatSessionId, chatsByRoot, clearConversation, deleteSession, sessions, setActiveSession, setSessionQueuedCount, setSessionRunning]);
+
+  if (workspaceMode === "agent") {
+    return (
+      <section className="flex h-screen min-w-0 flex-1 flex-col bg-[var(--background)]">
+        <div className="flex min-h-0 flex-1 flex-col">
+          {error && (
+            <div className="border-b border-[var(--border)] bg-[var(--surface-raised)] px-4 py-2 text-xs text-[#ff5f5f]">
+              {error}
+            </div>
+          )}
+          {chatSession ? (
+            <SessionChat
+              variant="docked"
+              session={chatSession}
+              rootSession={chatRoot ?? chatSession}
+              chats={chatOptions}
+              activeChatId={chatSession.id}
+              messages={chatMessages}
+              isSending={isChatSending}
+              queuedMessageCount={queuedMessageCount}
+              streamingMessageId={streamingMessageId}
+              onSendMessage={sendChatMessage}
+              onRunCommand={runUiCommand}
+              onSelectChat={setChatSessionId}
+              onCreateChat={createChatForCurrentSession}
+              onDeleteChat={requestDeleteSession}
+              onUpdateSessionProvider={updateSessionProvider}
+              onUpdateSessionTitle={updateSessionTitle}
+              onClose={closeChat}
+            />
+          ) : (
+            <div className="flex min-h-0 flex-1 items-center justify-center p-6 text-center">
+              <div className="max-w-sm space-y-2">
+                <h1 className="text-sm font-semibold text-[var(--foreground)]">Select a session or chat</h1>
+                <p className="text-xs text-[var(--text-muted)]">
+                  Pick a session from the sidebar, or add one under the current project to start a docked agent chat.
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+        <PermissionPromptBar sessionId={chatSessionId} sessionDirectory={chatRoot?.directory ?? chatSession?.directory} />
+        <DeleteSessionDialog
+          open={sessionPendingDelete !== null}
+          sessionId={sessionPendingDelete}
+          sessionLabel={sessionPendingDeleteLabel}
+          kind={sessionPendingDeleteKind}
+          onCancel={cancelDeleteSession}
+          onConfirm={confirmDeleteSession}
+        />
+      </section>
+    );
+  }
 
   return (
     <section className="flex h-screen min-w-0 flex-1 flex-col bg-[var(--background)]">

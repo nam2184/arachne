@@ -40,6 +40,7 @@ interface ChatMenuOption {
 }
 
 interface SessionChatProps {
+  variant?: "floating" | "docked";
   session: AgentSession;
   rootSession: AgentSession;
   chats: AgentSession[];
@@ -55,7 +56,7 @@ interface SessionChatProps {
   onDeleteChat: (sessionId: string) => Promise<void> | void;
   onUpdateSessionProvider: (sessionId: string, provider: string, model: string) => Promise<void>;
   onUpdateSessionTitle: (sessionId: string, title: string) => Promise<void>;
-  onClose: () => void;
+  onClose?: () => void;
 }
 
 const CHAT_WIDTH = 760;
@@ -152,6 +153,7 @@ function ChatOptionsMenu({
 }
 
 export function SessionChat({
+  variant = "floating",
   session,
   rootSession,
   chats,
@@ -435,50 +437,61 @@ export function SessionChat({
     : [];
 
   const directoryName = rootSession.directory.split(/[\\/]/).filter(Boolean).pop() ?? rootSession.directory;
+  const isFloating = variant === "floating";
+  const showChatSidebar = isFloating;
 
   return (
-    <div className="pointer-events-none fixed inset-0 z-50">
+    <div className={isFloating ? "pointer-events-none fixed inset-0 z-50" : "flex min-h-0 flex-1"}>
       <div
         className={cn(
-          "pointer-events-auto fixed flex h-[600px] max-h-[calc(100vh-32px)] w-[760px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-none border border-[var(--border)] bg-[var(--surface-raised)] text-[var(--foreground)] shadow-none",
+          "pointer-events-auto flex flex-col overflow-hidden rounded-none border border-[var(--border)] bg-[var(--surface-raised)] text-[var(--foreground)] shadow-none",
+          isFloating
+            ? "fixed h-[600px] max-h-[calc(100vh-32px)] w-[760px] max-w-[calc(100vw-32px)]"
+            : "h-full w-full border-0 border-l",
         )}
-        role="dialog"
-        aria-modal="false"
+        role={isFloating ? "dialog" : "region"}
+        aria-modal={isFloating ? "false" : undefined}
         aria-label={`${directoryName} chat`}
-        style={{ left: position.x, top: position.y }}
+        style={isFloating ? { left: position.x, top: position.y } : undefined}
       >
         <div
-          className="flex cursor-grab items-center justify-between border-b border-[var(--border)] px-6 py-4 active:cursor-grabbing"
-          onPointerDown={handleDragStart}
-          onPointerMove={handleDragMove}
-          onPointerUp={handleDragEnd}
-          onPointerCancel={handleDragEnd}
+          className={cn(
+            "flex items-center justify-between border-b border-[var(--border)] px-6 py-4",
+            isFloating && "cursor-grab active:cursor-grabbing",
+          )}
+          onPointerDown={isFloating ? handleDragStart : undefined}
+          onPointerMove={isFloating ? handleDragMove : undefined}
+          onPointerUp={isFloating ? handleDragEnd : undefined}
+          onPointerCancel={isFloating ? handleDragEnd : undefined}
         >
           <div className="flex min-w-0 items-center gap-3">
-            <GripHorizontal className="h-4 w-4 shrink-0 text-[var(--text-muted)]" />
+            {isFloating && <GripHorizontal className="h-4 w-4 shrink-0 text-[var(--text-muted)]" />}
             <div className="flex min-w-0 flex-col">
               <h2 className="truncate text-sm font-semibold text-[var(--foreground)]">{directoryName}</h2>
               <p className="truncate text-xs text-[var(--text-muted)]">{rootSession.directory}</p>
             </div>
           </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <Button
-              variant="ghost"
-              size="icon"
-              onPointerDown={(event) => event.stopPropagation()}
-              onClick={onClose}
-            >
-              <X className="h-4 w-4" />
-            </Button>
-          </div>
+          {isFloating && onClose && (
+            <div className="flex shrink-0 items-center gap-2">
+              <Button
+                variant="ghost"
+                size="icon"
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={onClose}
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+          )}
         </div>
         <div className="flex min-h-0 flex-1">
-          <aside
-            className={cn(
-              "flex shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] transition-[width] duration-150",
-              isChatSidebarOpen ? "w-40" : "w-10",
-            )}
-          >
+          {showChatSidebar && (
+            <aside
+              className={cn(
+                "flex shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] transition-[width] duration-150",
+                isChatSidebarOpen ? "w-40" : "w-10",
+              )}
+            >
             {isChatSidebarOpen ? (
               <>
                 <div className="flex items-center justify-between border-b border-[var(--border)] px-3 py-2">
@@ -597,7 +610,8 @@ export function SessionChat({
                 </Button>
               </div>
             )}
-          </aside>
+            </aside>
+          )}
           <div className="flex min-w-0 flex-1 flex-col">
             <ScrollArea className="flex-1 px-6 py-4" viewportRef={scrollViewportRef}>
               <div className="space-y-4">

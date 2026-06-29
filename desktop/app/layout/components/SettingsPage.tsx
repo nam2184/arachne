@@ -10,7 +10,7 @@ import {
 } from "@/features/sessions/providerModels";
 import type { ProviderConfig } from "@/features/sessions/sessionStore";
 import { cn } from "@/lib/utils";
-import { useAppStore, type NodeSkin } from "@/features/app/appStore";
+import { useAppStore, type NodeSkin, type WorkspaceMode } from "@/features/app/appStore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
@@ -33,7 +33,7 @@ const emptyProviderDraft: ProviderDraft = {
 };
 
 export function SettingsPage() {
-  const { settings, saveTheme, saveNodeSkin, saveWebSearchSettings, setView } = useAppStore();
+  const { settings, saveTheme, saveNodeSkin, saveWorkspaceMode, saveWebSearchSettings, setView } = useAppStore();
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [selectedProviderName, setSelectedProviderName] = useState("");
   const [providerDraft, setProviderDraft] = useState<ProviderDraft>(emptyProviderDraft);
@@ -182,6 +182,27 @@ export function SettingsPage() {
                   )}
                 </Button>
               </div>
+            </div>
+          </section>
+
+          <section className="space-y-4">
+            <h2 className="text-sm font-medium text-[var(--text-secondary)]">Workspace</h2>
+            <p className="text-xs text-[var(--text-subtle)]">Choose between the node canvas and a normal docked agent chat.</p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <WorkspaceModeCard
+                mode="canvas"
+                title="Canvas"
+                description="Node graph sessions with floating chats and loops"
+                active={settings.workspace_mode === "canvas"}
+                onSelect={saveWorkspaceMode}
+              />
+              <WorkspaceModeCard
+                mode="agent"
+                title="Agent"
+                description="Sidebar sessions with full-height chat"
+                active={settings.workspace_mode === "agent"}
+                onSelect={saveWorkspaceMode}
+              />
             </div>
           </section>
 
@@ -393,6 +414,39 @@ function inferProtocol(name: string): ProviderDraft["protocol"] {
 
 function formatError(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+interface WorkspaceModeCardProps {
+  mode: WorkspaceMode;
+  title: string;
+  description: string;
+  active: boolean;
+  onSelect: (mode: WorkspaceMode) => Promise<void> | void;
+}
+
+function WorkspaceModeCard({ mode, title, description, active, onSelect }: WorkspaceModeCardProps) {
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(mode)}
+      className={cn(
+        "flex flex-col gap-2 rounded-none border bg-[var(--surface-raised)] p-4 text-left transition-colors",
+        active ? "border-[var(--foreground)]" : "border-[var(--border)] hover:border-[var(--node-border-hover)]",
+      )}
+    >
+      <span className="flex items-center justify-between gap-3">
+        <span className="text-sm font-medium text-[var(--foreground)]">{title}</span>
+        <span
+          className={cn(
+            "h-3 w-3 rounded-full border",
+            active ? "border-[var(--foreground)] bg-[var(--foreground)]" : "border-[var(--node-border-hover)] bg-transparent",
+          )}
+          aria-hidden="true"
+        />
+      </span>
+      <span className="text-xs text-[var(--text-subtle)]">{description}</span>
+    </button>
+  );
 }
 
 interface NodeSkinCardProps {
