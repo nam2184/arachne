@@ -1,5 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { Folder, MessageSquare, Plus, Settings, Workflow, X } from "lucide-react";
+import { ChevronDown, ChevronRight, Folder, Plus, Settings, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -19,8 +19,6 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
   const { createProject, initializeProjects, projects, setCurrentProject } = useProjectStore();
   const theme = useAppStore((state) => state.settings.theme);
   const workspaceMode = useAppStore((state) => state.settings.workspace_mode);
-  const saveWorkspaceMode = useAppStore((state) => state.saveWorkspaceMode);
-  const setView = useAppStore((state) => state.setView);
   const {
     activeSessionId,
     createSession,
@@ -34,6 +32,7 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
   const [isAddingProject, setIsAddingProject] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
+  const [collapsedSessionIds, setCollapsedSessionIds] = useState<Set<string>>(() => new Set());
   const projectInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -128,11 +127,28 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
   const createChat = async (rootSessionId: string) => {
     try {
       const result = await createSessionChat(rootSessionId);
+      setCollapsedSessionIds((current) => {
+        const next = new Set(current);
+        next.delete(rootSessionId);
+        return next;
+      });
       setActiveSession(result.chatSessionId);
     } catch (createError) {
       setError(formatError(createError));
       console.error("Failed to create chat:", createError);
     }
+  };
+
+  const toggleSessionChats = (sessionId: string) => {
+    setCollapsedSessionIds((current) => {
+      const next = new Set(current);
+      if (next.has(sessionId)) {
+        next.delete(sessionId);
+      } else {
+        next.add(sessionId);
+      }
+      return next;
+    });
   };
 
   return (
@@ -150,40 +166,6 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
               ARACHNE
             </span>
           </a>
-        </div>
-        <div className="mb-4 grid grid-cols-2 gap-1 border border-[var(--border)] bg-[var(--background)] p-1">
-          <button
-            type="button"
-            onClick={() => {
-              void saveWorkspaceMode("canvas");
-              setView("canvas");
-            }}
-            className={cn(
-              "flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] uppercase tracking-[0.12em] transition-colors",
-              workspaceMode === "canvas"
-                ? "bg-[var(--foreground)] text-[var(--background)]"
-                : "text-[var(--text-muted)] hover:text-[var(--foreground)]",
-            )}
-          >
-            <Workflow className="h-3 w-3" />
-            Canvas
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              void saveWorkspaceMode("agent");
-              setView("canvas");
-            }}
-            className={cn(
-              "flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] uppercase tracking-[0.12em] transition-colors",
-              workspaceMode === "agent"
-                ? "bg-[var(--foreground)] text-[var(--background)]"
-                : "text-[var(--text-muted)] hover:text-[var(--foreground)]",
-            )}
-          >
-            <MessageSquare className="h-3 w-3" />
-            Agent
-          </button>
         </div>
         <div className="flex items-center justify-between">
           <h2 className="text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">Projects</h2>
@@ -272,10 +254,25 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
                   <div className="space-y-2">
                     {rootSessions.map((root) => {
                       const chats = chatsByRoot.get(root.id) ?? [];
+                      const isCollapsed = collapsedSessionIds.has(root.id);
                       const activeRoot = activeSessionId === root.id || chats.some((chat) => chat.id === activeSessionId);
                       return (
                         <div key={root.id} className="space-y-1">
                           <div className="group flex items-center gap-1">
+                            {chats.length > 0 ? (
+                              <button
+                                type="button"
+                                className="flex h-7 w-5 shrink-0 items-center justify-center bg-transparent text-[var(--text-muted)] hover:text-[var(--foreground)]"
+                                onClick={() => toggleSessionChats(root.id)}
+                                aria-expanded={!isCollapsed}
+                                aria-label={`${isCollapsed ? "Expand" : "Collapse"} chats for ${directoryName(root.directory)}`}
+                                title={isCollapsed ? "Expand chats" : "Collapse chats"}
+                              >
+                                {isCollapsed ? <ChevronRight className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                              </button>
+                            ) : (
+                              <span className="h-7 w-5 shrink-0" aria-hidden="true" />
+                            )}
                             <button
                               type="button"
                               className={cn(
@@ -297,7 +294,7 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
                               <Plus className="h-3.5 w-3.5" />
                             </button>
                           </div>
-                          {chats.length > 0 && (
+                          {chats.length > 0 && !isCollapsed && (
                             <div className="space-y-1 pl-3">
                               {chats.map((chat, index) => (
                                 <button
@@ -309,7 +306,6 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
                                   )}
                                   onClick={() => setActiveSession(chat.id)}
                                 >
-                                  <MessageSquare className="h-3 w-3 shrink-0" />
                                   <span className="truncate">{chatTitle(chat, index)}</span>
                                 </button>
                               ))}

@@ -541,7 +541,6 @@ export function SessionWorkspace() {
               onDeleteChat={requestDeleteSession}
               onUpdateSessionProvider={updateSessionProvider}
               onUpdateSessionTitle={updateSessionTitle}
-              onClose={closeChat}
             />
           ) : (
             <div className="flex min-h-0 flex-1 items-center justify-center p-6 text-center">

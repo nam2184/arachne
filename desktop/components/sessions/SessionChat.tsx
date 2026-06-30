@@ -464,9 +464,9 @@ export function SessionChat({
           onPointerUp={isFloating ? handleDragEnd : undefined}
           onPointerCancel={isFloating ? handleDragEnd : undefined}
         >
-          <div className="flex min-w-0 items-center gap-3">
+          <div className={cn("flex min-w-0 items-center gap-3", !isFloating && "ml-auto max-w-[70%]")}>
             {isFloating && <GripHorizontal className="h-4 w-4 shrink-0 text-[var(--text-muted)]" />}
-            <div className="flex min-w-0 flex-col">
+            <div className={cn("flex min-w-0 flex-col", !isFloating && "items-end text-right")}>
               <h2 className="truncate text-sm font-semibold text-[var(--foreground)]">{directoryName}</h2>
               <p className="truncate text-xs text-[var(--text-muted)]">{rootSession.directory}</p>
             </div>
