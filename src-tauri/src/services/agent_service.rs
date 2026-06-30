@@ -13,7 +13,8 @@ use arachne_agents::{
     tools::SandboxedContext,
     CompactionConfig, CompactionOutcome, CompactionRequest, CompactionService, ConversationService,
     LlmProvider, MessageRole, ModelRegistry, ProviderConfig, ProviderProtocol, ProviderRegistry,
-    ProviderService, SessionError, SessionRunEvent, SessionRunner, SessionService,
+    ProviderService, SessionError, SessionFileDiff, SessionRunEvent, SessionRunner, SessionService,
+    SnapshotService,
 };
 use tauri::{AppHandle, Emitter};
 
@@ -40,6 +41,11 @@ pub enum AgentUiEvent {
         session_id: String,
         message: String,
     },
+    SessionDiff {
+        session_id: String,
+        message_id: String,
+        diff: Vec<SessionFileDiff>,
+    },
 }
 
 pub struct AgentService {
@@ -51,6 +57,7 @@ pub struct AgentService {
     permission_map: Arc<PermissionMap>,
     compactor: Arc<CompactionService>,
     sse_proxy: Arc<SseProxyManager>,
+    snapshot_service: Arc<SnapshotService>,
 }
 
 impl AgentService {
@@ -60,6 +67,7 @@ impl AgentService {
         provider_service: Arc<ProviderService>,
         subagent_registry: Arc<SubagentRegistry>,
         permission_map: Arc<PermissionMap>,
+        snapshot_service: Arc<SnapshotService>,
     ) -> Arc<Self> {
         let providers = Arc::new(ProviderRegistry::new());
         providers.register_defaults_sync();
@@ -80,6 +88,7 @@ impl AgentService {
             permission_map,
             compactor,
             sse_proxy,
+            snapshot_service,
         })
     }
 
@@ -216,8 +225,9 @@ impl AgentService {
             },
         );
 
-        self.conversation_service
-            .append_message(session_id, MessageRole::User, message)?;
+        let user_message_id =
+            self.conversation_service
+                .append_message(session_id, MessageRole::User, message)?;
 
         let session = self
             .session_service
@@ -225,6 +235,7 @@ impl AgentService {
             .ok_or_else(|| "Session not found".to_string())?;
 
         self.refresh_provider(&session.provider).await;
+        let before_snapshot = self.snapshot_service.track(&session);
 
         let session_id_clone = session_id.to_string();
         let registry = Arc::clone(&self.subagent_registry);
@@ -246,6 +257,7 @@ impl AgentService {
             .with_subagent_registry(Arc::clone(&registry))
             .with_mode(mode);
         let run_result = runner.run(&session_id_clone).await;
+        self.capture_session_diff(&app, &session, &user_message_id, before_snapshot.as_deref());
 
         if let Err(error) = run_result {
             let message = chat_error_message(&error);
@@ -281,6 +293,39 @@ impl AgentService {
         );
 
         Ok(response)
+    }
+
+    fn capture_session_diff(
+        &self,
+        app: &AppHandle,
+        session: &arachne_agents::AgentSession,
+        message_id: &str,
+        before_snapshot: Option<&str>,
+    ) {
+        let Some(before_snapshot) = before_snapshot else {
+            return;
+        };
+        let Some(after_snapshot) = self.snapshot_service.track(session) else {
+            return;
+        };
+        let diff = self
+            .snapshot_service
+            .diff_full(session, before_snapshot, &after_snapshot);
+        if let Err(error) =
+            self.conversation_service
+                .write_session_diff(&session.id, message_id, diff.clone())
+        {
+            tracing::warn!(session_id = %session.id, error = %error, "failed to persist session diff");
+            return;
+        }
+        emit_agent_event(
+            app,
+            AgentUiEvent::SessionDiff {
+                session_id: session.id.clone(),
+                message_id: message_id.to_string(),
+                diff,
+            },
+        );
     }
 }
 

@@ -10,7 +10,7 @@ import { useAppStore } from "@/features/app/appStore";
 import { useLoopStore, type LoopInput } from "@/features/loops/loopStore";
 import { useProjectStore } from "@/features/project/projectStore";
 import { usePermissionStore } from "@/features/permissions/permissionStore";
-import { useConversationStore, type AgentStreamEvent } from "@/features/sessions/conversationStore";
+import { useConversationStore, type AgentStreamEvent, type SessionFileDiff } from "@/features/sessions/conversationStore";
 import { useSessionStore, type AgentSession } from "@/features/sessions/sessionStore";
 
 interface UiCommandResult {
@@ -64,6 +64,7 @@ export function SessionWorkspace() {
   const [isAddMenuOpen, setIsAddMenuOpen] = useState(false);
   const [isLoopDialogOpen, setIsLoopDialogOpen] = useState(false);
   const [configuringLoopId, setConfiguringLoopId] = useState<string | null>(null);
+  const [sessionDiffs, setSessionDiffs] = useState<Map<string, SessionFileDiff[]>>(() => new Map());
   const [focusRequest, setFocusRequest] = useState<{ sessionId: string; nonce: number } | null>(null);
   const sendQueuesRef = useRef(new Map<string, Array<{ content: string; mode: "plan" | "build" }>>());
   const processingSessionsRef = useRef(new Set<string>());
@@ -106,7 +107,15 @@ export function SessionWorkspace() {
     let mounted = true;
 
     listen<AgentStreamEvent>("agent:event", (event) => {
-      applyAgentEvent(event.payload);
+      const payload = event.payload;
+      applyAgentEvent(payload);
+      if (payload.type === "session_diff") {
+        setSessionDiffs((current) => {
+          const next = new Map(current);
+          next.set(payload.session_id, payload.diff);
+          return next;
+        });
+      }
     })
       .then((dispose) => {
         if (mounted) {
@@ -137,6 +146,21 @@ export function SessionWorkspace() {
       console.error("Failed to load conversation:", loadError);
     });
   }, [chatSessionId, clearConversation, loadUiConversation]);
+
+  useEffect(() => {
+    if (!chatSessionId) return;
+    invoke<SessionFileDiff[]>("get_session_diff", { sessionId: chatSessionId })
+      .then((diff) => {
+        setSessionDiffs((current) => {
+          const next = new Map(current);
+          next.set(chatSessionId, diff);
+          return next;
+        });
+      })
+      .catch((loadError) => {
+        console.error("Failed to load session diff:", loadError);
+      });
+  }, [chatSessionId]);
 
   const projectSessions = useMemo(() => {
     if (!currentProject) return new Map();
@@ -456,6 +480,7 @@ export function SessionWorkspace() {
   const chatMessages = activeConversation?.session_id === chatSessionId
     ? activeConversation.messages
     : [];
+  const chatDiff = chatSessionId ? sessionDiffs.get(chatSessionId) ?? [] : [];
 
   const pendingDeleteSession = sessionPendingDelete ? sessions.get(sessionPendingDelete) ?? null : null;
   const sessionPendingDeleteKind: "session" | "chat" = pendingDeleteSession?.parent_session_id ? "chat" : "session";
@@ -516,7 +541,7 @@ export function SessionWorkspace() {
 
   if (workspaceMode === "agent") {
     return (
-      <section className="flex h-screen min-w-0 flex-1 flex-col bg-[var(--background)]">
+      <section className="flex h-full min-w-0 flex-1 flex-col bg-[var(--background)]">
         <div className="flex min-h-0 flex-1 flex-col">
           {error && (
             <div className="border-b border-[var(--border)] bg-[var(--surface-raised)] px-4 py-2 text-xs text-[#ff5f5f]">
@@ -534,6 +559,7 @@ export function SessionWorkspace() {
               isSending={isChatSending}
               queuedMessageCount={queuedMessageCount}
               streamingMessageId={streamingMessageId}
+              diffs={chatDiff}
               onSendMessage={sendChatMessage}
               onRunCommand={runUiCommand}
               onSelectChat={setChatSessionId}
@@ -567,7 +593,7 @@ export function SessionWorkspace() {
   }
 
   return (
-    <section className="flex h-screen min-w-0 flex-1 flex-col bg-[var(--background)]">
+    <section className="flex h-full min-w-0 flex-1 flex-col bg-[var(--background)]">
       <div className="relative flex min-h-0 flex-1">
         <div className="pointer-events-none absolute right-4 top-4 z-20 flex flex-col items-end gap-2">
           <Button
@@ -630,6 +656,7 @@ export function SessionWorkspace() {
           isSending={isChatSending}
           queuedMessageCount={queuedMessageCount}
           streamingMessageId={streamingMessageId}
+          diffs={chatDiff}
           onSendMessage={sendChatMessage}
           onRunCommand={runUiCommand}
           onSelectChat={setChatSessionId}

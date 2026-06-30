@@ -23,6 +23,14 @@ export interface ConversationFile {
   summary: string | null;
 }
 
+export interface SessionFileDiff {
+  file: string;
+  patch?: string;
+  additions: number;
+  deletions: number;
+  status: "added" | "deleted" | "modified";
+}
+
 type AgentLlmEvent = {
   type: string;
   id?: string;
@@ -41,6 +49,7 @@ export type AgentStreamEvent =
   | { type: "started"; session_id: string }
   | { type: "llm_event"; session_id: string; step: number; event: AgentLlmEvent }
   | { type: "finished"; session_id: string; response: string }
+  | { type: "session_diff"; session_id: string; message_id: string; diff: SessionFileDiff[] }
   | { type: "error"; session_id: string; message: string };
 
 interface ConversationState {

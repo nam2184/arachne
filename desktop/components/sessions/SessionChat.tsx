@@ -1,12 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Check, ChevronDown, ChevronLeft, ChevronRight, FolderSearch, GripHorizontal, MoreHorizontal, Plus, Search, Terminal, Wrench, X } from "lucide-react";
+import { Check, ChevronDown, ChevronLeft, ChevronRight, FolderSearch, MoreHorizontal, Plus, Search, Terminal, Wrench, X } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { getDefaultModel, getModelOptions } from "@/features/sessions/providerModels";
-import type { ChatMessagePart } from "@/features/sessions/conversationStore";
+import type { ChatMessagePart, SessionFileDiff } from "@/features/sessions/conversationStore";
 import type { AgentSession, ProviderConfig } from "@/features/sessions/sessionStore";
+import { SessionDiffPane } from "@/components/sessions/SessionDiffPane";
 import { ThinkBlock } from "@/components/sessions/ThinkBlock";
 
 export interface SessionChatMessage {
@@ -49,6 +50,7 @@ interface SessionChatProps {
   isSending: boolean;
   queuedMessageCount: number;
   streamingMessageId: string | null;
+  diffs?: SessionFileDiff[];
   onSendMessage: (content: string, mode: ChatMode) => void | Promise<void>;
   onRunCommand: (input: string) => Promise<UiCommandResult>;
   onSelectChat: (sessionId: string) => void;
@@ -62,6 +64,11 @@ interface SessionChatProps {
 const CHAT_WIDTH = 760;
 const CHAT_HEIGHT = 600;
 const EDGE_PADDING = 16;
+const DIFF_PANE_DEFAULT_WIDTH = 520;
+const DIFF_PANE_MIN_WIDTH = 0;
+const DIFF_PANE_USABLE_MIN_WIDTH = 320;
+const DIFF_PANE_MAX_WIDTH = 760;
+const DIFF_PANE_SNAP_THRESHOLD = 72;
 const CONTROL_LABEL_CLASS = "text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]";
 const TRANSPARENT_CONTROL_CLASS =
   "min-w-0 bg-transparent py-1 text-[11px] text-[var(--text-muted)] outline-none transition-colors hover:text-[var(--foreground)] focus:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-40 [&>option]:bg-[var(--surface-raised)] [&>option]:text-[var(--foreground)]";
@@ -162,6 +169,7 @@ export function SessionChat({
   isSending,
   queuedMessageCount,
   streamingMessageId,
+  diffs = [],
   onSendMessage,
   onRunCommand,
   onSelectChat,
@@ -176,7 +184,7 @@ export function SessionChat({
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [isCommandRunning, setIsCommandRunning] = useState(false);
-  const [position, setPosition] = useState(() => initialChatPosition());
+  const [position] = useState(() => initialChatPosition());
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [providerDraft, setProviderDraft] = useState(session.provider);
   const [modelDraft, setModelDraft] = useState(session.model);
@@ -188,6 +196,7 @@ export function SessionChat({
   const [titleError, setTitleError] = useState<string | null>(null);
   const [isChatSidebarOpen, setIsChatSidebarOpen] = useState(true);
   const [openChatMenuId, setOpenChatMenuId] = useState<string | null>(null);
+  const [diffPaneWidth, setDiffPaneWidth] = useState(DIFF_PANE_DEFAULT_WIDTH);
   // In-memory only; not persisted to settings or anywhere else. The
   // active mode is sent to the backend on each prompt and injected into
   // the LLM's context as a synthetic user message.
@@ -201,12 +210,10 @@ export function SessionChat({
   // turns without the view jumping.
   const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const dragRef = useRef<{
+  const diffResizeRef = useRef<{
     pointerId: number;
     startX: number;
-    startY: number;
-    originX: number;
-    originY: number;
+    startWidth: number;
   } | null>(null);
 
   useEffect(() => {
@@ -320,30 +327,25 @@ export function SessionChat({
     }
   };
 
-  const handleDragStart = (event: PointerEvent<HTMLDivElement>) => {
-    dragRef.current = {
+  const handleDiffResizeStart = (event: PointerEvent<HTMLDivElement>) => {
+    diffResizeRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
-      startY: event.clientY,
-      originX: position.x,
-      originY: position.y,
+      startWidth: diffPaneWidth,
     };
     event.currentTarget.setPointerCapture(event.pointerId);
   };
 
-  const handleDragMove = (event: PointerEvent<HTMLDivElement>) => {
-    const drag = dragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-
-    setPosition(clampChatPosition({
-      x: drag.originX + event.clientX - drag.startX,
-      y: drag.originY + event.clientY - drag.startY,
-    }));
+  const handleDiffResizeMove = (event: PointerEvent<HTMLDivElement>) => {
+    const resize = diffResizeRef.current;
+    if (!resize || resize.pointerId !== event.pointerId) return;
+    const nextWidth = resize.startWidth - (event.clientX - resize.startX);
+    setDiffPaneWidth(clampDiffPaneWidth(nextWidth));
   };
 
-  const handleDragEnd = (event: PointerEvent<HTMLDivElement>) => {
-    if (dragRef.current?.pointerId === event.pointerId) {
-      dragRef.current = null;
+  const handleDiffResizeEnd = (event: PointerEvent<HTMLDivElement>) => {
+    if (diffResizeRef.current?.pointerId === event.pointerId) {
+      diffResizeRef.current = null;
     }
   };
 
@@ -439,14 +441,19 @@ export function SessionChat({
   const directoryName = rootSession.directory.split(/[\\/]/).filter(Boolean).pop() ?? rootSession.directory;
   const isFloating = variant === "floating";
   const showChatSidebar = isFloating;
+  const showDiffPane = diffs.length > 0;
+  const isDiffPaneCollapsed = diffPaneWidth === 0;
 
   return (
     <div className={isFloating ? "pointer-events-none fixed inset-0 z-50" : "flex min-h-0 flex-1"}>
       <div
         className={cn(
-          "pointer-events-auto flex flex-col overflow-hidden rounded-none border border-[var(--border)] bg-[var(--surface-raised)] text-[var(--foreground)] shadow-none",
+          "pointer-events-auto relative flex flex-col overflow-hidden rounded-none border border-[var(--border)] bg-[var(--surface-raised)] text-[var(--foreground)] shadow-none",
           isFloating
-            ? "fixed h-[600px] max-h-[calc(100vh-32px)] w-[760px] max-w-[calc(100vw-32px)]"
+            ? cn(
+                "fixed h-[600px] max-h-[calc(100vh-32px)] max-w-[calc(100vw-32px)]",
+                showDiffPane && !isDiffPaneCollapsed ? "w-[1120px]" : "w-[760px]",
+              )
             : "h-full w-full border-0 border-l",
         )}
         role={isFloating ? "dialog" : "region"}
@@ -454,36 +461,16 @@ export function SessionChat({
         aria-label={`${directoryName} chat`}
         style={isFloating ? { left: position.x, top: position.y } : undefined}
       >
-        <div
-          className={cn(
-            "flex items-center justify-between border-b border-[var(--border)] px-6 py-4",
-            isFloating && "cursor-grab active:cursor-grabbing",
-          )}
-          onPointerDown={isFloating ? handleDragStart : undefined}
-          onPointerMove={isFloating ? handleDragMove : undefined}
-          onPointerUp={isFloating ? handleDragEnd : undefined}
-          onPointerCancel={isFloating ? handleDragEnd : undefined}
-        >
-          <div className={cn("flex min-w-0 items-center gap-3", !isFloating && "ml-auto max-w-[70%]")}>
-            {isFloating && <GripHorizontal className="h-4 w-4 shrink-0 text-[var(--text-muted)]" />}
-            <div className={cn("flex min-w-0 flex-col", !isFloating && "items-end text-right")}>
-              <h2 className="truncate text-sm font-semibold text-[var(--foreground)]">{directoryName}</h2>
-              <p className="truncate text-xs text-[var(--text-muted)]">{rootSession.directory}</p>
-            </div>
-          </div>
-          {isFloating && onClose && (
-            <div className="flex shrink-0 items-center gap-2">
-              <Button
-                variant="ghost"
-                size="icon"
-                onPointerDown={(event) => event.stopPropagation()}
-                onClick={onClose}
-              >
-                <X className="h-4 w-4" />
-              </Button>
-            </div>
-          )}
-        </div>
+        {isFloating && onClose && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="absolute right-2 top-2 z-20 h-8 w-8 bg-[var(--surface-raised)]/80"
+            onClick={onClose}
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        )}
         <div className="flex min-h-0 flex-1">
           {showChatSidebar && (
             <aside
@@ -822,6 +809,27 @@ export function SessionChat({
           )}
             </div>
           </div>
+          {showDiffPane && (
+            <>
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="Resize changes pane"
+                className="z-10 w-1 shrink-0 cursor-col-resize border-l border-[var(--border)] bg-[var(--surface)] hover:bg-[var(--node-border-hover)] active:bg-[var(--node-border-hover)]"
+                onPointerDown={handleDiffResizeStart}
+                onPointerMove={handleDiffResizeMove}
+                onPointerUp={handleDiffResizeEnd}
+                onPointerCancel={handleDiffResizeEnd}
+              />
+              {!isDiffPaneCollapsed && (
+                <SessionDiffPane
+                  diffs={diffs}
+                  width={diffPaneWidth}
+                  onClose={() => setDiffPaneWidth(0)}
+                />
+              )}
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -1037,6 +1045,11 @@ function clampChatPosition(position: { x: number; y: number }) {
     x: Math.min(Math.max(EDGE_PADDING, position.x), maxX),
     y: Math.min(Math.max(EDGE_PADDING, position.y), maxY),
   };
+}
+
+function clampDiffPaneWidth(width: number) {
+  if (width <= DIFF_PANE_SNAP_THRESHOLD) return DIFF_PANE_MIN_WIDTH;
+  return Math.min(Math.max(DIFF_PANE_USABLE_MIN_WIDTH, width), DIFF_PANE_MAX_WIDTH);
 }
 
 function formatError(error: unknown) {
