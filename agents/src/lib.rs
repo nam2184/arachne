@@ -15,6 +15,7 @@ pub mod provider_service;
 pub mod routing;
 pub mod sandbox;
 pub mod sessions;
+pub mod snapshot;
 pub mod tools;
 
 pub use context::*;
@@ -31,5 +32,6 @@ pub use provider_service::ProviderService;
 pub use sessions::{
     build_prompt, create_conversation_service, serialize_message, CompactionConfig,
     CompactionOutcome, CompactionRequest, CompactionService, ConversationFile, ConversationMessage,
-    ConversationService, SessionService,
+    ConversationService, SessionService, SessionTurnDiff,
 };
+pub use snapshot::{DiffStatus, SessionFileDiff, SnapshotService};

@@ -152,7 +152,7 @@ export function ProjectSidebar({ project, onOpenSettings }: ProjectSidebarProps)
   };
 
   return (
-    <aside className="flex w-[200px] shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)]">
+    <aside className="flex h-full w-[200px] shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)]">
       <div className="p-4 pb-2">
         <div className="mb-5 flex items-center">
           <a href="#top" className="flex items-center gap-3" aria-label="Arachne home">

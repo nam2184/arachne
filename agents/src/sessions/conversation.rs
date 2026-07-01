@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::snapshot::SessionFileDiff;
 use crate::{Message, MessageRole};
 
 pub struct ConversationService {
@@ -35,6 +36,18 @@ pub struct ConversationMessage {
     pub role: String,
     pub content: String,
     pub timestamp: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionTurnDiff {
+    pub message_id: String,
+    pub diff: Vec<SessionFileDiff>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SessionDiffFile {
+    session_id: String,
+    turns: Vec<SessionTurnDiff>,
 }
 
 impl ConversationService {
@@ -184,6 +197,49 @@ impl ConversationService {
         Ok(self.read_ai_conversation(session_id)?.messages)
     }
 
+    pub fn write_session_diff(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        diff: Vec<SessionFileDiff>,
+    ) -> Result<(), String> {
+        let session_lock = self.get_lock(session_id);
+        let _session_guard = session_lock.lock();
+        let lock_path = self.lock_file_path(session_id);
+        let _file_guard = self.acquire_lock(&lock_path)?;
+
+        let mut file = self.read_session_diff_file(session_id)?;
+        file.turns.retain(|turn| turn.message_id != message_id);
+        file.turns.push(SessionTurnDiff {
+            message_id: message_id.to_string(),
+            diff,
+        });
+        self.write_session_diff_file(session_id, &file)
+    }
+
+    pub fn get_session_diff(
+        &self,
+        session_id: &str,
+        message_id: Option<&str>,
+    ) -> Result<Vec<SessionFileDiff>, String> {
+        let session_lock = self.get_lock(session_id);
+        let _session_guard = session_lock.lock();
+        let file = self.read_session_diff_file(session_id)?;
+        if let Some(message_id) = message_id {
+            return Ok(file
+                .turns
+                .into_iter()
+                .find(|turn| turn.message_id == message_id)
+                .map(|turn| turn.diff)
+                .unwrap_or_default());
+        }
+        Ok(file
+            .turns
+            .last()
+            .map(|turn| turn.diff.clone())
+            .unwrap_or_default())
+    }
+
     pub fn compact_conversation(&self, session_id: &str, summary: String) -> Result<(), String> {
         self.compact_conversation_with_recent_messages(session_id, &summary, &[])
     }
@@ -265,7 +321,11 @@ impl ConversationService {
         let lock_path = self.lock_file_path(session_id);
         let _file_guard = self.acquire_lock(&lock_path)?;
 
-        for path in [self.ai_file_path(session_id), self.ui_file_path(session_id)] {
+        for path in [
+            self.ai_file_path(session_id),
+            self.ui_file_path(session_id),
+            self.diff_file_path(session_id),
+        ] {
             if path.exists() {
                 std::fs::remove_file(&path)
                     .map_err(|e| format!("Failed to delete conversation file: {e}"))?;
@@ -294,6 +354,10 @@ impl ConversationService {
         self.base_dir.join(format!("{session_id}.ui.json"))
     }
 
+    fn diff_file_path(&self, session_id: &str) -> PathBuf {
+        self.base_dir.join(format!("{session_id}.diffs.json"))
+    }
+
     fn lock_file_path(&self, session_id: &str) -> PathBuf {
         self.base_dir.join(format!("{session_id}.lock"))
     }
@@ -316,6 +380,33 @@ impl ConversationService {
         let content = std::fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read {label} file: {e}"))?;
         serde_json::from_str(&content).map_err(|e| format!("Failed to parse {label} file: {e}"))
+    }
+
+    fn read_session_diff_file(&self, session_id: &str) -> Result<SessionDiffFile, String> {
+        let path = self.diff_file_path(session_id);
+        if !path.exists() {
+            return Ok(SessionDiffFile {
+                session_id: session_id.to_string(),
+                turns: Vec::new(),
+            });
+        }
+
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read session diff file: {e}"))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse session diff file: {e}"))
+    }
+
+    fn write_session_diff_file(
+        &self,
+        session_id: &str,
+        diff: &SessionDiffFile,
+    ) -> Result<(), String> {
+        let path = self.diff_file_path(session_id);
+        let content = serde_json::to_string_pretty(diff)
+            .map_err(|e| format!("Failed to serialize session diff file: {e}"))?;
+        std::fs::write(&path, content)
+            .map_err(|e| format!("Failed to write session diff file: {e}"))
     }
 
     fn write_ai_conversation(

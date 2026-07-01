@@ -8,7 +8,7 @@ mod services;
 
 use arachne_agents::{
     create_conversation_service, llm::SubagentRegistry, paths, ConversationService,
-    ProviderService, SessionService,
+    ProviderService, SessionService, SnapshotService,
 };
 use services::agent_service::AgentService;
 use services::memory_service::MemoryService;
@@ -23,6 +23,7 @@ pub struct AppState {
     pub agent_service: Arc<AgentService>,
     pub session_service: Arc<SessionService>,
     pub conversation_service: Arc<ConversationService>,
+    pub snapshot_service: Arc<SnapshotService>,
     pub settings_service: Arc<SettingsService>,
     pub memory_service: Arc<MemoryService>,
     pub stack_detector: Arc<StackDetector>,
@@ -114,6 +115,7 @@ pub fn run() {
     let project_service = ProjectService::new(db_path.clone(), Arc::clone(&stack_detector));
     let session_service = SessionService::new(db_path.clone());
     let conversation_service = create_conversation_service(app_data_dir.join("conversations"));
+    let snapshot_service = SnapshotService::new(app_data_dir.join("snapshots"));
     let provider_service = ProviderService::new(db_path.clone());
 
     // Initialize the database schema once so the sub-agent registry can
@@ -146,6 +148,7 @@ pub fn run() {
         Arc::clone(&provider_service),
         Arc::clone(&subagent_registry),
         Arc::clone(&permission_map),
+        Arc::clone(&snapshot_service),
     );
 
     tauri::Builder::default()
@@ -161,6 +164,7 @@ pub fn run() {
             agent_service: Arc::clone(&agent_service),
             session_service: Arc::clone(&session_service),
             conversation_service: Arc::clone(&conversation_service),
+            snapshot_service: Arc::clone(&snapshot_service),
             settings_service: Arc::clone(&settings_service),
             memory_service: Arc::clone(&memory_service),
             stack_detector: Arc::clone(&stack_detector),
@@ -172,6 +176,7 @@ pub fn run() {
         .manage(agent_service)
         .manage(provider_service)
         .manage(conversation_service)
+        .manage(snapshot_service)
         .manage(project_service)
         .manage(session_service)
         .manage(settings_service)
@@ -208,6 +213,7 @@ pub fn run() {
             commands::conversation_commands::get_ui_conversation,
             commands::conversation_commands::compact_conversation,
             commands::conversation_commands::delete_conversation,
+            commands::session_diff_commands::get_session_diff,
             commands::settings_commands::get_settings,
             commands::settings_commands::save_settings,
             commands::provider_commands::get_provider_configs,

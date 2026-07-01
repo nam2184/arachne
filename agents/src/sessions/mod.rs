@@ -9,5 +9,6 @@ pub use compaction::{
 };
 pub use conversation::{
     create_conversation_service, ConversationFile, ConversationMessage, ConversationService,
+    SessionTurnDiff,
 };
 pub use service::SessionService;
