@@ -171,18 +171,33 @@ impl SessionService {
                     SessionRepository::insert(&db, &new_root)?;
                     SessionGroupRepository::replace_session(&db, &session.id, &new_root_id)?;
                     SessionRepository::update_parent(&db, &session.id, Some(&new_root_id))?;
+                    if session
+                        .title
+                        .as_deref()
+                        .unwrap_or_default()
+                        .trim()
+                        .is_empty()
+                    {
+                        SessionRepository::update_title(
+                            &db,
+                            &session.id,
+                            Some(&default_chat_title(1)),
+                        )?;
+                    }
                     (new_root, Some(new_root_id))
                 } else {
                     (session.clone(), None)
                 }
             };
 
-        let chat = AgentSession::child_of(
+        let chat_count = SessionRepository::children_of(&db, &root.id)?.len();
+        let mut chat = AgentSession::child_of(
             &root,
             root.directory.clone(),
             root.provider.clone(),
             root.model.clone(),
         );
+        chat.title = Some(default_chat_title(chat_count + 1));
         let chat_id = chat.id.clone();
         SessionRepository::insert(&db, &chat)?;
 
@@ -312,6 +327,10 @@ impl SessionService {
         }
         Ok(roots)
     }
+}
+
+fn default_chat_title(number: usize) -> String {
+    format!("Chat {number}")
 }
 
 #[cfg(test)]
@@ -543,6 +562,8 @@ mod tests {
             new_chat.parent_session_id.as_deref(),
             Some(created.root_session_id.as_str())
         );
+        assert_eq!(old_root.title.as_deref(), Some("Chat 1"));
+        assert_eq!(new_chat.title.as_deref(), Some("Chat 2"));
 
         let groups = service.get_all_groups().unwrap();
         let group = groups.iter().find(|group| group.id == group_id).unwrap();
@@ -570,6 +591,9 @@ mod tests {
         assert!(chats
             .iter()
             .all(|chat| chat.parent_session_id.as_deref() == Some(first.root_session_id.as_str())));
+        assert_eq!(chats[0].title.as_deref(), Some("Chat 1"));
+        assert_eq!(chats[1].title.as_deref(), Some("Chat 2"));
+        assert_eq!(chats[2].title.as_deref(), Some("Chat 3"));
     }
 
     #[test]

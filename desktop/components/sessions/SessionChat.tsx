@@ -69,10 +69,8 @@ const DIFF_PANE_MIN_WIDTH = 0;
 const DIFF_PANE_USABLE_MIN_WIDTH = 320;
 const DIFF_PANE_MAX_WIDTH = 760;
 const DIFF_PANE_SNAP_THRESHOLD = 72;
-const CONTROL_LABEL_CLASS = "text-[10px] uppercase tracking-[0.18em] text-[var(--text-muted)]";
-const TRANSPARENT_CONTROL_CLASS =
-  "min-w-0 bg-transparent py-1 text-[11px] text-[var(--text-muted)] outline-none transition-colors hover:text-[var(--foreground)] focus:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-40 [&>option]:bg-[var(--surface-raised)] [&>option]:text-[var(--foreground)]";
-const COMPOSER_SELECT_CLASS = "w-[5.75rem]";
+const DOCK_CONTROL_CLASS =
+  "h-7 min-w-0 border-0 bg-transparent px-1 text-[11px] text-[var(--text-muted)] outline-none transition-colors hover:text-[var(--foreground)] focus:text-[var(--foreground)] disabled:cursor-not-allowed disabled:opacity-40 [&>option]:bg-[var(--surface-raised)] [&>option]:text-[var(--foreground)]";
 
 function ContextCheckpoint({ content }: { content: string }) {
   const [open, setOpen] = useState(false);
@@ -184,7 +182,7 @@ export function SessionChat({
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
   const [isCommandRunning, setIsCommandRunning] = useState(false);
-  const [position] = useState(() => initialChatPosition());
+  const [position, setPosition] = useState(() => initialChatPosition());
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [providerDraft, setProviderDraft] = useState(session.provider);
   const [modelDraft, setModelDraft] = useState(session.model);
@@ -214,6 +212,13 @@ export function SessionChat({
     pointerId: number;
     startX: number;
     startWidth: number;
+  } | null>(null);
+  const chatDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
   } | null>(null);
 
   useEffect(() => {
@@ -349,6 +354,33 @@ export function SessionChat({
     }
   };
 
+  const handleChatDragStart = (event: PointerEvent<HTMLDivElement>) => {
+    if (!isFloating || event.button !== 0 || isPopupDragExcluded(event.target)) return;
+    chatDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: position.x,
+      originY: position.y,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handleChatDragMove = (event: PointerEvent<HTMLDivElement>) => {
+    const drag = chatDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    setPosition(clampChatPosition({
+      x: drag.originX + event.clientX - drag.startX,
+      y: drag.originY + event.clientY - drag.startY,
+    }));
+  };
+
+  const handleChatDragEnd = (event: PointerEvent<HTMLDivElement>) => {
+    if (chatDragRef.current?.pointerId === event.pointerId) {
+      chatDragRef.current = null;
+    }
+  };
+
   const saveSessionConfig = async () => {
     const provider = providerDraft.trim();
     const model = modelDraft.trim();
@@ -371,9 +403,16 @@ export function SessionChat({
     }
   };
 
+  const chatTitleIndex = (chatId: string) => {
+    const index = chats.findIndex((chat) => chat.id === chatId);
+    return index >= 0 ? index : 0;
+  };
+
+  const displayChatTitle = (chat: AgentSession) => chatTitle(chat, chatTitleIndex(chat.id));
+
   const startTitleEdit = (chat: AgentSession) => {
     setEditingTitleId(chat.id);
-    setTitleDraft(chat.title?.trim() ?? "");
+    setTitleDraft(displayChatTitle(chat));
     setTitleError(null);
     setOpenChatMenuId(null);
   };
@@ -441,8 +480,11 @@ export function SessionChat({
   const directoryName = rootSession.directory.split(/[\\/]/).filter(Boolean).pop() ?? rootSession.directory;
   const isFloating = variant === "floating";
   const showChatSidebar = isFloating;
-  const showDiffPane = diffs.length > 0;
+  const showDiffPane = !isFloating && diffs.length > 0;
   const isDiffPaneCollapsed = diffPaneWidth === 0;
+  const activeChatIndex = chatTitleIndex(activeChatId);
+  const activeChatTitle = chatTitle(session, activeChatIndex);
+  const isEditingActiveTitle = editingTitleId === session.id;
 
   return (
     <div className={isFloating ? "pointer-events-none fixed inset-0 z-50" : "flex min-h-0 flex-1"}>
@@ -460,6 +502,10 @@ export function SessionChat({
         aria-modal={isFloating ? "false" : undefined}
         aria-label={`${directoryName} chat`}
         style={isFloating ? { left: position.x, top: position.y } : undefined}
+        onPointerDown={isFloating ? handleChatDragStart : undefined}
+        onPointerMove={isFloating ? handleChatDragMove : undefined}
+        onPointerUp={isFloating ? handleChatDragEnd : undefined}
+        onPointerCancel={isFloating ? handleChatDragEnd : undefined}
       >
         {isFloating && onClose && (
           <Button
@@ -505,7 +551,7 @@ export function SessionChat({
                   </div>
                 </div>
                 <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
-                  {chats.map((chat) => {
+                  {chats.map((chat, index) => {
                     const isActive = chat.id === activeChatId;
                     const isEditing = chat.id === editingTitleId;
                     return (
@@ -526,7 +572,7 @@ export function SessionChat({
                                 cancelTitleEdit();
                               }
                             }}
-                            placeholder="Unknown"
+                            placeholder={chatTitle(chat, index)}
                             className="mb-1 h-11 w-full border border-[var(--node-border-hover)] bg-[var(--input-bg)] px-2 text-left text-xs text-[var(--foreground)] outline-none placeholder:text-[var(--text-muted)]"
                           />
                         ) : (
@@ -541,7 +587,7 @@ export function SessionChat({
                                 : "text-[var(--text-muted)] hover:text-[var(--foreground)]",
                             )}
                           >
-                            <span className="w-full truncate text-xs font-medium">{chatTitle(chat)}</span>
+                            <span className="w-full truncate text-xs font-medium">{chatTitle(chat, index)}</span>
                           </button>
                         )}
                         {!isEditing && (
@@ -600,13 +646,47 @@ export function SessionChat({
             </aside>
           )}
           <div className="flex min-w-0 flex-1 flex-col">
+            {!isFloating && (
+              <div className="flex min-h-12 items-center justify-between gap-3 border-b border-[var(--border)] bg-[var(--surface-raised)] px-4">
+                <div className="min-w-0 flex-1">
+                  {isEditingActiveTitle ? (
+                    <input
+                      autoFocus
+                      value={titleDraft}
+                      onChange={(event) => setTitleDraft(event.target.value)}
+                      onFocus={(event) => event.currentTarget.select()}
+                      onBlur={() => void saveTitleEdit(session.id)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          void saveTitleEdit(session.id);
+                        } else if (event.key === "Escape") {
+                          event.preventDefault();
+                          cancelTitleEdit();
+                        }
+                      }}
+                      placeholder={activeChatTitle}
+                      className="h-8 w-full max-w-sm border border-[var(--node-border-hover)] bg-[var(--input-bg)] px-2 text-sm font-medium text-[var(--foreground)] outline-none placeholder:text-[var(--text-muted)]"
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      className="min-w-0 bg-transparent text-left"
+                      onClick={() => startTitleEdit(session)}
+                      title="Rename chat"
+                    >
+                      <span className="block truncate text-sm font-semibold text-[var(--foreground)]">{activeChatTitle}</span>
+                      <span className="block truncate text-[11px] text-[var(--text-muted)]">{directoryName}</span>
+                    </button>
+                  )}
+                </div>
+                {titleError && <span className="shrink-0 text-[11px] text-[#ff5f5f]">{titleError}</span>}
+              </div>
+            )}
             <ScrollArea className="flex-1 px-6 py-4" viewportRef={scrollViewportRef}>
               <div className="space-y-4">
                 {messages.length === 0 ? (
                   <div className="flex h-full items-center justify-center">
-                    <p className="text-sm text-[var(--text-muted)]">
-                      Chat with {directoryName} session. Ask about the codebase or files in this directory.
-                    </p>
                   </div>
                 ) : (
                   messages.map((message, index) => {
@@ -669,9 +749,9 @@ export function SessionChat({
               </div>
             </ScrollArea>
 
-            <div className="border-t border-[var(--border)] px-6 py-4">
+            <div className="bg-[var(--surface-raised)] px-4 py-4">
           {visibleCommandHints.length > 0 && (
-            <div className="mb-2 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1">
+            <div className="mx-auto mb-2 max-w-[820px] overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] p-1">
               {visibleCommandHints.map((hint) => (
                 <button
                   key={hint.name}
@@ -689,24 +769,26 @@ export function SessionChat({
               ))}
             </div>
           )}
-          <div className="rounded-2xl border border-[var(--input-border)] bg-[var(--input-bg)] px-3 py-2 transition-colors focus-within:border-[var(--node-border-hover)]">
-            <textarea
-              ref={inputRef}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="Ask about the codebase..."
-              rows={1}
-              className="box-border max-h-32 min-h-[42px] w-full resize-none whitespace-pre-wrap break-words break-all bg-transparent py-1 font-sans text-[12px] leading-[1.5] text-[var(--foreground)] shadow-none outline-none placeholder:text-[var(--text-muted)] disabled:cursor-not-allowed disabled:opacity-50"
-            />
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <div className="flex min-w-0 flex-wrap items-center gap-x-1 gap-y-1 text-[11px]">
+          <div className="w-full">
+            <div className="relative z-10 overflow-hidden rounded-xl border border-[var(--input-border)] bg-[var(--input-bg)] shadow-[0_1px_0_rgba(255,255,255,0.04),0_18px_42px_rgba(0,0,0,0.28)] transition-colors focus-within:border-[var(--node-border-hover)]">
+              <textarea
+                ref={inputRef}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Ask about the codebase..."
+                rows={1}
+                className="box-border max-h-40 min-h-[76px] w-full resize-none whitespace-pre-wrap break-words break-all bg-transparent px-4 pb-3 pt-4 font-sans text-[13px] leading-[1.55] text-[var(--foreground)] shadow-none outline-none placeholder:text-[var(--text-muted)] disabled:cursor-not-allowed disabled:opacity-50"
+              />
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-3 px-4 pt-2">
+              <div className="flex min-w-0 flex-wrap items-center gap-2 text-[11px]">
                 <label className="flex min-w-0 items-center gap-1">
-                  <span className={CONTROL_LABEL_CLASS}>Mode</span>
+                  <span className="sr-only">Mode</span>
                   <select
                     value={mode}
                     onChange={(event) => setMode(event.target.value as ChatMode)}
-                    className={cn(TRANSPARENT_CONTROL_CLASS, COMPOSER_SELECT_CLASS, "uppercase tracking-[0.12em]")}
+                    className={cn(DOCK_CONTROL_CLASS, "w-[5.5rem] uppercase tracking-[0.12em]")}
                     title={
                       mode === "plan"
                         ? "Read-only: shell, write, edit, apply_patch are blocked"
@@ -718,7 +800,7 @@ export function SessionChat({
                   </select>
                 </label>
                 <label className="flex min-w-0 items-center gap-1">
-                  <span className={CONTROL_LABEL_CLASS}>Provider</span>
+                  <span className="sr-only">Provider</span>
                   {providers.length > 0 ? (
                     <select
                       value={providerDraft}
@@ -730,7 +812,7 @@ export function SessionChat({
                         setConfigStatus(null);
                         setConfigError(null);
                       }}
-                      className={cn(TRANSPARENT_CONTROL_CLASS, COMPOSER_SELECT_CLASS)}
+                      className={cn(DOCK_CONTROL_CLASS, "w-[6.5rem]")}
                     >
                       {providerOptions.map((provider) => (
                         <option key={provider.name} value={provider.name}>
@@ -747,12 +829,12 @@ export function SessionChat({
                         setConfigError(null);
                       }}
                       placeholder="anthropic"
-                      className={cn(TRANSPARENT_CONTROL_CLASS, COMPOSER_SELECT_CLASS, "placeholder:text-[var(--text-muted)]")}
+                      className={cn(DOCK_CONTROL_CLASS, "w-[6.5rem] placeholder:text-[var(--text-muted)]")}
                     />
                   )}
                 </label>
                 <label className="flex min-w-0 items-center gap-1">
-                  <span className={CONTROL_LABEL_CLASS}>Model</span>
+                  <span className="sr-only">Model</span>
                   <select
                     value={modelDraft}
                     onChange={(event) => {
@@ -760,7 +842,7 @@ export function SessionChat({
                       setConfigStatus(null);
                       setConfigError(null);
                     }}
-                    className={cn(TRANSPARENT_CONTROL_CLASS, COMPOSER_SELECT_CLASS)}
+                    className={cn(DOCK_CONTROL_CLASS, "w-[8rem]")}
                     disabled={modelOptions.length === 0}
                   >
                     {modelOptions.length === 0 ? (
@@ -777,7 +859,7 @@ export function SessionChat({
                 <Button
                   variant="ghost"
                   size="sm"
-                  className="h-6 px-1 text-[11px] text-[var(--text-muted)] hover:bg-transparent hover:text-[var(--foreground)] disabled:hidden"
+                  className="h-7 rounded-none border-0 bg-transparent px-1 text-[11px] text-[var(--text-muted)] hover:bg-transparent hover:text-[var(--foreground)] disabled:hidden"
                   onClick={saveSessionConfig}
                   disabled={isConfigSaving || !configChanged}
                 >
@@ -787,7 +869,7 @@ export function SessionChat({
               </div>
               <Button
                 size="sm"
-                className="h-7 shrink-0 rounded-full px-3 text-[11px]"
+                className="h-8 shrink-0 rounded-md px-3 text-[11px] font-semibold"
                 onClick={handleSend}
                 disabled={!input.trim() || isCommandRunning}
               >
@@ -797,13 +879,13 @@ export function SessionChat({
             </div>
           </div>
           {(configStatus || configError) && (
-            <p className={cn("mt-1 text-[11px]", configError ? "text-[#ff5f5f]" : "text-[var(--text-muted)]")}>{configError ?? configStatus}</p>
+            <p className={cn("mt-1 px-4 text-[11px]", configError ? "text-[#ff5f5f]" : "text-[var(--text-muted)]")}>{configError ?? configStatus}</p>
           )}
           {(commandStatus || commandError) && (
-            <p className={cn("mt-1 whitespace-pre-wrap text-[11px]", commandError ? "text-[#ff5f5f]" : "text-[var(--text-muted)]")}>{commandError ?? commandStatus}</p>
+            <p className={cn("mt-1 whitespace-pre-wrap px-4 text-[11px]", commandError ? "text-[#ff5f5f]" : "text-[var(--text-muted)]")}>{commandError ?? commandStatus}</p>
           )}
           {queuedMessageCount > 0 && (
-            <p className="mt-2 text-xs text-[var(--text-muted)]">
+            <p className="mt-2 px-4 text-xs text-[var(--text-muted)]">
               {`${queuedMessageCount} message${queuedMessageCount === 1 ? "" : "s"} queued`}
             </p>
           )}
@@ -812,6 +894,7 @@ export function SessionChat({
           {showDiffPane && (
             <>
               <div
+                data-popup-drag-exclude
                 role="separator"
                 aria-orientation="vertical"
                 aria-label="Resize changes pane"
@@ -836,7 +919,7 @@ export function SessionChat({
   );
 }
 
-function chatTitle(chat: AgentSession) {
+function chatTitle(chat: AgentSession, index: number) {
   const title = chat.title?.trim();
   return title || "Unknown";
 }
@@ -1050,6 +1133,23 @@ function clampChatPosition(position: { x: number; y: number }) {
 function clampDiffPaneWidth(width: number) {
   if (width <= DIFF_PANE_SNAP_THRESHOLD) return DIFF_PANE_MIN_WIDTH;
   return Math.min(Math.max(DIFF_PANE_USABLE_MIN_WIDTH, width), DIFF_PANE_MAX_WIDTH);
+}
+
+function isPopupDragExcluded(target: EventTarget) {
+  if (!(target instanceof HTMLElement)) return false;
+  return target.closest(
+    [
+      "button",
+      "input",
+      "textarea",
+      "select",
+      "a",
+      "[role='button']",
+      "[role='menu']",
+      "[data-radix-scroll-area-viewport]",
+      "[data-popup-drag-exclude]",
+    ].join(","),
+  ) !== null;
 }
 
 function formatError(error: unknown) {

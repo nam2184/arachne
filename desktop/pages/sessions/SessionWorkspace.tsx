@@ -692,7 +692,7 @@ function formatError(error: unknown) {
 
 function chatDisplayTitle(session: AgentSession) {
   const title = session.title?.trim();
-  return title || "Unknown";
+  return title || "Chat";
 }
 
 function promptQueueKey(content: string, mode: "plan" | "build") {
