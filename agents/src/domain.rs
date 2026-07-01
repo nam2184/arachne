@@ -241,6 +241,8 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     pub protocol: ProviderProtocol,
     pub enabled: bool,
+    #[serde(skip)]
+    pub auth_field_type: ProviderAuthFieldType,
 }
 
 impl ProviderConfig {
@@ -252,6 +254,65 @@ impl ProviderConfig {
             base_url: None,
             protocol,
             enabled: true,
+            auth_field_type: ProviderAuthFieldType::ApiKey,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ProviderAuthFieldType {
+    #[serde(rename = "API_KEY")]
+    ApiKey,
+    #[serde(rename = "OAUTH")]
+    OAuth,
+}
+
+impl Default for ProviderAuthFieldType {
+    fn default() -> Self {
+        Self::ApiKey
+    }
+}
+
+impl ProviderAuthFieldType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ApiKey => "API_KEY",
+            Self::OAuth => "OAUTH",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Self {
+        match name.to_ascii_uppercase().as_str() {
+            "OAUTH" => Self::OAuth,
+            _ => Self::ApiKey,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderAuthState {
+    pub provider_name: String,
+    pub field_type: ProviderAuthFieldType,
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub api_key: Option<String>,
+}
+
+impl ProviderAuthState {
+    pub fn new(provider_name: String) -> Self {
+        Self {
+            provider_name,
+            field_type: ProviderAuthFieldType::ApiKey,
+            access_token: None,
+            refresh_token: None,
+            api_key: None,
+        }
+    }
+
+    pub fn selected_token(&self) -> Option<String> {
+        match self.field_type {
+            ProviderAuthFieldType::ApiKey => self.api_key.clone(),
+            ProviderAuthFieldType::OAuth => self.access_token.clone(),
         }
     }
 }

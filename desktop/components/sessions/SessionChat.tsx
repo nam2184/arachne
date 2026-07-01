@@ -921,7 +921,7 @@ export function SessionChat({
 
 function chatTitle(chat: AgentSession, index: number) {
   const title = chat.title?.trim();
-  return title || "Unknown";
+  return title || `Chat ${index + 1}`;
 }
 
 function AssistantMessageParts({

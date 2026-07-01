@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use aisdk::core::capabilities::{TextInputSupport, ToolCallSupport};
@@ -22,8 +24,10 @@ where
     M: LanguageModel + TextInputSupport + ToolCallSupport,
 {
     provider_name: String,
+    sdk_provider_name: String,
     api_key_env: Option<String>,
     api_key: Option<String>,
+    api_key_source: &'static str,
     base_url: Option<String>,
     supported_models: Vec<String>,
     sdk_model_name: String,
@@ -37,8 +41,10 @@ where
 {
     pub fn new(
         provider_name: impl Into<String>,
+        sdk_provider_name: impl Into<String>,
         api_key_env: Option<&str>,
         api_key: Option<String>,
+        api_key_source: &'static str,
         base_url: Option<String>,
         model: impl Into<String>,
         model_builder: impl Fn(&str) -> Result<M, LlmError> + Send + Sync + 'static,
@@ -56,8 +62,10 @@ where
 
         Self {
             provider_name,
+            sdk_provider_name: sdk_provider_name.into(),
             api_key_env,
             api_key,
+            api_key_source,
             base_url,
             supported_models: vec![sdk_model_name.clone()],
             sdk_model_name,
@@ -103,10 +111,16 @@ where
 
     async fn stream(&self, request: LlmRequest) -> Result<LlmStream, LlmError> {
         self.api_key.as_ref().ok_or_else(|| self.auth_error())?;
-
         let model = self.model_for_request(&request.model)?;
         let system = sdk_system_prompt(&request);
         let messages = sdk_messages(&request);
+        log_aisdk_request_shape(
+            &self.provider_name,
+            &self.sdk_provider_name,
+            &request,
+            &system,
+            &messages,
+        );
         let mut builder = if system.is_empty() {
             LanguageModelRequest::<M>::builder()
                 .model(model)
@@ -142,6 +156,19 @@ where
         }
 
         let mut sdk_request = builder.build();
+        let credential = self.api_key.as_deref().map(credential_debug);
+        tracing::debug!(
+            provider = %self.provider_name,
+            sdk_provider = %self.sdk_provider_name,
+            model = %request.model,
+            backend = "aisdk",
+            api_key_source = self.api_key_source,
+            has_api_key = self.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()),
+            access_token_preview = credential.as_ref().map(|token| token.preview.as_str()).unwrap_or("none"),
+            access_token_sha256 = credential.as_ref().map(|token| token.sha256.as_str()).unwrap_or("none"),
+            access_token_len = credential.as_ref().map(|token| token.len).unwrap_or(0),
+            "native AISDK provider request starting stream_text"
+        );
         let response = sdk_request.stream_text().await.map_err(|error| {
             LlmError::new("sdk_request", &error.to_string())
                 .provider(&self.provider_name)
@@ -284,19 +311,51 @@ where
     }
 }
 
+struct CredentialDebug {
+    preview: String,
+    sha256: String,
+    len: usize,
+}
+
+fn credential_debug(value: &str) -> CredentialDebug {
+    let prefix: String = value.chars().take(8).collect();
+    let suffix_chars = value.chars().rev().take(4).collect::<Vec<_>>();
+    let suffix = suffix_chars.into_iter().rev().collect::<String>();
+    CredentialDebug {
+        preview: format!("{prefix}...{suffix}"),
+        sha256: format!("{:x}", Sha256::digest(value.as_bytes())),
+        len: value.len(),
+    }
+}
+
 macro_rules! sdk_provider_case {
     ($name:expr, $ty:ty, $provider_name:expr, $api_key_env:expr, $api_key:expr, $base_url:expr, $model:expr) => {{
         let provider_name = $provider_name.to_string();
         let api_key_env = $api_key_env;
-        let resolved_api_key = $api_key.or_else(|| std::env::var(api_key_env).ok());
+        let config_api_key = $api_key;
+        let env_api_key = std::env::var(api_key_env).ok();
+        let api_key_source = match config_api_key.as_deref() {
+            Some(key) if !key.trim().is_empty() => "config",
+            Some(_) => "config-empty",
+            None if env_api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty()) =>
+            {
+                "env"
+            }
+            None => "none",
+        };
+        let resolved_api_key = config_api_key.or(env_api_key);
         let base_url = $base_url;
         let builder_provider = provider_name.clone();
         let builder_key = resolved_api_key.clone();
         let builder_base_url = base_url.clone();
         let provider = AisdkLanguageModelProvider::<$ty>::new(
             provider_name,
+            $name,
             Some(api_key_env),
             resolved_api_key,
+            api_key_source,
             base_url,
             $model,
             move |model| {
@@ -640,12 +699,23 @@ fn sdk_messages(request: &LlmRequest) -> Vec<Message> {
             }
         }
     }
-    messages
+    sanitize_sdk_messages(messages)
 }
 
 fn sdk_assistant_messages(content: &[ContentPart]) -> Vec<Message> {
     let mut messages = Vec::new();
     let mut text_parts = Vec::new();
+    let mut pending_tool_calls: Vec<ToolCallInfo> = Vec::new();
+
+    let flush_pending_tool_calls =
+        |messages: &mut Vec<Message>, pending: &mut Vec<ToolCallInfo>| {
+            messages.extend(pending.drain(..).map(|tool_call| {
+                Message::Assistant(AssistantMessage::new(
+                    LanguageModelResponseContentType::ToolCall(tool_call),
+                    None,
+                ))
+            }));
+        };
 
     for part in content {
         match part {
@@ -653,12 +723,21 @@ fn sdk_assistant_messages(content: &[ContentPart]) -> Vec<Message> {
                 let mut tool_call = ToolCallInfo::new(name.clone());
                 tool_call.id(id.clone());
                 tool_call.input(input.clone());
-                messages.push(Message::Assistant(AssistantMessage::new(
-                    LanguageModelResponseContentType::ToolCall(tool_call),
-                    None,
-                )));
+                pending_tool_calls.push(tool_call);
             }
             ContentPart::ToolResult { id, name, result } => {
+                if let Some(index) = pending_tool_calls
+                    .iter()
+                    .position(|call| call.tool.id == *id)
+                {
+                    let tool_call = pending_tool_calls.remove(index);
+                    messages.push(Message::Assistant(AssistantMessage::new(
+                        LanguageModelResponseContentType::ToolCall(tool_call),
+                        None,
+                    )));
+                } else {
+                    flush_pending_tool_calls(&mut messages, &mut pending_tool_calls);
+                }
                 messages.push(Message::Tool(sdk_tool_result_info(id, name, result)));
             }
             ContentPart::Reasoning { .. } => {}
@@ -671,6 +750,8 @@ fn sdk_assistant_messages(content: &[ContentPart]) -> Vec<Message> {
             }
         }
     }
+
+    flush_pending_tool_calls(&mut messages, &mut pending_tool_calls);
 
     if !text_parts.is_empty() {
         messages.insert(
@@ -694,11 +775,211 @@ fn sdk_tool_result_messages(content: &[ContentPart]) -> Vec<Message> {
         .collect()
 }
 
+fn sanitize_sdk_messages(messages: Vec<Message>) -> Vec<Message> {
+    let mut pending_tool_call_ids = HashSet::new();
+    let mut sanitized = Vec::with_capacity(messages.len());
+    let mut orphan_tool_results = 0_usize;
+
+    for message in messages {
+        match &message {
+            Message::Assistant(assistant) => {
+                if let LanguageModelResponseContentType::ToolCall(call) = &assistant.content {
+                    pending_tool_call_ids.insert(call.tool.id.clone());
+                }
+                sanitized.push(message);
+            }
+            Message::Tool(result) => {
+                if pending_tool_call_ids.remove(&result.tool.id) {
+                    sanitized.push(message);
+                } else {
+                    orphan_tool_results += 1;
+                    tracing::warn!(
+                        tool_call_id = %result.tool.id,
+                        tool = %result.tool.name,
+                        "lowering orphan SDK tool result as user text to avoid invalid Responses input"
+                    );
+                    sanitized.push(Message::User(UserMessage::new(orphan_tool_result_text(
+                        result,
+                    ))));
+                }
+            }
+            _ => sanitized.push(message),
+        }
+    }
+
+    if orphan_tool_results > 0 {
+        tracing::warn!(
+            orphan_tool_results,
+            message_count = sanitized.len(),
+            "sanitized SDK message history before provider request"
+        );
+    }
+
+    sanitized
+}
+
+fn orphan_tool_result_text(result: &ToolResultInfo) -> String {
+    let value = result
+        .output
+        .clone()
+        .unwrap_or_else(|error| serde_json::Value::String(error.to_string()));
+    format!(
+        "<tool_result tool_call_id=\"{}\" name=\"{}\">\n{}\n</tool_result>",
+        result.tool.id,
+        result.tool.name,
+        serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
+    )
+}
+
+fn log_aisdk_request_shape(
+    provider_name: &str,
+    sdk_provider_name: &str,
+    request: &LlmRequest,
+    system: &str,
+    messages: &[Message],
+) {
+    let message_shape = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| sdk_message_shape(index, message))
+        .collect::<Vec<_>>();
+    let tool_shape = request
+        .tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "name": tool.name.as_str(),
+                "description_bytes": tool.description.len(),
+                "parameters_type": json_type_name(&tool.parameters),
+                "parameters_bytes": json_bytes(&tool.parameters),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    tracing::debug!(
+        provider = %provider_name,
+        sdk_provider = %sdk_provider_name,
+        model = %request.model,
+        backend = "aisdk",
+        session_id = request.session_id.as_deref().unwrap_or(""),
+        system_bytes = system.len(),
+        system_preview = %preview(system, 512),
+        request_message_count = request.messages.len(),
+        sdk_message_count = messages.len(),
+        tool_count = request.tools.len(),
+        has_temperature = request.temperature.is_some(),
+        has_top_p = request.top_p.is_some(),
+        max_tokens = request.max_tokens.unwrap_or(0),
+        stop_count = request.stop.as_ref().map(Vec::len).unwrap_or(0),
+        sdk_message_shape = %json_string(&message_shape),
+        tool_shape = %json_string(&tool_shape),
+        "native AISDK provider lowered request shape"
+    );
+}
+
+fn sdk_message_shape(index: usize, message: &Message) -> serde_json::Value {
+    match message {
+        Message::System(system) => serde_json::json!({
+            "index": index,
+            "role": "system",
+            "content_bytes": system.content.len(),
+            "content_preview": preview(&system.content, 180),
+        }),
+        Message::User(user) => serde_json::json!({
+            "index": index,
+            "role": "user",
+            "content_bytes": user.content.len(),
+            "content_preview": preview(&user.content, 180),
+        }),
+        Message::Assistant(assistant) => match &assistant.content {
+            LanguageModelResponseContentType::Text(text) => serde_json::json!({
+                "index": index,
+                "role": "assistant",
+                "content_type": "text",
+                "content_bytes": text.len(),
+                "content_preview": preview(text, 180),
+            }),
+            LanguageModelResponseContentType::ToolCall(call) => serde_json::json!({
+                "index": index,
+                "role": "assistant",
+                "content_type": "tool_call",
+                "tool_call_id": call.tool.id.as_str(),
+                "tool": call.tool.name.as_str(),
+                "input_type": json_type_name(&call.input),
+                "input_bytes": json_bytes(&call.input),
+                "input_preview": preview(&json_string(&call.input), 180),
+            }),
+            LanguageModelResponseContentType::Reasoning { content, .. } => serde_json::json!({
+                "index": index,
+                "role": "assistant",
+                "content_type": "reasoning",
+                "content_bytes": content.len(),
+                "content_preview": preview(content, 180),
+            }),
+            LanguageModelResponseContentType::NotSupported(content) => serde_json::json!({
+                "index": index,
+                "role": "assistant",
+                "content_type": "not_supported",
+                "content_bytes": content.len(),
+                "content_preview": preview(content, 180),
+            }),
+        },
+        Message::Tool(result) => {
+            let output = result
+                .output
+                .as_ref()
+                .map(json_string)
+                .unwrap_or_else(|error| error.to_string());
+            serde_json::json!({
+                "index": index,
+                "role": "tool",
+                "tool_call_id": result.tool.id.as_str(),
+                "tool": result.tool.name.as_str(),
+                "output_ok": result.output.is_ok(),
+                "output_bytes": output.len(),
+                "output_preview": preview(&output, 180),
+            })
+        }
+        Message::Developer(content) => serde_json::json!({
+            "index": index,
+            "role": "developer",
+            "content_bytes": content.len(),
+            "content_preview": preview(content, 180),
+        }),
+    }
+}
+
+fn preview(value: &str, max_chars: usize) -> String {
+    let mut preview = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn json_string(value: &impl serde::Serialize) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "<json serialization failed>".to_string())
+}
+
+fn json_bytes(value: &impl serde::Serialize) -> usize {
+    json_string(value).len()
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 fn sdk_tool_result_info(id: &str, name: &str, result: &serde_json::Value) -> ToolResultInfo {
     let mut tool_result = ToolResultInfo::new(name.to_string());
     tool_result.id(id.to_string());
-    let result_text = serde_json::to_string(result).unwrap_or_else(|_| "null".to_string());
-    tool_result.output(serde_json::Value::String(result_text));
+    tool_result.output(result.clone());
     tool_result
 }
 
@@ -807,7 +1088,8 @@ fn percent_u32(value: f32) -> u32 {
 mod tests {
     use super::*;
     use crate::llm::providers::provider_from_config;
-    use crate::{ProviderConfig, ProviderProtocol};
+    use crate::llm::request::LlmMessage;
+    use crate::{ProviderAuthFieldType, ProviderConfig, ProviderProtocol};
     use futures_util::StreamExt;
 
     #[test]
@@ -820,6 +1102,7 @@ mod tests {
                 base_url: None,
                 protocol: ProviderProtocol::OpenAI,
                 enabled: true,
+                auth_field_type: ProviderAuthFieldType::ApiKey,
             };
             assert!(
                 provider_from_config(&config).is_some(),
@@ -904,6 +1187,7 @@ mod tests {
                 base_url,
                 protocol: ProviderProtocol::OpenAI,
                 enabled: true,
+                auth_field_type: ProviderAuthFieldType::ApiKey,
             };
             let provider = provider_from_config(&config).expect("provider factory");
             let request = LlmRequest::new(&model, provider_name)
@@ -925,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn sdk_tool_result_message_stringifies_result_for_wire() {
+    fn sdk_tool_result_message_preserves_json_value_for_wire() {
         let content = vec![ContentPart::tool_result(
             "call_1",
             "read",
@@ -939,9 +1223,38 @@ mod tests {
             panic!("expected Message::Tool, got {:?}", messages[0]);
         };
         let output = tool_result.output.as_ref().expect("output should be Ok");
-        let output_string = output
-            .as_str()
-            .expect("output should be Value::String, not nested Object");
-        assert_eq!(output_string, "{\"text\":\"hello world\"}");
+        assert_eq!(output, &serde_json::json!({"text": "hello world"}));
+    }
+
+    #[test]
+    fn sdk_assistant_messages_keep_tool_results_after_matching_calls() {
+        let messages = sdk_assistant_messages(&[
+            ContentPart::tool_call("call_1", "read", serde_json::json!({"path": "README.md"})),
+            ContentPart::tool_result("call_1", "read", serde_json::json!({"text": "hello"})),
+        ]);
+
+        assert!(matches!(messages[0], Message::Assistant(_)));
+        let Message::Tool(tool_result) = &messages[1] else {
+            panic!("expected Message::Tool, got {:?}", messages[1]);
+        };
+        assert_eq!(tool_result.tool.id, "call_1");
+    }
+
+    #[test]
+    fn sdk_messages_downgrade_orphan_tool_results_to_user_text() {
+        let request = LlmRequest::new("gpt-5.5", "openai").with_message(LlmMessage::tool(
+            "orphan_1",
+            "read",
+            serde_json::json!({"text": "hello"}),
+        ));
+
+        let messages = sdk_messages(&request);
+
+        assert_eq!(messages.len(), 1);
+        let Message::User(user) = &messages[0] else {
+            panic!("expected orphan tool result to become user text, got {messages:?}");
+        };
+        assert!(user.content.contains("tool_result"));
+        assert!(user.content.contains("orphan_1"));
     }
 }

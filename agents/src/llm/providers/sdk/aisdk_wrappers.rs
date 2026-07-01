@@ -6,7 +6,10 @@ use aisdk::core::DynamicModel;
 use super::aisdk_provider::AisdkLanguageModelProvider;
 use super::{LlmError, LlmProvider, LlmStream};
 use crate::llm::request::LlmRequest;
-use crate::ProviderConfig;
+use crate::{ProviderAuthFieldType, ProviderConfig};
+
+const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const OPENAI_CODEX_RESPONSES_PATH: &str = "/responses";
 
 macro_rules! define_aisdk_provider {
     ($struct_name:ident, $sdk_ty:ty, $provider_slug:literal, $api_key_env:literal) => {
@@ -37,7 +40,39 @@ macro_rules! define_aisdk_provider {
                 base_url: Option<String>,
                 model: String,
             ) -> Self {
-                let resolved_api_key = api_key.or_else(|| std::env::var(Self::API_KEY_ENV).ok());
+                let env_api_key = std::env::var(Self::API_KEY_ENV).ok();
+                let api_key_source = match api_key.as_deref() {
+                    Some(key) if !key.trim().is_empty() => "config",
+                    Some(_) => "config-empty",
+                    None if env_api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) => "env",
+                    None => "none",
+                };
+                let resolved_api_key = api_key.or(env_api_key);
+                let has_api_key = resolved_api_key.as_deref().is_some_and(|key| !key.trim().is_empty());
+                let has_base_url = base_url.as_deref().is_some_and(|url| !url.trim().is_empty());
+                if has_api_key {
+                    tracing::debug!(
+                        provider = %provider_name,
+                        sdk_provider = Self::PROVIDER,
+                        api_key_env = Self::API_KEY_ENV,
+                        api_key_source,
+                        has_api_key,
+                        has_base_url,
+                        model = %model,
+                        "selected native AISDK provider auth config"
+                    );
+                } else {
+                    tracing::trace!(
+                        provider = %provider_name,
+                        sdk_provider = Self::PROVIDER,
+                        api_key_env = Self::API_KEY_ENV,
+                        api_key_source,
+                        has_api_key,
+                        has_base_url,
+                        model = %model,
+                        "selected native AISDK provider auth config"
+                    );
+                }
                 let builder_provider = provider_name.to_string();
                 let builder_key = resolved_api_key.clone();
                 let builder_base_url = base_url.clone();
@@ -45,8 +80,10 @@ macro_rules! define_aisdk_provider {
                 Self {
                     inner: AisdkLanguageModelProvider::<$sdk_ty>::new(
                         provider_name,
+                        Self::PROVIDER,
                         Some(Self::API_KEY_ENV),
                         resolved_api_key,
+                        api_key_source,
                         base_url,
                         model,
                         move |model| {
@@ -374,12 +411,145 @@ define_aisdk_provider!(
     "ollama-cloud",
     "OLLAMA_API_KEY"
 );
-define_aisdk_provider!(
-    OpenAiAisdkProvider,
-    aisdk::providers::OpenAI<DynamicModel>,
-    "openai",
-    "OPENAI_API_KEY"
-);
+
+pub struct OpenAiAisdkProvider {
+    inner: AisdkLanguageModelProvider<aisdk::providers::OpenAI<DynamicModel>>,
+}
+
+impl OpenAiAisdkProvider {
+    pub const PROVIDER: &'static str = "openai";
+    pub const API_KEY_ENV: &'static str = "OPENAI_API_KEY";
+
+    pub fn from_config(config: &ProviderConfig) -> Self {
+        Self::with_provider_name(
+            &config.name,
+            config.api_key.clone(),
+            config.base_url.clone(),
+            config.model.clone(),
+            config.auth_field_type == ProviderAuthFieldType::OAuth,
+        )
+    }
+
+    pub fn with_provider_name(
+        provider_name: &str,
+        api_key: Option<String>,
+        base_url: Option<String>,
+        model: String,
+        use_codex_oauth_endpoint: bool,
+    ) -> Self {
+        let env_api_key = std::env::var(Self::API_KEY_ENV).ok();
+        let api_key_source = match api_key.as_deref() {
+            Some(key) if !key.trim().is_empty() => "config",
+            Some(_) => "config-empty",
+            None if env_api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty()) =>
+            {
+                "env"
+            }
+            None => "none",
+        };
+        let resolved_api_key = api_key.or(env_api_key);
+        let effective_base_url = if use_codex_oauth_endpoint {
+            Some(OPENAI_CODEX_BASE_URL.to_string())
+        } else {
+            base_url
+        };
+        let effective_path = use_codex_oauth_endpoint.then_some(OPENAI_CODEX_RESPONSES_PATH);
+        let has_api_key = resolved_api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty());
+        let has_base_url = effective_base_url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty());
+        if has_api_key {
+            tracing::debug!(
+                provider = %provider_name,
+                sdk_provider = Self::PROVIDER,
+                api_key_env = Self::API_KEY_ENV,
+                api_key_source,
+                has_api_key,
+                has_base_url,
+                openai_oauth_codex_endpoint = use_codex_oauth_endpoint,
+                model = %model,
+                "selected native AISDK provider auth config"
+            );
+        } else {
+            tracing::trace!(
+                provider = %provider_name,
+                sdk_provider = Self::PROVIDER,
+                api_key_env = Self::API_KEY_ENV,
+                api_key_source,
+                has_api_key,
+                has_base_url,
+                openai_oauth_codex_endpoint = use_codex_oauth_endpoint,
+                model = %model,
+                "selected native AISDK provider auth config"
+            );
+        }
+
+        let builder_provider = provider_name.to_string();
+        let builder_key = resolved_api_key.clone();
+        let builder_base_url = effective_base_url.clone();
+
+        Self {
+            inner: AisdkLanguageModelProvider::<aisdk::providers::OpenAI<DynamicModel>>::new(
+                provider_name,
+                Self::PROVIDER,
+                Some(Self::API_KEY_ENV),
+                resolved_api_key,
+                api_key_source,
+                effective_base_url,
+                model,
+                move |model| {
+                    let mut builder = aisdk::providers::OpenAI::<DynamicModel>::builder()
+                        .provider_name(builder_provider.clone())
+                        .model_name(model.to_string());
+                    if let Some(api_key) = builder_key.as_deref() {
+                        builder = builder.api_key(api_key.to_string());
+                    }
+                    if let Some(base_url) = builder_base_url.as_deref() {
+                        builder = builder.base_url(base_url.to_string());
+                    }
+                    if let Some(path) = effective_path {
+                        builder = builder.path(path.to_string());
+                    }
+                    builder.build().map_err(|error| {
+                        LlmError::new("sdk_config", &error.to_string()).provider(&builder_provider)
+                    })
+                },
+            ),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAiAisdkProvider {
+    fn provider_name(&self) -> &str {
+        self.inner.provider_name()
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        self.inner.supported_models()
+    }
+
+    fn backend_name(&self) -> &str {
+        self.inner.backend_name()
+    }
+
+    async fn stream(&self, request: LlmRequest) -> Result<LlmStream, LlmError> {
+        self.inner.stream(request).await
+    }
+
+    fn model_base_url(&self) -> Option<&str> {
+        self.inner.model_base_url()
+    }
+
+    fn api_key(&self) -> Option<&str> {
+        self.inner.api_key()
+    }
+}
+
 define_aisdk_provider!(
     OpenAiCompatibleAisdkProvider,
     aisdk::providers::OpenAICompatible<DynamicModel>,

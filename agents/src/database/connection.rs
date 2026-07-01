@@ -76,6 +76,14 @@ impl Database {
                 enabled INTEGER NOT NULL DEFAULT 1
             );
 
+            CREATE TABLE IF NOT EXISTS provider_auth_states (
+                provider_name TEXT PRIMARY KEY,
+                field_type TEXT NOT NULL DEFAULT 'API_KEY',
+                access_token TEXT,
+                refresh_token TEXT,
+                api_key TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 id TEXT PRIMARY KEY,
                 applied_at TEXT NOT NULL
@@ -120,6 +128,22 @@ impl Database {
         );
         let _ = self.conn.execute(
             "UPDATE provider_configs SET protocol = 'openai' WHERE lower(name) IN ('openai', 'minimax')",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE provider_auth_states ADD COLUMN access_token TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE provider_auth_states ADD COLUMN refresh_token TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE provider_auth_states ADD COLUMN api_key TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE provider_auth_states ADD COLUMN field_type TEXT NOT NULL DEFAULT 'API_KEY'",
             [],
         );
 

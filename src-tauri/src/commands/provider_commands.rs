@@ -1,4 +1,6 @@
-use arachne_agents::{ProviderConfig, ProviderService};
+use arachne_agents::{
+    ProviderAuthState, ProviderConfig, ProviderOAuthAuthorization, ProviderService,
+};
 use std::sync::Arc;
 use tauri::State;
 
@@ -15,6 +17,45 @@ pub async fn get_provider_config(
     provider_service: State<'_, Arc<ProviderService>>,
 ) -> Result<Option<ProviderConfig>, String> {
     Ok(provider_service.get_config(&name))
+}
+
+#[tauri::command]
+pub async fn get_provider_auth_states(
+    provider_service: State<'_, Arc<ProviderService>>,
+) -> Result<Vec<ProviderAuthState>, String> {
+    provider_service.get_auth_states()
+}
+
+#[tauri::command]
+pub async fn get_provider_auth_state(
+    provider_name: String,
+    provider_service: State<'_, Arc<ProviderService>>,
+) -> Result<ProviderAuthState, String> {
+    provider_service.get_auth_state(&provider_name)
+}
+
+#[tauri::command]
+pub async fn upsert_provider_auth_state(
+    auth: ProviderAuthState,
+    provider_service: State<'_, Arc<ProviderService>>,
+) -> Result<(), String> {
+    provider_service.upsert_auth_state(auth)
+}
+
+#[tauri::command]
+pub async fn start_provider_oauth(
+    provider_name: String,
+    provider_service: State<'_, Arc<ProviderService>>,
+) -> Result<ProviderOAuthAuthorization, String> {
+    provider_service.start_oauth(&provider_name).await
+}
+
+#[tauri::command]
+pub async fn complete_provider_oauth(
+    provider_name: String,
+    provider_service: State<'_, Arc<ProviderService>>,
+) -> Result<ProviderAuthState, String> {
+    provider_service.complete_oauth(&provider_name).await
 }
 
 #[tauri::command]

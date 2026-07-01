@@ -12,7 +12,7 @@ use tokio_stream::StreamExt;
 
 use crate::domain::ToolCall;
 
-use crate::llm::events::{FinishReason, LlmEvent, ToolResultValue};
+use crate::llm::events::{FinishReason, LlmEvent, ToolDefinition, ToolResultValue};
 
 use crate::llm::providers::{LlmProvider, ToolDispatcherFn};
 
@@ -1272,6 +1272,18 @@ impl SessionRunner {
         // the log when the conversation is long.
 
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        log_session_request_shape(
+            session_id,
+            step,
+            &session.provider,
+            &session.model,
+            &history,
+            &conversation,
+            &messages,
+            &system_prompt,
+            &tools,
+        );
 
         tracing::info!(
 
@@ -2558,6 +2570,159 @@ fn history_to_llm_messages(history: &[ConversationMessage]) -> Vec<LlmMessage> {
             _ => LlmMessage::user(&msg.content),
         })
         .collect()
+}
+
+fn log_session_request_shape(
+    session_id: &str,
+    step: u32,
+    provider: &str,
+    model: &str,
+    raw_history: &[ConversationMessage],
+    conversation: &ConversationFile,
+    messages: &[LlmMessage],
+    system_prompt: &str,
+    tools: &[ToolDefinition],
+) {
+    let raw_history_shape = raw_history
+        .iter()
+        .enumerate()
+        .map(|(index, message)| raw_conversation_message_shape(index, message))
+        .collect::<Vec<_>>();
+    let recent_tail_shape = conversation
+        .recent_messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| raw_conversation_message_shape(index, message))
+        .collect::<Vec<_>>();
+    let assembled_message_shape = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| llm_message_shape(index, message))
+        .collect::<Vec<_>>();
+    let tool_shape = tools
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "name": tool.name.as_str(),
+                "description_bytes": tool.description.len(),
+                "parameters_type": json_type_name(&tool.parameters),
+                "parameters_bytes": json_bytes(&tool.parameters),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    tracing::debug!(
+        session_id = %session_id,
+        step,
+        provider = %provider,
+        model = %model,
+        raw_history_messages = raw_history.len(),
+        assembled_messages = messages.len(),
+        recent_tail_messages = conversation.recent_messages.len(),
+        has_compaction_summary = conversation.summary.as_deref().is_some_and(|summary| !summary.trim().is_empty()),
+        compaction_summary_bytes = conversation.summary.as_deref().map(str::len).unwrap_or(0),
+        system_prompt_bytes = system_prompt.len(),
+        system_prompt_preview = %preview(system_prompt, 512),
+        tool_count = tools.len(),
+        raw_history_shape = %json_string(&raw_history_shape),
+        recent_tail_shape = %json_string(&recent_tail_shape),
+        assembled_message_shape = %json_string(&assembled_message_shape),
+        tool_shape = %json_string(&tool_shape),
+        "llm session history and request shape"
+    );
+}
+
+fn raw_conversation_message_shape(
+    index: usize,
+    message: &ConversationMessage,
+) -> serde_json::Value {
+    let parsed_parts = serde_json::from_str::<Vec<ContentPart>>(&message.content).ok();
+    serde_json::json!({
+        "index": index,
+        "id": message.id.as_str(),
+        "role": message.role.as_str(),
+        "content_bytes": message.content.len(),
+        "content_preview": preview(&message.content, 180),
+        "parsed_parts": parsed_parts.as_ref().map(Vec::len).unwrap_or(0),
+        "parts": parsed_parts
+            .as_deref()
+            .map(content_parts_shape)
+            .unwrap_or_default(),
+    })
+}
+
+fn llm_message_shape(index: usize, message: &LlmMessage) -> serde_json::Value {
+    serde_json::json!({
+        "index": index,
+        "role": message.role.as_str(),
+        "parts": content_parts_shape(&message.content),
+    })
+}
+
+fn content_parts_shape(parts: &[ContentPart]) -> Vec<serde_json::Value> {
+    parts
+        .iter()
+        .enumerate()
+        .map(|(index, part)| match part {
+            ContentPart::Text { text } => serde_json::json!({
+                "index": index,
+                "type": "text",
+                "bytes": text.len(),
+                "preview": preview(text, 180),
+            }),
+            ContentPart::ToolCall { id, name, input } => serde_json::json!({
+                "index": index,
+                "type": "tool_call",
+                "id": id,
+                "name": name,
+                "input_type": json_type_name(input),
+                "input_bytes": json_bytes(input),
+                "input_preview": preview(&json_string(input), 180),
+            }),
+            ContentPart::ToolResult { id, name, result } => serde_json::json!({
+                "index": index,
+                "type": "tool_result",
+                "id": id,
+                "name": name,
+                "result_type": json_type_name(result),
+                "result_bytes": json_bytes(result),
+                "result_preview": preview(&json_string(result), 180),
+            }),
+            ContentPart::Reasoning { text } => serde_json::json!({
+                "index": index,
+                "type": "reasoning",
+                "bytes": text.len(),
+                "preview": preview(text, 180),
+            }),
+        })
+        .collect()
+}
+
+fn preview(value: &str, max_chars: usize) -> String {
+    let mut preview = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn json_string(value: &impl serde::Serialize) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "<json serialization failed>".to_string())
+}
+
+fn json_bytes(value: &impl serde::Serialize) -> usize {
+    json_string(value).len()
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 fn system_prompt_for_session(provider: &str, session_directory: &str, _extra: &[String]) -> String {
