@@ -21,13 +21,13 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use crate::database::{Database, ProjectRepository, SessionRepository};
+use crate::database::{Database, ProjectRepository, SessionGroupRepository, SessionRepository};
 use crate::llm::session::SessionRunner;
 use crate::llm::{ChildCompletion, ChildKind, ProviderRegistry};
 use crate::permission_v2::{default_ruleset, PermissionService};
 use crate::sandbox::SandboxPolicy;
 use crate::tools::{string_arg, SandboxedContext, ToolRuntime};
-use crate::{AgentSession, ConversationService, Project, SessionService};
+use crate::{AgentSession, ConversationService, Project, SessionGroup, SessionService};
 
 use super::{failure, not_implemented, success, ToolCall, ToolResult};
 
@@ -268,18 +268,14 @@ fn prepare_ephemeral_child_runtime(
     let db_path = db_dir.path().join("task.sqlite");
     let db = Database::new(db_path.clone()).map_err(|e| e.to_string())?;
     db.init()?;
-    ProjectRepository::insert(
-        &db,
-        &Project {
-            id: parent.project_id.clone(),
-            path: parent.directory.clone(),
-            name: parent.project_id.clone(),
-            tech_stack: vec![],
-            created_at: Utc::now(),
-        },
-    )?;
-    let mut child = AgentSession::new(
-        parent.project_id.clone(),
+    let root = runtime
+        .session_service
+        .root_session(&parent.id)
+        .unwrap_or_else(|_| parent.clone());
+    seed_child_routing_context(&db, &root, runtime)?;
+
+    let mut child = AgentSession::child_of(
+        &root,
         parent.directory.clone(),
         parent.provider.clone(),
         parent.model.clone(),
@@ -306,6 +302,55 @@ fn prepare_ephemeral_child_runtime(
         _db_dir: db_dir,
         _conversation_dir: conversation_dir,
     })
+}
+
+fn seed_child_routing_context(
+    db: &Database,
+    root: &AgentSession,
+    runtime: &ToolRuntime,
+) -> Result<(), String> {
+    insert_project_for_session(db, root)?;
+    SessionRepository::insert(db, root)?;
+
+    let Some(group_id) = root.group_id.as_deref() else {
+        return Ok(());
+    };
+
+    let mut session_ids = Vec::new();
+    for session in runtime.session_service.sessions_in_group(group_id)? {
+        insert_project_for_session(db, &session)?;
+        if session.id != root.id {
+            SessionRepository::insert(db, &session)?;
+        }
+        session_ids.push(session.id);
+    }
+
+    if !session_ids.iter().any(|id| id == &root.id) {
+        session_ids.push(root.id.clone());
+    }
+
+    SessionGroupRepository::insert(
+        db,
+        &SessionGroup {
+            id: group_id.to_string(),
+            name: None,
+            session_ids,
+            created_at: Utc::now(),
+        },
+    )
+}
+
+fn insert_project_for_session(db: &Database, session: &AgentSession) -> Result<(), String> {
+    ProjectRepository::insert(
+        db,
+        &Project {
+            id: session.project_id.clone(),
+            path: session.directory.clone(),
+            name: session.project_id.clone(),
+            tech_stack: vec![],
+            created_at: Utc::now(),
+        },
+    )
 }
 
 fn child_provider_registry(_runtime: &ToolRuntime) -> Arc<ProviderRegistry> {

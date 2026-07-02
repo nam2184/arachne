@@ -128,7 +128,7 @@ fn oauth_config(provider_name: &str) -> Result<ProviderOAuthConfig, String> {
             extra_authorize_params: &[
                 ("id_token_add_organizations", "true"),
                 ("codex_cli_simplified_flow", "true"),
-                ("originator", "openman"),
+                ("originator", "arachne"),
             ],
         }),
         _ => Err(format!(
@@ -440,7 +440,7 @@ fn html_error(error: &str) -> String {
         r#"<!doctype html>
 <html>
   <head>
-    <title>Openman - Authorization Failed</title>
+    <title>Arachne - Authorization Failed</title>
     <style>
       body {{ font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #131010; color: #f1ecec; }}
       .container {{ text-align: center; padding: 2rem; }}
@@ -473,7 +473,7 @@ fn escape_html(value: &str) -> String {
 const HTML_SUCCESS: &str = r#"<!doctype html>
 <html>
   <head>
-    <title>Openman - Authorization Successful</title>
+    <title>Arachne - Authorization Successful</title>
     <style>
       body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #131010; color: #f1ecec; }
       .container { text-align: center; padding: 2rem; }
@@ -484,7 +484,7 @@ const HTML_SUCCESS: &str = r#"<!doctype html>
   <body>
     <div class="container">
       <h1>Authorization Successful</h1>
-      <p>You can close this window and return to Openman.</p>
+      <p>You can close this window and return to Arachne.</p>
     </div>
     <script>setTimeout(() => window.close(), 2000)</script>
   </body>

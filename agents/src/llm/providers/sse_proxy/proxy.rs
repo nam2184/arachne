@@ -650,7 +650,7 @@ impl SseProxyRestructure {
                         return rewritten;
                     }
                 }
-                payload.to_string(re e
+                payload.to_string()
             }
         }
     }

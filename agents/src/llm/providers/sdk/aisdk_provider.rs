@@ -868,7 +868,7 @@ fn sdk_tool_result_messages(content: &[ContentPart]) -> Vec<Message> {
 }
 
 fn sanitize_sdk_messages(messages: Vec<Message>) -> Vec<Message> {
-    let mut pending_tool_call_ids = HashSet::new();
+    let mut pending_tool_calls: Vec<(String, String, usize)> = Vec::new();
     let mut sanitized = Vec::with_capacity(messages.len());
     let mut orphan_tool_results = 0_usize;
 
@@ -876,12 +876,20 @@ fn sanitize_sdk_messages(messages: Vec<Message>) -> Vec<Message> {
         match &message {
             Message::Assistant(assistant) => {
                 if let LanguageModelResponseContentType::ToolCall(call) = &assistant.content {
-                    pending_tool_call_ids.insert(call.tool.id.clone());
+                    pending_tool_calls.push((
+                        call.tool.id.clone(),
+                        call.tool.name.clone(),
+                        sanitized.len(),
+                    ));
                 }
                 sanitized.push(message);
             }
             Message::Tool(result) => {
-                if pending_tool_call_ids.remove(&result.tool.id) {
+                if let Some(index) = pending_tool_calls
+                    .iter()
+                    .position(|(id, _, _)| id == &result.tool.id)
+                {
+                    pending_tool_calls.remove(index);
                     sanitized.push(message);
                 } else {
                     orphan_tool_results += 1;
@@ -897,6 +905,35 @@ fn sanitize_sdk_messages(messages: Vec<Message>) -> Vec<Message> {
             }
             _ => sanitized.push(message),
         }
+    }
+
+    let dangling_tool_calls = pending_tool_calls.len();
+    if dangling_tool_calls > 0 {
+        let dangling_indexes = pending_tool_calls
+            .iter()
+            .map(|(_, _, index)| *index)
+            .collect::<HashSet<_>>();
+        let dangling_ids = pending_tool_calls
+            .iter()
+            .map(|(id, name, _)| format!("{name}:{id}"))
+            .collect::<Vec<_>>();
+        sanitized = sanitized
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                if dangling_indexes.contains(&index) {
+                    None
+                } else {
+                    Some(message)
+                }
+            })
+            .collect();
+        tracing::warn!(
+            dangling_tool_calls,
+            tool_calls = %dangling_ids.join(","),
+            message_count = sanitized.len(),
+            "dropping dangling SDK assistant tool calls to avoid invalid Responses input"
+        );
     }
 
     if orphan_tool_results > 0 {
@@ -1141,7 +1178,7 @@ fn sdk_tool_call_events(call: &ToolCallInfo) -> Vec<LlmEvent> {
             id,
             name,
             input,
-            provider_executed: Some(true),
+            provider_executed: Some(false),
         },
     ]
 }
@@ -1250,6 +1287,23 @@ mod tests {
         assert_eq!(calls[0].tool.id, "call_new");
     }
 
+    #[test]
+    fn sdk_tool_call_events_are_runner_executed() {
+        let mut call = ToolCallInfo::new("glob");
+        call.id("call_runner");
+        call.input(serde_json::json!({"path":"."}));
+
+        let events = sdk_tool_call_events(&call);
+
+        let LlmEvent::ToolCall {
+            provider_executed, ..
+        } = &events[3]
+        else {
+            panic!("expected ToolCall, got {:?}", events[3]);
+        };
+        assert_eq!(*provider_executed, Some(false));
+    }
+
     #[tokio::test]
     #[ignore = "requires provider API keys and AISDK_<PROVIDER>_MODEL env vars"]
     async fn live_smoke_streams_configured_aisdk_providers_from_env() {
@@ -1350,5 +1404,62 @@ mod tests {
         };
         assert!(user.content.contains("tool_result"));
         assert!(user.content.contains("orphan_1"));
+    }
+
+    #[test]
+    fn sdk_messages_drop_dangling_assistant_tool_calls() {
+        let request = LlmRequest::new("gpt-5.5", "openai")
+            .with_message(LlmMessage::user("inspect the workspace"))
+            .with_message(LlmMessage {
+                role: "assistant".to_string(),
+                content: vec![ContentPart::tool_call(
+                    "call_dangling",
+                    "glob",
+                    serde_json::json!({"pattern": "**/*.rs"}),
+                )],
+            });
+
+        let messages = sdk_messages(&request);
+
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0], Message::User(_)));
+    }
+
+    #[test]
+    fn sdk_messages_keep_cross_message_tool_call_results() {
+        let request = LlmRequest::new("gpt-5.5", "openai")
+            .with_message(LlmMessage::user("inspect the workspace"))
+            .with_message(LlmMessage {
+                role: "assistant".to_string(),
+                content: vec![ContentPart::tool_call(
+                    "call_1",
+                    "glob",
+                    serde_json::json!({"pattern": "**/*.rs"}),
+                )],
+            })
+            .with_message(LlmMessage::tool(
+                "call_1",
+                "glob",
+                serde_json::json!({"matches": ["src/main.rs"]}),
+            ));
+
+        let messages = sdk_messages(&request);
+
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(messages[0], Message::User(_)));
+        let Message::Assistant(assistant) = &messages[1] else {
+            panic!("expected assistant tool call, got {:?}", messages[1]);
+        };
+        let LanguageModelResponseContentType::ToolCall(call) = &assistant.content else {
+            panic!(
+                "expected assistant tool call content, got {:?}",
+                assistant.content
+            );
+        };
+        assert_eq!(call.tool.id, "call_1");
+        let Message::Tool(tool_result) = &messages[2] else {
+            panic!("expected tool result, got {:?}", messages[2]);
+        };
+        assert_eq!(tool_result.tool.id, "call_1");
     }
 }

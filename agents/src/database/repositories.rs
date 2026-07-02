@@ -119,7 +119,10 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       COALESCE(
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1),
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.parent_session_id LIMIT 1)
+                       ) AS group_id,
                        s.title
                 FROM agent_sessions s
                 ",
@@ -142,7 +145,10 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       COALESCE(
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1),
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.parent_session_id LIMIT 1)
+                       ) AS group_id,
                        s.title
                 FROM agent_sessions s
                 WHERE s.id = ?1
@@ -162,7 +168,10 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       COALESCE(
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1),
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.parent_session_id LIMIT 1)
+                       ) AS group_id,
                        s.title
                 FROM agent_sessions s
                 WHERE s.project_id = ?1
@@ -190,7 +199,10 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       COALESCE(
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1),
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.parent_session_id LIMIT 1)
+                       ) AS group_id,
                        s.title
                 FROM agent_sessions s
                 WHERE s.project_id = ?1
@@ -254,7 +266,10 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       COALESCE(
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1),
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.parent_session_id LIMIT 1)
+                       ) AS group_id,
                        s.title
                 FROM agent_sessions s
                 WHERE s.parent_session_id = ?1
@@ -741,6 +756,33 @@ mod tests {
         let list = SessionRepository::list(&db).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].group_id.as_deref(), Some("g1"));
+    }
+
+    #[test]
+    fn child_sessions_inherit_parent_group_id_on_read() {
+        let (db, _guard) = test_db();
+        seed_project(&db);
+        let parent = sample_session("root", "p1");
+        let mut child = sample_session("chat", "p1");
+        child.parent_session_id = Some(parent.id.clone());
+        SessionRepository::insert(&db, &parent).unwrap();
+        SessionRepository::insert(&db, &child).unwrap();
+
+        let group = SessionGroup {
+            id: "g1".to_string(),
+            name: None,
+            session_ids: vec![parent.id.clone()],
+            created_at: ts(2026, 1, 3, 0, 0, 0),
+        };
+        SessionGroupRepository::insert(&db, &group).unwrap();
+
+        let found = SessionRepository::find_by_id(&db, &child.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.group_id.as_deref(), Some("g1"));
+
+        let children = SessionRepository::children_of(&db, &parent.id).unwrap();
+        assert_eq!(children[0].group_id.as_deref(), Some("g1"));
     }
 
     // ---------------------------------------------------------------------

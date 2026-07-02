@@ -564,6 +564,8 @@ mod tests {
         );
         assert_eq!(old_root.title.as_deref(), Some("Chat 1"));
         assert_eq!(new_chat.title.as_deref(), Some("Chat 2"));
+        assert_eq!(old_root.group_id.as_deref(), Some(group_id.as_str()));
+        assert_eq!(new_chat.group_id.as_deref(), Some(group_id.as_str()));
 
         let groups = service.get_all_groups().unwrap();
         let group = groups.iter().find(|group| group.id == group_id).unwrap();

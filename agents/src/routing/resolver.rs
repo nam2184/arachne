@@ -11,7 +11,14 @@ pub fn build_virtual_group(
     session_service: &Arc<SessionService>,
 ) -> Result<(Option<String>, VirtualGroup), String> {
     let caller = session_service.root_session(caller_session_id)?;
-    let Some(group_id) = caller.group_id.clone() else {
+    let group_id = caller.group_id.clone().or_else(|| {
+        session_service
+            .get_session(caller_session_id)
+            .ok()
+            .flatten()
+            .and_then(|session| session.group_id)
+    });
+    let Some(group_id) = group_id else {
         return Ok((None, VirtualGroup::default()));
     };
     let sessions = session_service.sessions_in_group(&group_id)?;

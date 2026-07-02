@@ -457,10 +457,10 @@ impl OpenAiAisdkProvider {
         let configured_base_url = base_url;
         let effective_base_url = if use_codex_oauth_endpoint {
             let mut extra_headers = vec![
-                ("originator".to_string(), "openman".to_string()),
+                ("originator".to_string(), "arachne".to_string()),
                 (
                     "User-Agent".to_string(),
-                    format!("openman/{}", env!("CARGO_PKG_VERSION")),
+                    format!("arachne/{}", env!("CARGO_PKG_VERSION")),
                 ),
             ];
             if let Some(account_id) = account_id
