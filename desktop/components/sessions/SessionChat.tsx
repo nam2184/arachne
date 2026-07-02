@@ -1136,7 +1136,7 @@ function clampDiffPaneWidth(width: number) {
 }
 
 function isPopupDragExcluded(target: EventTarget) {
-  if (!(target instanceof HTMLElement)) return false;
+  if (!(target instanceof Element)) return false;
   return target.closest(
     [
       "button",
