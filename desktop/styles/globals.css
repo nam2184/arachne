@@ -122,3 +122,164 @@
   }
 
 }
+
+@layer components {
+  .markdown-content {
+    color: inherit;
+    line-height: 1.6;
+  }
+
+  .markdown-content > :first-child {
+    margin-top: 0;
+  }
+
+  .markdown-content > :last-child {
+    margin-bottom: 0;
+  }
+
+  .markdown-content p,
+  .markdown-content blockquote,
+  .markdown-content ul,
+  .markdown-content ol,
+  .markdown-content table,
+  .markdown-content pre {
+    margin-bottom: 0.75rem;
+  }
+
+  .markdown-content h1,
+  .markdown-content h2,
+  .markdown-content h3,
+  .markdown-content h4,
+  .markdown-content h5,
+  .markdown-content h6 {
+    margin-bottom: 0.5rem;
+    font-size: 1em;
+    font-weight: 650;
+    color: var(--foreground);
+  }
+
+  .markdown-content ul,
+  .markdown-content ol {
+    padding-left: 1.35rem;
+  }
+
+  .markdown-content ul {
+    list-style-type: disc;
+  }
+
+  .markdown-content ol {
+    list-style-type: decimal;
+  }
+
+  .markdown-content li {
+    margin-bottom: 0.25rem;
+  }
+
+  .markdown-content li > p {
+    margin-bottom: 0.25rem;
+  }
+
+  .markdown-content li > ul,
+  .markdown-content li > ol {
+    margin-top: 0.25rem;
+    margin-bottom: 0.25rem;
+  }
+
+  .markdown-content a {
+    color: var(--node-focus);
+    text-decoration: none;
+  }
+
+  .markdown-content a:hover {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+
+  .markdown-content blockquote {
+    border-left: 2px solid var(--border);
+    padding-left: 0.75rem;
+    color: var(--text-secondary);
+  }
+
+  .markdown-content strong {
+    font-weight: 650;
+    color: var(--foreground);
+  }
+
+  .markdown-content :not(pre) > code {
+    border: 1px solid var(--border);
+    background: var(--surface-raised);
+    padding: 0.05rem 0.25rem;
+    font-family: theme("fontFamily.mono");
+    font-size: 0.92em;
+    color: var(--text-secondary);
+  }
+
+  .markdown-content pre {
+    max-width: 100%;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    background: var(--surface-raised);
+    padding: 0.75rem;
+    font-family: theme("fontFamily.mono");
+    font-size: 0.92em;
+    line-height: 1.55;
+    color: var(--text-secondary);
+  }
+
+  .markdown-content pre code {
+    font: inherit;
+    color: inherit;
+    white-space: pre;
+  }
+
+  .markdown-content table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+  }
+
+  .markdown-content th,
+  .markdown-content td {
+    border: 1px solid var(--border);
+    padding: 0.4rem 0.55rem;
+    text-align: left;
+    vertical-align: top;
+  }
+
+  .markdown-content th {
+    color: var(--foreground);
+    font-weight: 650;
+  }
+
+  .markdown-content hr {
+    margin: 1rem 0;
+    border: 0;
+    border-top: 1px solid var(--border);
+  }
+
+  .markdown-content img {
+    max-width: 100%;
+    height: auto;
+  }
+
+  .markdown-content-thinking {
+    color: var(--text-muted);
+  }
+
+  .markdown-content-thinking h1,
+  .markdown-content-thinking h2,
+  .markdown-content-thinking h3,
+  .markdown-content-thinking h4,
+  .markdown-content-thinking h5,
+  .markdown-content-thinking h6,
+  .markdown-content-thinking strong {
+    color: var(--text-subtle);
+  }
+
+  .markdown-content-thinking pre,
+  .markdown-content-thinking :not(pre) > code {
+    color: var(--text-muted);
+  }
+}

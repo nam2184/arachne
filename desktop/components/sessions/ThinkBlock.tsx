@@ -1,3 +1,4 @@
+import { MarkdownContent } from "@/components/ui/markdown-content";
 import { cn } from "@/lib/utils";
 
 interface ThinkBlockProps {
@@ -8,16 +9,15 @@ interface ThinkBlockProps {
 
 export function ThinkBlock({ text, className, defaultOpen = false }: ThinkBlockProps) {
   if (!text) return null;
-  void defaultOpen;
 
   return (
     <div
       className={cn(
-        "text-[11px] italic text-[var(--text-muted)] whitespace-pre-wrap break-words",
+        "text-[11px] text-[var(--text-muted)]",
         className,
       )}
     >
-      <div>{text}</div>
+      <MarkdownContent text={text} streaming={defaultOpen} className="markdown-content-thinking" />
     </div>
   );
 }
