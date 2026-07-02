@@ -16,9 +16,10 @@ pub mod parser;
 pub mod proxy;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
+use serde_json::Value;
 use tokio::sync::broadcast;
 
 pub use parser::SseEvent;
@@ -32,6 +33,8 @@ pub enum ProxyTermination {
     SseDone,
     /// Provider emitted a JSON chunk with `choices[*].finish_reason` set.
     FinishReason(String),
+    /// Provider emitted a terminal OpenAI Responses API event.
+    ResponsesEvent(String),
     /// Upstream response body ended without `[DONE]` or `finish_reason`.
     EofWithoutFinish,
     /// Reqwest stream error (network drop, decode error, etc).
@@ -88,21 +91,79 @@ impl SseTerminalInfo {
 /// can attach terminal metadata to the correct stream.
 pub type RequestKey = u64;
 
+/// Provider-specific stream repair requested by the provider setup. The proxy
+/// code calls this through [`SseProxyProviderConfig::restructure`] instead of
+/// hard-coding upstream URLs in the forwarding path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SseProxyRestructure {
+    /// ChatGPT Codex Responses streams omit data AISDK expects on terminal
+    /// events and do not set a response Content-Type.
+    OpenAiCodexResponses,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SseRestructureState {
+    pub last_responses_output_item: Option<Value>,
+    pub completed_output_injected: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SseProxyOptions {
+    pub extra_headers: Vec<(String, String)>,
+    pub require_sse_restructure: bool,
+}
+
+/// Provider descriptor carried by each proxy instance. This is intentionally
+/// small and explicit: callers decide whether restructure is required, then the
+/// module maps provider identity to the concrete restructure implementation.
+#[derive(Debug, Clone)]
+pub struct SseProxyProviderConfig {
+    pub name: String,
+    pub require_sse_restructure: bool,
+}
+
+impl SseProxyProviderConfig {
+    pub fn new(name: String, require_sse_restructure: bool) -> Self {
+        Self {
+            name,
+            require_sse_restructure,
+        }
+    }
+
+    pub fn restructure(&self) -> Option<SseProxyRestructure> {
+        if self.require_sse_restructure && self.name.eq_ignore_ascii_case("openai") {
+            Some(SseProxyRestructure::OpenAiCodexResponses)
+        } else {
+            None
+        }
+    }
+}
+
 /// One proxied upstream. Spawned lazily and shared across requests. Each
 /// instance owns its own loopback listener.
 pub struct SseProxyInstance {
     pub provider: String,
+    pub provider_config: SseProxyProviderConfig,
     pub upstream_base_url: String,
     pub local_base_url: String,
+    pub extra_headers: Vec<(String, String)>,
     pending: Mutex<HashMap<RequestKey, broadcast::Sender<Arc<SseTerminalInfo>>>>,
 }
 
 impl SseProxyInstance {
-    fn new(provider: String, upstream_base_url: String, local_base_url: String) -> Self {
+    fn new(
+        provider_config: SseProxyProviderConfig,
+        upstream_base_url: String,
+        local_base_url: String,
+        options: SseProxyOptions,
+    ) -> Self {
+        let provider = provider_config.name.clone();
         Self {
             provider,
+            provider_config,
             upstream_base_url,
             local_base_url,
+            extra_headers: options.extra_headers,
             pending: Mutex::new(HashMap::new()),
         }
     }
@@ -131,6 +192,12 @@ pub struct SseProxyManager {
     inner: Mutex<HashMap<String, Arc<SseProxyInstance>>>,
 }
 
+static GLOBAL_MANAGER: OnceLock<SseProxyManager> = OnceLock::new();
+
+pub fn global_manager() -> &'static SseProxyManager {
+    GLOBAL_MANAGER.get_or_init(SseProxyManager::new)
+}
+
 impl SseProxyManager {
     pub fn new() -> Self {
         Self {
@@ -147,7 +214,48 @@ impl SseProxyManager {
         provider: &str,
         upstream_base_url: &str,
     ) -> Result<(String, Arc<SseProxyInstance>), String> {
-        let cache_key = format!("{provider}|{upstream_base_url}");
+        self.ensure_for_provider_with_options(
+            provider,
+            upstream_base_url,
+            SseProxyOptions::default(),
+        )
+    }
+
+    /// Like [`SseProxyManager::ensure_for_provider`], but injects the provided
+    /// headers into every upstream request. Header values are part of the cache
+    /// key because OAuth account affinity can differ between provider configs.
+    pub fn ensure_for_provider_with_headers(
+        &self,
+        provider: &str,
+        upstream_base_url: &str,
+        extra_headers: &[(String, String)],
+    ) -> Result<(String, Arc<SseProxyInstance>), String> {
+        self.ensure_for_provider_with_options(
+            provider,
+            upstream_base_url,
+            SseProxyOptions {
+                extra_headers: extra_headers.to_vec(),
+                require_sse_restructure: false,
+            },
+        )
+    }
+
+    pub fn ensure_for_provider_with_options(
+        &self,
+        provider: &str,
+        upstream_base_url: &str,
+        options: SseProxyOptions,
+    ) -> Result<(String, Arc<SseProxyInstance>), String> {
+        let cache_key = format!(
+            "{provider}|{upstream_base_url}|restructure={}|{}",
+            options.require_sse_restructure,
+            options
+                .extra_headers
+                .iter()
+                .map(|(name, value)| format!("{}={}", name.to_ascii_lowercase(), value))
+                .collect::<Vec<_>>()
+                .join(";")
+        );
         if let Some(existing) = self.inner.lock().get(&cache_key).cloned() {
             return Ok((existing.local_base_url.clone(), existing));
         }
@@ -168,11 +276,14 @@ impl SseProxyManager {
         let provider_owned = provider.to_string();
         let upstream_owned = upstream_base_url.to_string();
         let local_base_url = format!("http://{local_addr}");
+        let provider_config =
+            SseProxyProviderConfig::new(provider_owned.clone(), options.require_sse_restructure);
 
         let instance = Arc::new(SseProxyInstance::new(
-            provider_owned.clone(),
+            provider_config,
             upstream_owned.clone(),
             local_base_url.clone(),
+            options,
         ));
 
         let instance_for_task = Arc::clone(&instance);

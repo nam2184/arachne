@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Check, ChevronDown, ChevronLeft, ChevronRight, FolderSearch, MoreHorizontal, Plus, Search, Terminal, Wrench, X } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { Button } from "@/components/ui/button";
+import { MarkdownContent } from "@/components/ui/markdown-content";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import { getDefaultModel, getModelOptions } from "@/features/sessions/providerModels";
@@ -727,9 +728,14 @@ export function SessionChat({
                           parts={parts}
                           fallbackContent={content}
                           defaultThinkingOpen={streamingMessageId === message.id}
+                          streaming={streamingMessageId === message.id}
                         />
                       ) : content ? (
-                        <div className="whitespace-pre-wrap break-words">{content}</div>
+                        isAssistant ? (
+                          <MarkdownContent text={content} streaming={streamingMessageId === message.id} />
+                        ) : (
+                          <div className="whitespace-pre-wrap break-words">{content}</div>
+                        )
                       ) : null}
                     </div>
                   </div>
@@ -921,17 +927,19 @@ export function SessionChat({
 
 function chatTitle(chat: AgentSession, index: number) {
   const title = chat.title?.trim();
-  return title || "Unknown";
+  return title || `Chat ${index + 1}`;
 }
 
 function AssistantMessageParts({
   parts,
   fallbackContent,
   defaultThinkingOpen,
+  streaming,
 }: {
   parts: ChatMessagePart[];
   fallbackContent: string;
   defaultThinkingOpen: boolean;
+  streaming: boolean;
 }) {
   const results = new Map<string, Extract<ChatMessagePart, { type: "tool_result" }>>();
   for (const part of parts) {
@@ -942,7 +950,7 @@ function AssistantMessageParts({
 
   const visibleParts = parts.filter((part) => part.type !== "tool_result");
   if (visibleParts.length === 0 && fallbackContent) {
-    return <div className="whitespace-pre-wrap break-words">{fallbackContent}</div>;
+    return <MarkdownContent text={fallbackContent} streaming={streaming} />;
   }
 
   return (
@@ -950,9 +958,7 @@ function AssistantMessageParts({
       {visibleParts.map((part, index) => {
         if (part.type === "text") {
           return part.text ? (
-            <div key={`text-${index}`} className="whitespace-pre-wrap break-words">
-              {part.text}
-            </div>
+            <MarkdownContent key={`text-${index}`} text={part.text} streaming={streaming} />
           ) : null;
         }
         if (part.type === "reasoning") {
@@ -1136,7 +1142,7 @@ function clampDiffPaneWidth(width: number) {
 }
 
 function isPopupDragExcluded(target: EventTarget) {
-  if (!(target instanceof HTMLElement)) return false;
+  if (!(target instanceof Element)) return false;
   return target.closest(
     [
       "button",

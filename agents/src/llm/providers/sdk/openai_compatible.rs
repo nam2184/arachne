@@ -38,6 +38,7 @@ pub struct OpenAiCompatibleSdkProvider {
     provider_name: String,
     api_key_env: String,
     api_key: Option<String>,
+    api_key_source: &'static str,
     base_url: String,
     supported_models: Vec<String>,
     sdk_model_name: String,
@@ -63,7 +64,19 @@ impl OpenAiCompatibleSdkProvider {
         api_key_env: &str,
         supported_models: &[&str],
     ) -> Self {
-        let api_key = api_key.or_else(|| std::env::var(api_key_env).ok());
+        let env_api_key = std::env::var(api_key_env).ok();
+        let api_key_source = match api_key.as_deref() {
+            Some(key) if !key.trim().is_empty() => "config",
+            Some(_) => "config-empty",
+            None if env_api_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty()) =>
+            {
+                "env"
+            }
+            None => "none",
+        };
+        let api_key = api_key.or(env_api_key);
         let base_url = base_url.unwrap_or_else(|| default_base_url.to_string());
         let supported_models = supported_models
             .iter()
@@ -77,11 +90,32 @@ impl OpenAiCompatibleSdkProvider {
             api_key_env,
             &sdk_model_name,
         );
+        let has_api_key = api_key.as_deref().is_some_and(|key| !key.trim().is_empty());
+        if has_api_key {
+            tracing::debug!(
+                provider = %provider_name,
+                base_url = %base_url,
+                api_key_env = %api_key_env,
+                api_key_source,
+                has_api_key,
+                "created OpenAI-compatible SDK provider auth config"
+            );
+        } else {
+            tracing::trace!(
+                provider = %provider_name,
+                base_url = %base_url,
+                api_key_env = %api_key_env,
+                api_key_source,
+                has_api_key,
+                "created OpenAI-compatible SDK provider auth config"
+            );
+        }
 
         Self {
             provider_name: provider_name.to_string(),
             api_key_env: api_key_env.to_string(),
             api_key,
+            api_key_source,
             base_url,
             supported_models,
             sdk_model_name,
@@ -185,6 +219,7 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
             model = %request.model,
             sdk_base_url = %sdk_base_url,
             has_api_key = self.api_key.as_ref().is_some_and(|api_key| !api_key.is_empty()),
+            api_key_source = self.api_key_source,
             tool_count = request.tools.len(),
             tool_dispatcher_wired = self
                 .tool_dispatcher

@@ -8,7 +8,7 @@ import {
   getModelOptions,
   getModelSpec,
 } from "@/features/sessions/providerModels";
-import type { ProviderConfig } from "@/features/sessions/sessionStore";
+import type { ProviderAuthState, ProviderConfig, ProviderOAuthAuthorization } from "@/features/sessions/sessionStore";
 import { cn } from "@/lib/utils";
 import { useAppStore, type NodeSkin, type WorkspaceMode } from "@/features/app/appStore";
 import { Button } from "@/components/ui/button";
@@ -17,6 +17,7 @@ import { Input } from "@/components/ui/input";
 interface ProviderDraft {
   name: string;
   model: string;
+  field_type: "API_KEY" | "OAUTH";
   api_key: string;
   base_url: string;
   protocol: "openai" | "anthropic";
@@ -26,6 +27,7 @@ interface ProviderDraft {
 const emptyProviderDraft: ProviderDraft = {
   name: "",
   model: "",
+  field_type: "API_KEY",
   api_key: "",
   base_url: "",
   protocol: "openai",
@@ -35,6 +37,7 @@ const emptyProviderDraft: ProviderDraft = {
 export function SettingsPage() {
   const { settings, saveTheme, saveNodeSkin, saveWorkspaceMode, saveWebSearchSettings, setView } = useAppStore();
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
+  const [providerAuthStates, setProviderAuthStates] = useState<Map<string, ProviderAuthState>>(() => new Map());
   const [selectedProviderName, setSelectedProviderName] = useState("");
   const [providerDraft, setProviderDraft] = useState<ProviderDraft>(emptyProviderDraft);
   const [searxngBaseUrl, setSearxngBaseUrl] = useState(settings.searxng_base_url ?? "");
@@ -45,6 +48,8 @@ export function SettingsPage() {
   const [error, setError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isSavingWebSearch, setIsSavingWebSearch] = useState(false);
+  const [isConnectingOAuth, setIsConnectingOAuth] = useState(false);
+  const [oauthAuthorizationUrl, setOauthAuthorizationUrl] = useState<string | null>(null);
 
   useEffect(() => {
     loadProviders().catch((loadError) => {
@@ -58,13 +63,18 @@ export function SettingsPage() {
   }, [settings.searxng_base_url, settings.websearch_max_results]);
 
   async function loadProviders() {
-    const configs = await invoke<ProviderConfig[]>("get_provider_configs");
+    const [configs, authStates] = await Promise.all([
+      invoke<ProviderConfig[]>("get_provider_configs"),
+      invoke<ProviderAuthState[]>("get_provider_auth_states"),
+    ]);
+    const authByProvider = new Map(authStates.map((auth) => [auth.provider_name, auth]));
     setProviders(configs);
+    setProviderAuthStates(authByProvider);
 
     const selected = configs.find((config) => config.name === selectedProviderName) ?? configs[0];
     if (selected) {
       setSelectedProviderName(selected.name);
-      setProviderDraft(providerToDraft(selected));
+      setProviderDraft(providerToDraft(selected, authByProvider.get(selected.name)));
     }
   }
 
@@ -72,7 +82,7 @@ export function SettingsPage() {
     setSelectedProviderName(name);
     const provider = providers.find((config) => config.name === name);
     if (provider) {
-      setProviderDraft(providerToDraft(provider));
+      setProviderDraft(providerToDraft(provider, providerAuthStates.get(provider.name)));
     }
   }
 
@@ -87,16 +97,22 @@ export function SettingsPage() {
     setStatus(null);
 
     try {
+      const providerName = providerDraft.name.trim();
       const config: ProviderConfig = {
-        name: providerDraft.name.trim(),
+        name: providerName,
         model: providerDraft.model.trim(),
-        api_key: providerDraft.api_key.trim() || null,
+        api_key: selectedAuthValue(providerDraft),
         base_url: providerDraft.base_url.trim() || null,
         protocol: providerDraft.protocol,
         enabled: providerDraft.enabled,
       };
 
       await invoke("upsert_provider_config", { config });
+      await invoke("update_provider_auth_settings", {
+        providerName,
+        fieldType: providerDraft.field_type,
+        apiKey: providerDraft.api_key.trim() || null,
+      });
       setStatus("Provider config saved.");
       setSelectedProviderName(config.name);
       await loadProviders();
@@ -105,6 +121,43 @@ export function SettingsPage() {
     } finally {
       setIsSaving(false);
     }
+  }
+
+  async function connectOpenAiOAuth() {
+    const providerName = providerDraft.name.trim();
+    if (providerName.toLowerCase() !== "openai") {
+      setError("OAuth browser sign-in is currently available for OpenAI only.");
+      return;
+    }
+
+    setIsConnectingOAuth(true);
+    setError(null);
+    setStatus(null);
+    setOauthAuthorizationUrl(null);
+
+    try {
+      const authorization = await invoke<ProviderOAuthAuthorization>("start_provider_oauth", { providerName });
+      setOauthAuthorizationUrl(authorization.authorization_url);
+      setStatus("Open the OAuth URL in your external browser. Waiting for the browser callback...");
+      await invoke<ProviderAuthState>("complete_provider_oauth", { providerName });
+      setProviderDraft((draft) => ({
+        ...draft,
+        field_type: "OAUTH",
+      }));
+      setOauthAuthorizationUrl(null);
+      setStatus("OpenAI OAuth connected.");
+      await loadProviders();
+    } catch (oauthError) {
+      setError(formatError(oauthError));
+    } finally {
+      setIsConnectingOAuth(false);
+    }
+  }
+
+  async function copyOAuthUrl() {
+    if (!oauthAuthorizationUrl) return;
+    await navigator.clipboard.writeText(oauthAuthorizationUrl);
+    setStatus("OAuth URL copied. Paste it into your external browser.");
   }
 
   async function handleThemeToggle() {
@@ -151,6 +204,9 @@ export function SettingsPage() {
   );
   const modelContextWindow = selectedSpec?.context_window ?? getContextWindow(providerDraft.model);
   const modelMaxOutput = selectedSpec?.max_output ?? getMaxOutput(providerDraft.model);
+  const selectedAuthState = providerAuthStates.get(providerDraft.name.trim());
+  const hasOAuthAccessToken = Boolean(selectedAuthState?.access_token);
+  const hasOAuthRefreshToken = Boolean(selectedAuthState?.refresh_token);
 
   return (
     <div className="flex h-full flex-col bg-[var(--background)] text-[var(--foreground)]">
@@ -342,14 +398,58 @@ export function SettingsPage() {
                 </select>
               </label>
               <label className="block space-y-1.5">
-                <span className="text-xs font-medium text-[var(--text-secondary)]">API Key</span>
-                <Input
-                  type="password"
-                  value={providerDraft.api_key}
-                  onChange={(event: ChangeEvent<HTMLInputElement>) => setProviderDraft((draft) => ({ ...draft, api_key: event.target.value }))}
-                  placeholder="Stored locally"
-                />
+                <span className="text-xs font-medium text-[var(--text-secondary)]">Auth Type</span>
+                <select
+                  value={providerDraft.field_type}
+                  onChange={(event: ChangeEvent<HTMLSelectElement>) => setProviderDraft((draft) => ({ ...draft, field_type: event.target.value as ProviderDraft["field_type"] }))}
+                  className="h-9 w-full rounded-none border border-[var(--input-border)] bg-[var(--input-bg)] px-3 text-sm text-[var(--foreground)] outline-none transition-colors hover:border-[var(--node-border-hover)] focus:border-[var(--foreground)]"
+                >
+                  <option value="API_KEY">API key</option>
+                  <option value="OAUTH">OAuth</option>
+                </select>
               </label>
+              {providerDraft.field_type === "API_KEY" ? (
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-[var(--text-secondary)]">API Key</span>
+                  <Input
+                    type="password"
+                    value={providerDraft.api_key}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setProviderDraft((draft) => ({ ...draft, api_key: event.target.value }))}
+                    placeholder="Stored locally"
+                  />
+                </label>
+              ) : (
+                <div className="space-y-3">
+                  {providerDraft.name.trim().toLowerCase() === "openai" && (
+                    <div className="space-y-2 rounded-none border border-[var(--border)] bg-[var(--surface)] p-3">
+                      <Button className="w-full" variant="secondary" onClick={connectOpenAiOAuth} disabled={isConnectingOAuth}>
+                        {isConnectingOAuth ? "Waiting for OpenAI..." : "Connect OpenAI OAuth"}
+                      </Button>
+                      {oauthAuthorizationUrl && (
+                        <div className="space-y-2 text-xs text-[var(--text-secondary)]">
+                          <p>Copy this URL and open it in your external browser.</p>
+                          <p className="break-all rounded-none border border-[var(--border)] bg-[var(--input-bg)] p-2 text-[var(--foreground)]">
+                            {oauthAuthorizationUrl}
+                          </p>
+                          <Button className="w-full" variant="secondary" onClick={copyOAuthUrl}>
+                            Copy OAuth URL
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  <div className="rounded-none border border-[var(--border)] bg-[var(--surface)] p-3 text-xs text-[var(--text-secondary)]">
+                    <p className="text-[10px] uppercase tracking-wider text-[var(--text-muted)]">OAuth tokens</p>
+                    <p className="mt-1">
+                      Access token: <span className="text-[var(--foreground)]">{hasOAuthAccessToken ? "Connected" : "Not connected"}</span>
+                    </p>
+                    <p>
+                      Refresh token: <span className="text-[var(--foreground)]">{hasOAuthRefreshToken ? "Stored" : "Not stored"}</span>
+                    </p>
+                    <p className="mt-2">Tokens are managed by Connect OpenAI OAuth and cannot be edited here.</p>
+                  </div>
+                </div>
+              )}
               <label className="block space-y-1.5">
                 <span className="text-xs font-medium text-[var(--text-secondary)]">Base URL</span>
                 <Input
@@ -397,15 +497,22 @@ export function SettingsPage() {
   );
 }
 
-function providerToDraft(provider: ProviderConfig): ProviderDraft {
+function providerToDraft(provider: ProviderConfig, auth?: ProviderAuthState): ProviderDraft {
   return {
     name: provider.name,
     model: provider.model,
-    api_key: provider.api_key ?? "",
+    field_type: auth?.field_type ?? "API_KEY",
+    api_key: auth?.api_key ?? provider.api_key ?? "",
     base_url: provider.base_url ?? "",
     protocol: provider.protocol ?? inferProtocol(provider.name),
     enabled: provider.enabled,
   };
+}
+
+function selectedAuthValue(provider: ProviderDraft) {
+  return provider.field_type === "API_KEY"
+    ? provider.api_key.trim() || null
+    : null;
 }
 
 function inferProtocol(name: string): ProviderDraft["protocol"] {

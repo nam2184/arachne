@@ -37,7 +37,11 @@ pub(crate) fn parse_provider_error_body(body: &str) -> ProviderErrorInfo {
         };
     }
 
-    let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+    let parsed: serde_json::Value = match serde_json::from_str(trimmed).or_else(|_| {
+        embedded_json_object(trimmed)
+            .ok_or(())
+            .and_then(|json| serde_json::from_str(json).map_err(|_| ()))
+    }) {
         Ok(value) => value,
         Err(_) => {
             return ProviderErrorInfo {
@@ -116,6 +120,15 @@ pub(crate) fn parse_provider_error_body(body: &str) -> ProviderErrorInfo {
         error_code: None,
         error_param: None,
     }
+}
+
+fn embedded_json_object(value: &str) -> Option<&str> {
+    let start = value.find('{')?;
+    let end = value.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    Some(&value[start..=end])
 }
 
 /// Render the provider error into a one-line human-readable

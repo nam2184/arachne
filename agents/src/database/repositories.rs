@@ -3,7 +3,8 @@ use rusqlite::params;
 
 use crate::database::connection::Database;
 use crate::{
-    AgentSession, Message, MessageRole, Project, ProviderConfig, ProviderProtocol, SessionGroup,
+    AgentSession, Message, MessageRole, Project, ProviderAuthFieldType, ProviderAuthState,
+    ProviderConfig, ProviderProtocol, SessionGroup,
 };
 
 pub struct ProjectRepository;
@@ -118,7 +119,10 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       COALESCE(
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1),
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.parent_session_id LIMIT 1)
+                       ) AS group_id,
                        s.title
                 FROM agent_sessions s
                 ",
@@ -141,7 +145,10 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       COALESCE(
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1),
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.parent_session_id LIMIT 1)
+                       ) AS group_id,
                        s.title
                 FROM agent_sessions s
                 WHERE s.id = ?1
@@ -161,7 +168,10 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       COALESCE(
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1),
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.parent_session_id LIMIT 1)
+                       ) AS group_id,
                        s.title
                 FROM agent_sessions s
                 WHERE s.project_id = ?1
@@ -189,7 +199,10 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       COALESCE(
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1),
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.parent_session_id LIMIT 1)
+                       ) AS group_id,
                        s.title
                 FROM agent_sessions s
                 WHERE s.project_id = ?1
@@ -253,7 +266,10 @@ impl SessionRepository {
                 "
                 SELECT s.id, s.project_id, s.directory, s.provider, s.model, s.created_at,
                        s.parent_session_id, s.summary_json,
-                       (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1) AS group_id,
+                       COALESCE(
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.id LIMIT 1),
+                           (SELECT group_id FROM session_group_sessions WHERE session_id = s.parent_session_id LIMIT 1)
+                       ) AS group_id,
                        s.title
                 FROM agent_sessions s
                 WHERE s.parent_session_id = ?1
@@ -605,6 +621,8 @@ mod tests {
             base_url: None,
             protocol,
             enabled: true,
+            auth_account_id: None,
+            auth_field_type: ProviderAuthFieldType::ApiKey,
         }
     }
 
@@ -738,6 +756,33 @@ mod tests {
         let list = SessionRepository::list(&db).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].group_id.as_deref(), Some("g1"));
+    }
+
+    #[test]
+    fn child_sessions_inherit_parent_group_id_on_read() {
+        let (db, _guard) = test_db();
+        seed_project(&db);
+        let parent = sample_session("root", "p1");
+        let mut child = sample_session("chat", "p1");
+        child.parent_session_id = Some(parent.id.clone());
+        SessionRepository::insert(&db, &parent).unwrap();
+        SessionRepository::insert(&db, &child).unwrap();
+
+        let group = SessionGroup {
+            id: "g1".to_string(),
+            name: None,
+            session_ids: vec![parent.id.clone()],
+            created_at: ts(2026, 1, 3, 0, 0, 0),
+        };
+        SessionGroupRepository::insert(&db, &group).unwrap();
+
+        let found = SessionRepository::find_by_id(&db, &child.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.group_id.as_deref(), Some("g1"));
+
+        let children = SessionRepository::children_of(&db, &parent.id).unwrap();
+        assert_eq!(children[0].group_id.as_deref(), Some("g1"));
     }
 
     // ---------------------------------------------------------------------
@@ -1090,6 +1135,34 @@ mod tests {
         assert_eq!(openai.protocol, ProviderProtocol::OpenAI);
     }
 
+    #[test]
+    fn provider_auth_state_round_trips_api_key_and_oauth() {
+        let (db, _guard) = test_db();
+        let mut auth = ProviderAuthState::new("openai".to_string());
+        auth.api_key = Some("sk-test".to_string());
+
+        ProviderAuthStateRepository::upsert(&db, &auth).unwrap();
+        let found = ProviderAuthStateRepository::find_by_provider(&db, "openai")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.field_type, ProviderAuthFieldType::ApiKey);
+        assert_eq!(found.selected_token().as_deref(), Some("sk-test"));
+
+        auth.field_type = ProviderAuthFieldType::OAuth;
+        auth.access_token = Some("access-token".to_string());
+        auth.refresh_token = Some("refresh-token".to_string());
+        auth.account_id = Some("acc-test".to_string());
+        ProviderAuthStateRepository::upsert(&db, &auth).unwrap();
+
+        let found = ProviderAuthStateRepository::find_by_provider(&db, "openai")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.field_type, ProviderAuthFieldType::OAuth);
+        assert_eq!(found.selected_token().as_deref(), Some("access-token"));
+        assert_eq!(found.refresh_token.as_deref(), Some("refresh-token"));
+        assert_eq!(found.account_id.as_deref(), Some("acc-test"));
+    }
+
     // ---------------------------------------------------------------------
     // Multi-connection sanity check (proves temp-file approach works)
     // ---------------------------------------------------------------------
@@ -1244,6 +1317,8 @@ impl ProviderConfigRepository {
                     base_url: row.get(3)?,
                     protocol: ProviderProtocol::from_name(row.get::<_, String>(4)?.as_str()),
                     enabled: row.get::<_, i32>(5)? != 0,
+                    auth_account_id: None,
+                    auth_field_type: ProviderAuthFieldType::ApiKey,
                 })
             })
             .ok();
@@ -1268,6 +1343,8 @@ impl ProviderConfigRepository {
                     base_url: row.get(3)?,
                     protocol: ProviderProtocol::from_name(row.get::<_, String>(4)?.as_str()),
                     enabled: row.get::<_, i32>(5)? != 0,
+                    auth_account_id: None,
+                    auth_field_type: ProviderAuthFieldType::ApiKey,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -1286,4 +1363,81 @@ impl ProviderConfigRepository {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
+}
+
+pub struct ProviderAuthStateRepository;
+
+impl ProviderAuthStateRepository {
+    pub fn upsert(db: &Database, auth: &ProviderAuthState) -> Result<(), String> {
+        db.connection()
+            .execute(
+                "INSERT OR REPLACE INTO provider_auth_states (provider_name, field_type, access_token, refresh_token, account_id, api_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    auth.provider_name,
+                    auth.field_type.as_str(),
+                    auth.access_token,
+                    auth.refresh_token,
+                    auth.account_id,
+                    auth.api_key
+                ],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn find_by_provider(
+        db: &Database,
+        provider_name: &str,
+    ) -> Result<Option<ProviderAuthState>, String> {
+        let mut stmt = db
+            .connection()
+            .prepare(
+                "SELECT provider_name, field_type, access_token, refresh_token, account_id, api_key FROM provider_auth_states WHERE provider_name = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let result = stmt
+            .query_row(params![provider_name], |row| provider_auth_from_row(row))
+            .ok();
+
+        Ok(result)
+    }
+
+    pub fn list(db: &Database) -> Result<Vec<ProviderAuthState>, String> {
+        let mut stmt = db
+            .connection()
+            .prepare(
+                "SELECT provider_name, field_type, access_token, refresh_token, account_id, api_key FROM provider_auth_states",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let auth_states = stmt
+            .query_map([], |row| provider_auth_from_row(row))
+            .map_err(|e| e.to_string())?
+            .filter_map(|row| row.ok())
+            .collect();
+
+        Ok(auth_states)
+    }
+
+    pub fn delete(db: &Database, provider_name: &str) -> Result<(), String> {
+        db.connection()
+            .execute(
+                "DELETE FROM provider_auth_states WHERE provider_name = ?1",
+                params![provider_name],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn provider_auth_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderAuthState> {
+    Ok(ProviderAuthState {
+        provider_name: row.get(0)?,
+        field_type: ProviderAuthFieldType::from_name(row.get::<_, String>(1)?.as_str()),
+        access_token: row.get(2)?,
+        refresh_token: row.get(3)?,
+        account_id: row.get(4)?,
+        api_key: row.get(5)?,
+    })
 }

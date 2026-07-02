@@ -11,6 +11,7 @@ pub mod patch;
 pub mod paths;
 pub mod permission;
 pub mod permission_v2;
+pub mod provider_oauth;
 pub mod provider_service;
 pub mod routing;
 pub mod sandbox;
@@ -28,6 +29,7 @@ pub use llm::{
 };
 pub use model_spec::{ModelRegistry, ModelSpec, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT};
 pub use permission::{PermissionAction, PermissionMode, PermissionRequest, PermissionService};
+pub use provider_oauth::{ProviderOAuthAuthorization, ProviderOAuthTokens};
 pub use provider_service::ProviderService;
 pub use sessions::{
     build_prompt, create_conversation_service, serialize_message, CompactionConfig,

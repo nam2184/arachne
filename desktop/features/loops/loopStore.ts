@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import type { LoopGoalStatus } from "@/components/loops";
 
-const STORAGE_KEY = "openman.session-loops.v1";
+const STORAGE_KEY = "arachne.session-loops.v1";
 
 export type SessionLoopStatus = "active" | "paused" | "completed";
 

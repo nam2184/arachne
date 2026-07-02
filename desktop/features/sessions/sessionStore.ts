@@ -29,6 +29,21 @@ export interface ProviderConfig {
   enabled: boolean;
 }
 
+export interface ProviderAuthState {
+  provider_name: string;
+  field_type: "API_KEY" | "OAUTH";
+  access_token?: string | null;
+  refresh_token?: string | null;
+  api_key?: string | null;
+}
+
+export interface ProviderOAuthAuthorization {
+  provider_name: string;
+  authorization_url: string;
+  redirect_uri: string;
+  expires_in_seconds: number;
+}
+
 interface SessionInitPayload {
   sessions: AgentSession[];
   groups: SessionGroup[];
