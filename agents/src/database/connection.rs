@@ -81,6 +81,7 @@ impl Database {
                 field_type TEXT NOT NULL DEFAULT 'API_KEY',
                 access_token TEXT,
                 refresh_token TEXT,
+                account_id TEXT,
                 api_key TEXT
             );
 
@@ -136,6 +137,10 @@ impl Database {
         );
         let _ = self.conn.execute(
             "ALTER TABLE provider_auth_states ADD COLUMN refresh_token TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE provider_auth_states ADD COLUMN account_id TEXT",
             [],
         );
         let _ = self.conn.execute(

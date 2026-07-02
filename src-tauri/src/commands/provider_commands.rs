@@ -1,5 +1,6 @@
 use arachne_agents::{
-    ProviderAuthState, ProviderConfig, ProviderOAuthAuthorization, ProviderService,
+    ProviderAuthFieldType, ProviderAuthState, ProviderConfig, ProviderOAuthAuthorization,
+    ProviderService,
 };
 use std::sync::Arc;
 use tauri::State;
@@ -40,6 +41,16 @@ pub async fn upsert_provider_auth_state(
     provider_service: State<'_, Arc<ProviderService>>,
 ) -> Result<(), String> {
     provider_service.upsert_auth_state(auth)
+}
+
+#[tauri::command]
+pub async fn update_provider_auth_settings(
+    provider_name: String,
+    field_type: ProviderAuthFieldType,
+    api_key: Option<String>,
+    provider_service: State<'_, Arc<ProviderService>>,
+) -> Result<(), String> {
+    provider_service.update_auth_settings(&provider_name, field_type, api_key)
 }
 
 #[tauri::command]

@@ -221,6 +221,7 @@ pub fn run() {
             commands::provider_commands::get_provider_auth_states,
             commands::provider_commands::get_provider_auth_state,
             commands::provider_commands::upsert_provider_auth_state,
+            commands::provider_commands::update_provider_auth_settings,
             commands::provider_commands::start_provider_oauth,
             commands::provider_commands::complete_provider_oauth,
             commands::provider_commands::upsert_provider_config,

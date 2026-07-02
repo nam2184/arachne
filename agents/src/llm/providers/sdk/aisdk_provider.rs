@@ -12,6 +12,7 @@ use aisdk::core::{
     LanguageModelStreamChunkType, Message, Tool, ToolCallInfo, ToolResultInfo, UserMessage,
 };
 
+use super::error_parsing::{format_provider_error, parse_provider_error_body};
 use super::{LlmError, LlmProvider, LlmStream};
 use crate::llm::events::{FinishReason, LlmEvent, ToolDefinition};
 use crate::llm::request::{ContentPart, LlmRequest};
@@ -170,7 +171,22 @@ where
             "native AISDK provider request starting stream_text"
         );
         let response = sdk_request.stream_text().await.map_err(|error| {
-            LlmError::new("sdk_request", &error.to_string())
+            let raw = error.to_string();
+            let info = parse_provider_error_body(&raw);
+            let user_message = format_provider_error(&info, &raw);
+            tracing::error!(
+                provider = %self.provider_name,
+                sdk_provider = %self.sdk_provider_name,
+                model = %request.model,
+                error_kind = %info.kind,
+                error_type = info.error_type.as_deref().unwrap_or(""),
+                error_code = info.error_code.as_deref().unwrap_or(""),
+                error_param = info.error_param.as_deref().unwrap_or(""),
+                error_message = %info.message,
+                raw_error = %raw,
+                "sdk_request failed: provider rejected the request"
+            );
+            LlmError::new("sdk_request", &user_message)
                 .provider(&self.provider_name)
                 .model(&request.model)
         })?;
@@ -224,16 +240,48 @@ where
                             "sdk llm stream chunk: end"
                         );
                     }
-                    LanguageModelStreamChunkType::Failed(message)
-                    | LanguageModelStreamChunkType::NotSupported(message) => {
+                    LanguageModelStreamChunkType::Failed(message) => {
                         saw_provider_error = true;
+                        let info = parse_provider_error_body(&message);
+                        let formatted = format_provider_error(&info, &message);
                         tracing::warn!(
                             provider = %stream_provider,
                             model = %stream_model,
-                            error = %message,
+                            error = %formatted,
+                            raw_error = %message,
+                            error_kind = %info.kind,
+                            error_type = info.error_type.as_deref().unwrap_or(""),
+                            error_code = info.error_code.as_deref().unwrap_or(""),
+                            error_param = info.error_param.as_deref().unwrap_or(""),
                             "sdk llm stream chunk: failed_or_not_supported"
                         );
-                        yield LlmEvent::ProviderError { message };
+                        yield LlmEvent::ProviderError { message: formatted };
+                    }
+                    LanguageModelStreamChunkType::NotSupported(message) => {
+                        if is_benign_openai_responses_not_supported(&message) {
+                            tracing::debug!(
+                                provider = %stream_provider,
+                                model = %stream_model,
+                                raw_event = %message,
+                                "sdk llm stream chunk: ignored benign not_supported event"
+                            );
+                        } else {
+                            saw_provider_error = true;
+                            let info = parse_provider_error_body(&message);
+                            let formatted = format_provider_error(&info, &message);
+                            tracing::warn!(
+                                provider = %stream_provider,
+                                model = %stream_model,
+                                error = %formatted,
+                                raw_error = %message,
+                                error_kind = %info.kind,
+                                error_type = info.error_type.as_deref().unwrap_or(""),
+                                error_code = info.error_code.as_deref().unwrap_or(""),
+                                error_param = info.error_param.as_deref().unwrap_or(""),
+                                "sdk llm stream chunk: failed_or_not_supported"
+                            );
+                            yield LlmEvent::ProviderError { message: formatted };
+                        }
                     }
                     LanguageModelStreamChunkType::Incomplete(message) => {
                         tracing::warn!(
@@ -326,6 +374,50 @@ fn credential_debug(value: &str) -> CredentialDebug {
         sha256: format!("{:x}", Sha256::digest(value.as_bytes())),
         len: value.len(),
     }
+}
+
+fn is_benign_openai_responses_not_supported(message: &str) -> bool {
+    let Some(payload) = aisdk_not_supported_payload(message) else {
+        return false;
+    };
+    let trimmed = payload.trim();
+    if matches!(trimmed, "{}" | "[END]") {
+        return true;
+    }
+
+    let value: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+
+    matches!(
+        event_type,
+        "response.created"
+            | "response.in_progress"
+            | "response.queued"
+            | "response.output_item.added"
+            | "response.output_item.done"
+            | "response.content_part.added"
+            | "response.content_part.done"
+            | "response.output_text.done"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+            | "response.reasoning_summary_text.done"
+    )
+}
+
+fn aisdk_not_supported_payload(message: &str) -> Option<String> {
+    let trimmed = message.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix("NotSupported(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return serde_json::from_str::<String>(inner).ok();
+    }
+    Some(trimmed.to_string())
 }
 
 macro_rules! sdk_provider_case {
@@ -1102,6 +1194,7 @@ mod tests {
                 base_url: None,
                 protocol: ProviderProtocol::OpenAI,
                 enabled: true,
+                auth_account_id: None,
                 auth_field_type: ProviderAuthFieldType::ApiKey,
             };
             assert!(
@@ -1187,6 +1280,7 @@ mod tests {
                 base_url,
                 protocol: ProviderProtocol::OpenAI,
                 enabled: true,
+                auth_account_id: None,
                 auth_field_type: ProviderAuthFieldType::ApiKey,
             };
             let provider = provider_from_config(&config).expect("provider factory");

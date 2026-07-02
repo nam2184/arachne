@@ -18,8 +18,6 @@ interface ProviderDraft {
   name: string;
   model: string;
   field_type: "API_KEY" | "OAUTH";
-  access_token: string;
-  refresh_token: string;
   api_key: string;
   base_url: string;
   protocol: "openai" | "anthropic";
@@ -30,8 +28,6 @@ const emptyProviderDraft: ProviderDraft = {
   name: "",
   model: "",
   field_type: "API_KEY",
-  access_token: "",
-  refresh_token: "",
   api_key: "",
   base_url: "",
   protocol: "openai",
@@ -110,16 +106,13 @@ export function SettingsPage() {
         protocol: providerDraft.protocol,
         enabled: providerDraft.enabled,
       };
-      const auth: ProviderAuthState = {
-        provider_name: providerName,
-        field_type: providerDraft.field_type,
-        access_token: providerDraft.access_token.trim() || null,
-        refresh_token: providerDraft.refresh_token.trim() || null,
-        api_key: providerDraft.api_key.trim() || null,
-      };
 
       await invoke("upsert_provider_config", { config });
-      await invoke("upsert_provider_auth_state", { auth });
+      await invoke("update_provider_auth_settings", {
+        providerName,
+        fieldType: providerDraft.field_type,
+        apiKey: providerDraft.api_key.trim() || null,
+      });
       setStatus("Provider config saved.");
       setSelectedProviderName(config.name);
       await loadProviders();
@@ -146,12 +139,10 @@ export function SettingsPage() {
       const authorization = await invoke<ProviderOAuthAuthorization>("start_provider_oauth", { providerName });
       setOauthAuthorizationUrl(authorization.authorization_url);
       setStatus("Open the OAuth URL in your external browser. Waiting for the browser callback...");
-      const auth = await invoke<ProviderAuthState>("complete_provider_oauth", { providerName });
+      await invoke<ProviderAuthState>("complete_provider_oauth", { providerName });
       setProviderDraft((draft) => ({
         ...draft,
         field_type: "OAUTH",
-        access_token: auth.access_token ?? "",
-        refresh_token: auth.refresh_token ?? "",
       }));
       setOauthAuthorizationUrl(null);
       setStatus("OpenAI OAuth connected.");
@@ -213,6 +204,9 @@ export function SettingsPage() {
   );
   const modelContextWindow = selectedSpec?.context_window ?? getContextWindow(providerDraft.model);
   const modelMaxOutput = selectedSpec?.max_output ?? getMaxOutput(providerDraft.model);
+  const selectedAuthState = providerAuthStates.get(providerDraft.name.trim());
+  const hasOAuthAccessToken = Boolean(selectedAuthState?.access_token);
+  const hasOAuthRefreshToken = Boolean(selectedAuthState?.refresh_token);
 
   return (
     <div className="flex h-full flex-col bg-[var(--background)] text-[var(--foreground)]">
@@ -444,24 +438,16 @@ export function SettingsPage() {
                       )}
                     </div>
                   )}
-                  <label className="block space-y-1.5">
-                    <span className="text-xs font-medium text-[var(--text-secondary)]">Access Token</span>
-                    <Input
-                      type="password"
-                      value={providerDraft.access_token}
-                      onChange={(event: ChangeEvent<HTMLInputElement>) => setProviderDraft((draft) => ({ ...draft, access_token: event.target.value }))}
-                      placeholder="Bearer token used for requests"
-                    />
-                  </label>
-                  <label className="block space-y-1.5">
-                    <span className="text-xs font-medium text-[var(--text-secondary)]">Refresh Token</span>
-                    <Input
-                      type="password"
-                      value={providerDraft.refresh_token}
-                      onChange={(event: ChangeEvent<HTMLInputElement>) => setProviderDraft((draft) => ({ ...draft, refresh_token: event.target.value }))}
-                      placeholder="Optional token for refresh flow"
-                    />
-                  </label>
+                  <div className="rounded-none border border-[var(--border)] bg-[var(--surface)] p-3 text-xs text-[var(--text-secondary)]">
+                    <p className="text-[10px] uppercase tracking-wider text-[var(--text-muted)]">OAuth tokens</p>
+                    <p className="mt-1">
+                      Access token: <span className="text-[var(--foreground)]">{hasOAuthAccessToken ? "Connected" : "Not connected"}</span>
+                    </p>
+                    <p>
+                      Refresh token: <span className="text-[var(--foreground)]">{hasOAuthRefreshToken ? "Stored" : "Not stored"}</span>
+                    </p>
+                    <p className="mt-2">Tokens are managed by Connect OpenAI OAuth and cannot be edited here.</p>
+                  </div>
                 </div>
               )}
               <label className="block space-y-1.5">
@@ -516,8 +502,6 @@ function providerToDraft(provider: ProviderConfig, auth?: ProviderAuthState): Pr
     name: provider.name,
     model: provider.model,
     field_type: auth?.field_type ?? "API_KEY",
-    access_token: auth?.access_token ?? "",
-    refresh_token: auth?.refresh_token ?? "",
     api_key: auth?.api_key ?? provider.api_key ?? "",
     base_url: provider.base_url ?? "",
     protocol: provider.protocol ?? inferProtocol(provider.name),
@@ -528,7 +512,7 @@ function providerToDraft(provider: ProviderConfig, auth?: ProviderAuthState): Pr
 function selectedAuthValue(provider: ProviderDraft) {
   return provider.field_type === "API_KEY"
     ? provider.api_key.trim() || null
-    : provider.access_token.trim() || null;
+    : null;
 }
 
 function inferProtocol(name: string): ProviderDraft["protocol"] {

@@ -242,6 +242,8 @@ pub struct ProviderConfig {
     pub protocol: ProviderProtocol,
     pub enabled: bool,
     #[serde(skip)]
+    pub auth_account_id: Option<String>,
+    #[serde(skip)]
     pub auth_field_type: ProviderAuthFieldType,
 }
 
@@ -254,6 +256,7 @@ impl ProviderConfig {
             base_url: None,
             protocol,
             enabled: true,
+            auth_account_id: None,
             auth_field_type: ProviderAuthFieldType::ApiKey,
         }
     }
@@ -295,6 +298,7 @@ pub struct ProviderAuthState {
     pub field_type: ProviderAuthFieldType,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
+    pub account_id: Option<String>,
     pub api_key: Option<String>,
 }
 
@@ -305,6 +309,7 @@ impl ProviderAuthState {
             field_type: ProviderAuthFieldType::ApiKey,
             access_token: None,
             refresh_token: None,
+            account_id: None,
             api_key: None,
         }
     }

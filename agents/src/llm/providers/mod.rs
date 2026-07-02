@@ -53,6 +53,10 @@ pub trait LlmProvider: Send + Sync {
     fn model_base_url(&self) -> Option<&str>;
     fn api_key(&self) -> Option<&str>;
 
+    fn uses_codex_oauth_endpoint(&self) -> bool {
+        false
+    }
+
     /// Set the harness-side tool dispatcher. The SDK provider
     /// stores this on a per-stream basis so the AI SDK's
     /// `handle_tool_call` loop routes through our v2 permission

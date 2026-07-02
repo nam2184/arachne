@@ -109,7 +109,10 @@ impl ProviderService {
             }
         }
         self.seed_auth_states_from_legacy_api_keys(&db, &configs)?;
-        let auth_states = ProviderAuthStateRepository::list(&db)?;
+        let auth_states = ProviderAuthStateRepository::list(&db)?
+            .into_iter()
+            .map(normalize_auth_state)
+            .collect::<Vec<_>>();
         for config in &mut configs {
             if let Some(auth) = auth_states
                 .iter()
@@ -117,10 +120,12 @@ impl ProviderService {
             {
                 config.auth_field_type = auth.field_type.clone();
                 config.api_key = auth.selected_token().and_then(non_empty);
+                config.auth_account_id = auth.account_id.clone().and_then(non_empty);
                 tracing::debug!(
                     provider = %config.name,
                     auth_type = %auth.field_type.as_str(),
                     has_selected_token = config.api_key.is_some(),
+                    has_account_id = config.auth_account_id.is_some(),
                     selected_token_source = auth_token_source(auth),
                     "loaded provider auth token into runtime config"
                 );
@@ -183,16 +188,30 @@ impl ProviderService {
             {
                 config.auth_field_type = auth.field_type.clone();
                 config.api_key = auth.selected_token().and_then(non_empty);
+                config.auth_account_id = auth.account_id.clone().and_then(non_empty);
                 tracing::debug!(
                     provider = %config.name,
                     auth_type = %auth.field_type.as_str(),
                     has_selected_token = config.api_key.is_some(),
+                    has_account_id = config.auth_account_id.is_some(),
                     selected_token_source = auth_token_source(&auth),
                     "updated provider auth token in runtime config"
                 );
             }
         }
         Ok(())
+    }
+
+    pub fn update_auth_settings(
+        &self,
+        provider_name: &str,
+        field_type: ProviderAuthFieldType,
+        api_key: Option<String>,
+    ) -> Result<(), String> {
+        let mut auth = self.get_auth_state(provider_name)?;
+        auth.field_type = field_type;
+        auth.api_key = api_key.and_then(non_empty);
+        self.upsert_auth_state(auth)
     }
 
     pub async fn start_oauth(
@@ -208,10 +227,12 @@ impl ProviderService {
         auth.field_type = ProviderAuthFieldType::OAuth;
         auth.access_token = Some(tokens.access_token);
         auth.refresh_token = tokens.refresh_token;
+        auth.account_id = tokens.account_id;
         tracing::debug!(
             provider = %provider_name,
             has_access_token = auth.access_token.is_some(),
             has_refresh_token = auth.refresh_token.is_some(),
+            has_account_id = auth.account_id.is_some(),
             "completed provider oauth and received token set"
         );
         self.upsert_auth_state(auth.clone())?;
@@ -230,6 +251,7 @@ impl ProviderService {
                 let auth = normalize_auth_state(auth);
                 config.auth_field_type = auth.field_type.clone();
                 config.api_key = auth.selected_token().and_then(non_empty);
+                config.auth_account_id = auth.account_id.clone().and_then(non_empty);
             }
         }
         {
@@ -305,6 +327,7 @@ fn provider_config(
 fn normalize_config(mut config: ProviderConfig) -> ProviderConfig {
     config.base_url = config.base_url.and_then(non_empty);
     config.api_key = config.api_key.and_then(non_empty);
+    config.auth_account_id = config.auth_account_id.and_then(non_empty);
     if config.model.trim().is_empty() {
         config.model = default_model_for_provider(&config.name);
     }
@@ -315,6 +338,13 @@ fn normalize_auth_state(mut auth: ProviderAuthState) -> ProviderAuthState {
     auth.provider_name = auth.provider_name.trim().to_string();
     auth.access_token = auth.access_token.and_then(non_empty);
     auth.refresh_token = auth.refresh_token.and_then(non_empty);
+    auth.account_id = auth.account_id.and_then(non_empty);
+    if auth.account_id.is_none() && auth.provider_name.eq_ignore_ascii_case("openai") {
+        auth.account_id = auth
+            .access_token
+            .as_deref()
+            .and_then(crate::provider_oauth::extract_openai_account_id_from_jwt);
+    }
     auth.api_key = auth.api_key.and_then(non_empty);
     auth
 }

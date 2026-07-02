@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,6 +27,7 @@ pub struct ProviderOAuthAuthorization {
 pub struct ProviderOAuthTokens {
     pub access_token: String,
     pub refresh_token: Option<String>,
+    pub account_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -280,16 +284,72 @@ async fn exchange_code_for_tokens(
         .json::<OpenAiTokenResponse>()
         .await
         .map_err(|e| format!("Token response was invalid: {e}"))?;
+    let account_id = extract_account_id(&tokens);
     Ok(ProviderOAuthTokens {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
+        account_id,
     })
 }
 
 #[derive(Deserialize)]
 struct OpenAiTokenResponse {
+    id_token: Option<String>,
     access_token: String,
     refresh_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiTokenClaims {
+    chatgpt_account_id: Option<String>,
+    organizations: Option<Vec<OpenAiOrganizationClaim>>,
+    #[serde(rename = "https://api.openai.com/auth")]
+    api_auth: Option<OpenAiNestedAuthClaim>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiNestedAuthClaim {
+    chatgpt_account_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiOrganizationClaim {
+    id: String,
+}
+
+fn extract_account_id(tokens: &OpenAiTokenResponse) -> Option<String> {
+    tokens
+        .id_token
+        .as_deref()
+        .and_then(extract_openai_account_id_from_jwt)
+        .or_else(|| extract_openai_account_id_from_jwt(&tokens.access_token))
+}
+
+pub fn extract_openai_account_id_from_jwt(token: &str) -> Option<String> {
+    let claims = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(claims)
+        .or_else(|_| URL_SAFE.decode(claims))
+        .ok()?;
+    let claims: OpenAiTokenClaims = serde_json::from_slice(&decoded).ok()?;
+    claims
+        .chatgpt_account_id
+        .or_else(|| claims.api_auth.and_then(|auth| auth.chatgpt_account_id))
+        .or_else(|| {
+            claims
+                .organizations
+                .and_then(|organizations| organizations.into_iter().next().map(|org| org.id))
+        })
+        .and_then(non_empty)
+}
+
+fn non_empty(value: String) -> Option<String> {
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn authorize_url(

@@ -5,6 +5,7 @@ use aisdk::core::DynamicModel;
 
 use super::aisdk_provider::AisdkLanguageModelProvider;
 use super::{LlmError, LlmProvider, LlmStream};
+use crate::llm::providers::sse_proxy;
 use crate::llm::request::LlmRequest;
 use crate::{ProviderAuthFieldType, ProviderConfig};
 
@@ -414,6 +415,7 @@ define_aisdk_provider!(
 
 pub struct OpenAiAisdkProvider {
     inner: AisdkLanguageModelProvider<aisdk::providers::OpenAI<DynamicModel>>,
+    use_codex_oauth_endpoint: bool,
 }
 
 impl OpenAiAisdkProvider {
@@ -427,6 +429,7 @@ impl OpenAiAisdkProvider {
             config.base_url.clone(),
             config.model.clone(),
             config.auth_field_type == ProviderAuthFieldType::OAuth,
+            config.auth_account_id.clone(),
         )
     }
 
@@ -436,6 +439,7 @@ impl OpenAiAisdkProvider {
         base_url: Option<String>,
         model: String,
         use_codex_oauth_endpoint: bool,
+        account_id: Option<String>,
     ) -> Self {
         let env_api_key = std::env::var(Self::API_KEY_ENV).ok();
         let api_key_source = match api_key.as_deref() {
@@ -450,10 +454,61 @@ impl OpenAiAisdkProvider {
             None => "none",
         };
         let resolved_api_key = api_key.or(env_api_key);
+        let configured_base_url = base_url;
         let effective_base_url = if use_codex_oauth_endpoint {
-            Some(OPENAI_CODEX_BASE_URL.to_string())
+            let mut extra_headers = vec![
+                ("originator".to_string(), "openman".to_string()),
+                (
+                    "User-Agent".to_string(),
+                    format!("openman/{}", env!("CARGO_PKG_VERSION")),
+                ),
+            ];
+            if let Some(account_id) = account_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                extra_headers.push((
+                    "ChatGPT-Account-Id".to_string(),
+                    account_id.trim().to_string(),
+                ));
+            }
+            match sse_proxy::global_manager().ensure_for_provider_with_options(
+                provider_name,
+                OPENAI_CODEX_BASE_URL,
+                sse_proxy::SseProxyOptions {
+                    extra_headers,
+                    require_sse_restructure: true,
+                },
+            ) {
+                Ok((local_base_url, _instance)) => Some(local_base_url),
+                Err(error) => {
+                    tracing::warn!(
+                        provider = %provider_name,
+                        error = %error,
+                        "failed to start OpenAI Codex SSE proxy; falling back to direct Codex endpoint"
+                    );
+                    Some(OPENAI_CODEX_BASE_URL.to_string())
+                }
+            }
+        } else if sse_proxy::SseProxyManager::env_enabled(provider_name) {
+            let upstream_base_url = configured_base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            match sse_proxy::global_manager().ensure_for_provider(provider_name, &upstream_base_url)
+            {
+                Ok((local_base_url, _instance)) => Some(local_base_url),
+                Err(error) => {
+                    tracing::warn!(
+                        provider = %provider_name,
+                        upstream_base_url = %upstream_base_url,
+                        error = %error,
+                        "failed to start OpenAI SSE proxy; falling back to direct endpoint"
+                    );
+                    Some(upstream_base_url)
+                }
+            }
         } else {
-            base_url
+            configured_base_url
         };
         let effective_path = use_codex_oauth_endpoint.then_some(OPENAI_CODEX_RESPONSES_PATH);
         let has_api_key = resolved_api_key
@@ -471,6 +526,7 @@ impl OpenAiAisdkProvider {
                 has_api_key,
                 has_base_url,
                 openai_oauth_codex_endpoint = use_codex_oauth_endpoint,
+                has_account_id = account_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
                 model = %model,
                 "selected native AISDK provider auth config"
             );
@@ -483,6 +539,7 @@ impl OpenAiAisdkProvider {
                 has_api_key,
                 has_base_url,
                 openai_oauth_codex_endpoint = use_codex_oauth_endpoint,
+                has_account_id = account_id.as_deref().is_some_and(|value| !value.trim().is_empty()),
                 model = %model,
                 "selected native AISDK provider auth config"
             );
@@ -519,6 +576,7 @@ impl OpenAiAisdkProvider {
                     })
                 },
             ),
+            use_codex_oauth_endpoint,
         }
     }
 }
@@ -547,6 +605,10 @@ impl LlmProvider for OpenAiAisdkProvider {
 
     fn api_key(&self) -> Option<&str> {
         self.inner.api_key()
+    }
+
+    fn uses_codex_oauth_endpoint(&self) -> bool {
+        self.use_codex_oauth_endpoint
     }
 }
 

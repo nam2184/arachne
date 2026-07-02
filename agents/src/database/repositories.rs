@@ -606,6 +606,7 @@ mod tests {
             base_url: None,
             protocol,
             enabled: true,
+            auth_account_id: None,
             auth_field_type: ProviderAuthFieldType::ApiKey,
         }
     }
@@ -1108,6 +1109,7 @@ mod tests {
         auth.field_type = ProviderAuthFieldType::OAuth;
         auth.access_token = Some("access-token".to_string());
         auth.refresh_token = Some("refresh-token".to_string());
+        auth.account_id = Some("acc-test".to_string());
         ProviderAuthStateRepository::upsert(&db, &auth).unwrap();
 
         let found = ProviderAuthStateRepository::find_by_provider(&db, "openai")
@@ -1116,6 +1118,7 @@ mod tests {
         assert_eq!(found.field_type, ProviderAuthFieldType::OAuth);
         assert_eq!(found.selected_token().as_deref(), Some("access-token"));
         assert_eq!(found.refresh_token.as_deref(), Some("refresh-token"));
+        assert_eq!(found.account_id.as_deref(), Some("acc-test"));
     }
 
     // ---------------------------------------------------------------------
@@ -1272,6 +1275,7 @@ impl ProviderConfigRepository {
                     base_url: row.get(3)?,
                     protocol: ProviderProtocol::from_name(row.get::<_, String>(4)?.as_str()),
                     enabled: row.get::<_, i32>(5)? != 0,
+                    auth_account_id: None,
                     auth_field_type: ProviderAuthFieldType::ApiKey,
                 })
             })
@@ -1297,6 +1301,7 @@ impl ProviderConfigRepository {
                     base_url: row.get(3)?,
                     protocol: ProviderProtocol::from_name(row.get::<_, String>(4)?.as_str()),
                     enabled: row.get::<_, i32>(5)? != 0,
+                    auth_account_id: None,
                     auth_field_type: ProviderAuthFieldType::ApiKey,
                 })
             })
@@ -1324,12 +1329,13 @@ impl ProviderAuthStateRepository {
     pub fn upsert(db: &Database, auth: &ProviderAuthState) -> Result<(), String> {
         db.connection()
             .execute(
-                "INSERT OR REPLACE INTO provider_auth_states (provider_name, field_type, access_token, refresh_token, api_key) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT OR REPLACE INTO provider_auth_states (provider_name, field_type, access_token, refresh_token, account_id, api_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     auth.provider_name,
                     auth.field_type.as_str(),
                     auth.access_token,
                     auth.refresh_token,
+                    auth.account_id,
                     auth.api_key
                 ],
             )
@@ -1344,7 +1350,7 @@ impl ProviderAuthStateRepository {
         let mut stmt = db
             .connection()
             .prepare(
-                "SELECT provider_name, field_type, access_token, refresh_token, api_key FROM provider_auth_states WHERE provider_name = ?1",
+                "SELECT provider_name, field_type, access_token, refresh_token, account_id, api_key FROM provider_auth_states WHERE provider_name = ?1",
             )
             .map_err(|e| e.to_string())?;
 
@@ -1359,7 +1365,7 @@ impl ProviderAuthStateRepository {
         let mut stmt = db
             .connection()
             .prepare(
-                "SELECT provider_name, field_type, access_token, refresh_token, api_key FROM provider_auth_states",
+                "SELECT provider_name, field_type, access_token, refresh_token, account_id, api_key FROM provider_auth_states",
             )
             .map_err(|e| e.to_string())?;
 
@@ -1389,6 +1395,7 @@ fn provider_auth_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderA
         field_type: ProviderAuthFieldType::from_name(row.get::<_, String>(1)?.as_str()),
         access_token: row.get(2)?,
         refresh_token: row.get(3)?,
-        api_key: row.get(4)?,
+        account_id: row.get(4)?,
+        api_key: row.get(5)?,
     })
 }

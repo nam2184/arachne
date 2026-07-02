@@ -1315,10 +1315,16 @@ impl SessionRunner {
 
         );
 
-        let max_tokens = if session.provider.eq_ignore_ascii_case("minimax") {
-            Some(spec.max_output.min(u32::MAX as usize) as u32)
-        } else {
+        let provider = self
+            .providers
+            .get(&session.provider)
+            .await
+            .ok_or(SessionError::NoProviderForSession)?;
+
+        let max_tokens = if provider.uses_codex_oauth_endpoint() {
             None
+        } else {
+            Some(spec.max_output.min(u32::MAX as usize) as u32)
         };
 
         let mut request = LlmRequest::new(&session.model, &session.provider)
@@ -1330,12 +1336,6 @@ impl SessionRunner {
         if let Some(max_tokens) = max_tokens {
             request = request.max_tokens(max_tokens);
         }
-
-        let provider = self
-            .providers
-            .get(&session.provider)
-            .await
-            .ok_or(SessionError::NoProviderForSession)?;
 
         // The harness dispatcher needs the resolved project
 
@@ -3157,18 +3157,51 @@ pub fn readonly_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
 
 /// schema, which would otherwise round-trip as parse errors.
 
-fn object_schema(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
+fn object_schema(mut properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
+    let mut all_required = Vec::new();
+    if let Some(properties_object) = properties.as_object_mut() {
+        for (name, schema) in properties_object.iter_mut() {
+            all_required.push(name.clone());
+            if !required.iter().any(|required_name| *required_name == name) {
+                make_nullable(schema);
+            }
+        }
+        all_required.sort();
+    }
+
     serde_json::json!({
 
         "type": "object",
 
         "properties": properties,
 
-        "required": required,
+        "required": all_required,
 
         "additionalProperties": false,
 
     })
+}
+
+fn make_nullable(schema: &mut serde_json::Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+
+    match object.get_mut("type") {
+        Some(serde_json::Value::String(kind)) => {
+            let kind = kind.clone();
+            object.insert(
+                "type".to_string(),
+                serde_json::Value::Array(vec![kind.into(), "null".into()]),
+            );
+        }
+        Some(serde_json::Value::Array(types)) => {
+            if !types.iter().any(|value| value.as_str() == Some("null")) {
+                types.push("null".into());
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Names of the file-mutation tools that we surface to the model.
@@ -3585,6 +3618,55 @@ mod tests {
             is_sorted_by_name(&tools),
             "tools must be sorted by name: {tools:#?}"
         );
+    }
+
+    #[test]
+    fn tool_schemas_require_every_property_for_openai_strict_mode() {
+        for tool in readonly_tool_definitions()
+            .into_iter()
+            .chain(default_tool_definitions())
+        {
+            let properties = tool
+                .parameters
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("{} schema missing properties", tool.name));
+            let required = tool
+                .parameters
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| panic!("{} schema missing required", tool.name));
+            let mut property_names = properties.keys().cloned().collect::<Vec<_>>();
+            property_names.sort();
+            let mut required_names = required
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            required_names.sort();
+
+            assert_eq!(
+                required_names, property_names,
+                "{} schema must list every property in required for OpenAI strict mode",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn optional_tool_schema_fields_are_nullable_when_required_for_strict_mode() {
+        let glob = readonly_tool_definitions()
+            .into_iter()
+            .find(|tool| tool.name == "glob")
+            .expect("glob tool exists");
+        let pattern_type = glob
+            .parameters
+            .pointer("/properties/pattern/type")
+            .and_then(serde_json::Value::as_array)
+            .expect("optional glob pattern should use a type array");
+
+        assert!(pattern_type.iter().any(|value| value.as_str() == Some("string")));
+        assert!(pattern_type.iter().any(|value| value.as_str() == Some("null")));
     }
 
     #[test]
