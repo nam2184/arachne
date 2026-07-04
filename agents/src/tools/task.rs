@@ -385,6 +385,7 @@ fn success_or_failure(tool: &str, ok: bool, output: String, error: Option<String
             success: false,
             output,
             error,
+            metadata: None,
         }
     }
 }

@@ -905,6 +905,8 @@ impl SessionRunner {
                 }
             };
 
+            let result_metadata = result.metadata.clone();
+
             let result_value = if !result.success {
                 serde_json::json!({ "error": result.error.unwrap_or_default() })
             } else if bounded.truncated {
@@ -924,9 +926,17 @@ impl SessionRunner {
                     value["spill_path"] = serde_json::Value::String(path.clone());
                 }
 
+                if let Some(metadata) = &result_metadata {
+                    value["metadata"] = metadata.clone();
+                }
+
                 value
             } else {
-                serde_json::json!({ "text": bounded.text })
+                let mut value = serde_json::json!({ "text": bounded.text });
+                if let Some(metadata) = &result_metadata {
+                    value["metadata"] = metadata.clone();
+                }
+                value
             };
 
             // The SDK wraps whatever string we return into
@@ -2273,7 +2283,9 @@ impl SessionRunner {
                     }
                 };
 
-                let (result_value, output) = if result.success {
+                let result_metadata = result.metadata.clone();
+
+                let (mut result_value, output) = if result.success {
                     let output = result.output.clone();
 
                     (serde_json::json!({ "text": output }), Some(result.output))
@@ -2282,6 +2294,12 @@ impl SessionRunner {
 
                     (serde_json::json!({ "error": error }), None)
                 };
+
+                if result.success {
+                    if let Some(metadata) = &result_metadata {
+                        result_value["metadata"] = metadata.clone();
+                    }
+                }
 
                 // Bound the persisted tool result so a single tool
 
@@ -2363,6 +2381,10 @@ impl SessionRunner {
 
                     if let Some(path) = &bounded.spill_path {
                         value["spill_path"] = serde_json::Value::String(path.clone());
+                    }
+
+                    if let Some(metadata) = &result_metadata {
+                        value["metadata"] = metadata.clone();
                     }
 
                     value

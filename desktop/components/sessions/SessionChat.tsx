@@ -2,8 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { Check, ChevronDown, ChevronLeft, ChevronRight, FolderSearch, MoreHorizontal, Plus, Search, Terminal, Wrench, X } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { Button } from "@/components/ui/button";
+import { DiffBlock } from "@/components/ui/diff-block";
 import { MarkdownContent } from "@/components/ui/markdown-content";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { ThemedCodeBlock } from "@/components/ui/themed-code-block";
 import { cn } from "@/lib/utils";
 import { getDefaultModel, getModelOptions } from "@/features/sessions/providerModels";
 import type { ChatMessagePart, SessionFileDiff } from "@/features/sessions/conversationStore";
@@ -209,6 +211,7 @@ export function SessionChat({
   // turns without the view jumping.
   const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const isFloating = variant === "floating";
   const diffResizeRef = useRef<{
     pointerId: number;
     startX: number;
@@ -225,6 +228,14 @@ export function SessionChat({
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    if (!isFloating) return;
+    const handleResize = () => setPosition((current) => clampChatPosition(current));
+    window.addEventListener("resize", handleResize);
+    handleResize();
+    return () => window.removeEventListener("resize", handleResize);
+  }, [isFloating]);
 
   useEffect(() => {
     const el = inputRef.current;
@@ -479,7 +490,6 @@ export function SessionChat({
     : [];
 
   const directoryName = rootSession.directory.split(/[\\/]/).filter(Boolean).pop() ?? rootSession.directory;
-  const isFloating = variant === "floating";
   const showChatSidebar = isFloating;
   const showDiffPane = !isFloating && diffs.length > 0;
   const isDiffPaneCollapsed = diffPaneWidth === 0;
@@ -518,7 +528,7 @@ export function SessionChat({
             <X className="h-4 w-4" />
           </Button>
         )}
-        <div className="flex min-h-0 flex-1">
+        <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
           {showChatSidebar && (
             <aside
               className={cn(
@@ -646,7 +656,7 @@ export function SessionChat({
             )}
             </aside>
           )}
-          <div className="flex min-w-0 flex-1 flex-col">
+          <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
             {!isFloating && (
               <div className="flex min-h-12 items-center justify-between gap-3 border-b border-[var(--border)] bg-[var(--surface-raised)] px-4">
                 <div className="min-w-0 flex-1">
@@ -684,8 +694,8 @@ export function SessionChat({
                 {titleError && <span className="shrink-0 text-[11px] text-[#ff5f5f]">{titleError}</span>}
               </div>
             )}
-            <ScrollArea className="flex-1 px-6 py-4" viewportRef={scrollViewportRef}>
-              <div className="space-y-4">
+            <ScrollArea className="min-h-0 min-w-0 flex-1 px-6 py-4" viewportRef={scrollViewportRef}>
+              <div className="min-w-0 max-w-full space-y-4 overflow-hidden">
                 {messages.length === 0 ? (
                   <div className="flex h-full items-center justify-center">
                   </div>
@@ -706,14 +716,14 @@ export function SessionChat({
                 return (
                   <div
                     key={message.id ?? `${message.timestamp}-${index}`}
-                    className={cn("flex", message.role === "user" ? "justify-end" : "justify-start")}
+                    className={cn("flex min-w-0 max-w-full", message.role === "user" ? "justify-end" : "justify-start")}
                   >
                     <div
                       className={cn(
-                        "min-w-0 max-w-[80%] text-[12px] leading-relaxed text-[var(--foreground)]",
+                        "min-w-0 text-[12px] leading-relaxed text-[var(--foreground)]",
                         message.role === "user"
-                          ? "rounded-2xl bg-[var(--foreground)] px-3 py-2 text-[var(--background)] whitespace-pre-wrap break-words"
-                          : "overflow-hidden",
+                          ? "max-w-[80%] rounded-2xl bg-[var(--foreground)] px-3 py-2 text-[var(--background)] whitespace-pre-wrap break-words"
+                          : "w-full max-w-full overflow-hidden",
                       )}
                     >
                       {isAssistant && reasoning && !hasReasoningPart && (
@@ -942,9 +952,11 @@ function AssistantMessageParts({
   streaming: boolean;
 }) {
   const results = new Map<string, Extract<ChatMessagePart, { type: "tool_result" }>>();
+  const resultsByName = new Map<string, Extract<ChatMessagePart, { type: "tool_result" }>>();
   for (const part of parts) {
     if (part.type === "tool_result") {
       results.set(part.id, part);
+      if (part.name) resultsByName.set(part.name, part);
     }
   }
 
@@ -971,7 +983,7 @@ function AssistantMessageParts({
           ) : null;
         }
         if (part.type === "tool_call") {
-          return <ToolCallBlock key={part.id || `tool-${index}`} call={part} result={results.get(part.id)} />;
+          return <ToolCallBlock key={part.id || `tool-${index}`} call={part} result={results.get(part.id) ?? resultsByName.get(part.name)} />;
         }
         if (part.type === "tool_error") {
           return <ToolErrorBlock key={part.id || `tool-error-${index}`} error={part} />;
@@ -991,16 +1003,26 @@ function ToolCallBlock({
 }) {
   const details = toolDetails(call.name, call.input);
   const resultSummary = summarizeToolResult(result);
+  const metadata = toolResultMetadata(result);
+  const resultLang = toolResultLang(call.name, call.input);
   const status = resultSummary?.isError ? "failed" : result ? "done" : "running";
   const Icon = details.icon;
+  const showDiffs = !resultSummary?.isError && (call.name === "write" || call.name === "apply_patch");
+  const readRange = call.name === "read" ? readRangeInfo(call.input, resultSummary?.text, metadata) : null;
 
   return (
-    <div className="min-w-0 max-w-full overflow-hidden rounded-none border border-[var(--node-border)] bg-[var(--input-bg)] font-mono text-xs">
+    <div className="w-full min-w-0 max-w-full overflow-hidden rounded-none border border-[var(--node-border)] bg-[var(--input-bg)] font-mono text-xs">
       <div className="flex items-center justify-between border-b border-[var(--border)] bg-[var(--surface)] px-3 py-2">
-        <div className="flex min-w-0 items-center gap-2">
+        <div className="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
           <Icon className="h-3.5 w-3.5 shrink-0 text-[var(--text-muted)]" />
-          <span className="truncate text-[var(--foreground)]">{call.name}</span>
-          <span className="text-[var(--text-muted)]">{details.label}</span>
+          <span className="min-w-0 shrink-0 truncate text-[var(--foreground)]">{call.name}</span>
+          <span className="min-w-0 truncate text-[var(--text-muted)]">{details.label}</span>
+          {metadata && (metadata.additions > 0 || metadata.deletions > 0) && (
+            <span className="text-[10px] text-[var(--text-muted)]">
+              <span className="text-[#7ddc8a]">+{metadata.additions}</span>{" "}
+              <span className="text-[#ff5f5f]">-{metadata.deletions}</span>
+            </span>
+          )}
         </div>
         <span
           className={cn(
@@ -1011,14 +1033,60 @@ function ToolCallBlock({
           {status}
         </span>
       </div>
-      <div className="space-y-2 px-3 py-2">
-        <pre className="max-w-full whitespace-pre-wrap break-all text-[var(--text-secondary)]">{details.command}</pre>
+      <div className="min-w-0 max-w-full space-y-2 overflow-hidden px-3 py-2">
+        <ThemedCodeBlock code={details.command} lang={details.lang} />
+        {readRange && <ToolReadRange range={readRange} />}
         {resultSummary?.text && (
-          <pre className="max-h-40 max-w-full overflow-auto whitespace-pre-wrap break-all border-t border-[var(--border)] pt-2 text-[var(--text-muted)]">
-            {resultSummary.text}
-          </pre>
+          <ThemedCodeBlock code={resultSummary.text} lang={resultSummary.isError ? "text" : resultLang} className="max-h-40" />
         )}
+        {showDiffs && metadata && <ToolDiffSections metadata={metadata} />}
       </div>
+    </div>
+  );
+}
+
+interface ToolReadRangeInfo {
+  file: string;
+  label: string;
+  truncated: boolean;
+}
+
+function ToolReadRange({ range }: { range: ToolReadRangeInfo }) {
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-[10px] uppercase tracking-[0.14em] text-[var(--text-muted)]">
+      <span className="min-w-0 truncate normal-case tracking-normal text-[var(--text-secondary)]">{range.file || "read result"}</span>
+      <span>{range.label}</span>
+      {range.truncated && <span className="text-[#d6b85a]">truncated</span>}
+    </div>
+  );
+}
+
+function ToolDiffSections({ metadata }: { metadata: ToolResultMetadata }) {
+  const files = metadata.files.length > 0 ? metadata.files : metadata.diff ? [{
+    file: metadata.file || "diff",
+    diff: metadata.diff,
+    additions: metadata.additions,
+    deletions: metadata.deletions,
+  }] : [];
+
+  if (files.length === 0) return null;
+
+  return (
+    <div className="min-w-0 space-y-2 overflow-hidden">
+      {files.map((file, index) => (
+        <div key={`${file.file}-${index}`} className="min-w-0 overflow-hidden">
+          <div className="flex min-w-0 items-center justify-between gap-2 border border-b-0 border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-[10px] text-[var(--text-muted)]">
+            <span className="min-w-0 truncate">{file.file}</span>
+            {(file.additions > 0 || file.deletions > 0) && (
+              <span className="shrink-0">
+                <span className="text-[#7ddc8a]">+{file.additions}</span>{" "}
+                <span className="text-[#ff5f5f]">-{file.deletions}</span>
+              </span>
+            )}
+          </div>
+          <DiffBlock diff={file.diff} />
+        </div>
+      ))}
     </div>
   );
 }
@@ -1027,12 +1095,12 @@ function ToolErrorBlock({ error }: { error: Extract<ChatMessagePart, { type: "to
   return (
     <div className="rounded-none border border-[#8a2f2f] bg-[var(--surface)] px-3 py-2 font-mono text-xs text-[#d14d4d]">
       <div className="mb-1 text-[10px] uppercase tracking-[0.18em] text-[#ff5f5f]">{error.name ?? "tool"} failed</div>
-      <pre className="whitespace-pre-wrap break-words">{error.message}</pre>
+      <ThemedCodeBlock code={error.message} lang="text" />
     </div>
   );
 }
 
-function toolDetails(name: string, input: unknown): { icon: typeof Terminal; label: string; command: string } {
+function toolDetails(name: string, input: unknown): { icon: typeof Terminal; label: string; command: string; lang: string } {
   const args = isRecord(input) ? input : {};
   if (name === "shell") {
     const command = stringArg(args.command) || "shell";
@@ -1041,6 +1109,7 @@ function toolDetails(name: string, input: unknown): { icon: typeof Terminal; lab
       icon: Terminal,
       label: workdir ? `in ${workdir}` : "command",
       command: workdir ? `$ ${command}\n# cwd: ${workdir}` : `$ ${command}`,
+      lang: "shellscript",
     };
   }
   if (name === "grep") {
@@ -1051,6 +1120,7 @@ function toolDetails(name: string, input: unknown): { icon: typeof Terminal; lab
       icon: Search,
       label: "search",
       command: `grep ${quoteArg(pattern)} ${path}${include ? ` --include ${include}` : ""}`,
+      lang: "shellscript",
     };
   }
   if (name === "glob") {
@@ -1060,6 +1130,7 @@ function toolDetails(name: string, input: unknown): { icon: typeof Terminal; lab
       icon: FolderSearch,
       label: "match files",
       command: `glob ${quoteArg(pattern)} ${path}`,
+      lang: "shellscript",
     };
   }
   if (name === "read") {
@@ -1067,14 +1138,200 @@ function toolDetails(name: string, input: unknown): { icon: typeof Terminal; lab
       icon: Wrench,
       label: "read file",
       command: stringArg(args.path) || JSON.stringify(input ?? {}, null, 2),
+      lang: "text",
+    };
+  }
+  if (name === "write") {
+    return {
+      icon: Wrench,
+      label: "write file",
+      command: stringArg(args.path) || JSON.stringify(input ?? {}, null, 2),
+      lang: "text",
+    };
+  }
+  if (name === "apply_patch") {
+    return {
+      icon: Wrench,
+      label: "apply patch",
+      command: summarizePatchText(stringArg(args.patchText) || stringArg(args.patch_text) || stringArg(args.patch)),
+      lang: "text",
     };
   }
   return {
     icon: Wrench,
     label: "tool call",
     command: JSON.stringify(input ?? {}, null, 2),
+    lang: "json",
   };
 }
+
+interface ToolDiffMetadata {
+  file: string;
+  diff: string;
+  additions: number;
+  deletions: number;
+}
+
+interface ToolResultMetadata {
+  file: string;
+  diff: string;
+  additions: number;
+  deletions: number;
+  files: ToolDiffMetadata[];
+  offset: number;
+  limit: number | null;
+  startLine: number;
+  endLine: number;
+  returnedLines: number;
+  totalLines: number;
+  truncated: boolean;
+}
+
+function toolResultMetadata(result?: Extract<ChatMessagePart, { type: "tool_result" }>): ToolResultMetadata | null {
+  const value = unwrapResultValue(result?.result);
+  if (!isRecord(value) || !isRecord(value.metadata)) return null;
+  const diff = stringArg(value.metadata.diff);
+  const files = Array.isArray(value.metadata.files)
+    ? value.metadata.files.flatMap((item) => {
+        if (!isRecord(item)) return [];
+        const fileDiff = stringArg(item.diff);
+        if (!fileDiff) return [];
+        return [{
+          file: stringArg(item.file) || "diff",
+          diff: fileDiff,
+          additions: numberArg(item.additions),
+          deletions: numberArg(item.deletions),
+        }];
+      })
+    : [];
+  const metadata: ToolResultMetadata = {
+    file: stringArg(value.metadata.file),
+    diff,
+    additions: numberArg(value.metadata.additions),
+    deletions: numberArg(value.metadata.deletions),
+    files,
+    offset: numberArg(value.metadata.offset),
+    limit: nullableNumberArg(value.metadata.limit),
+    startLine: numberArg(value.metadata.start_line),
+    endLine: numberArg(value.metadata.end_line),
+    returnedLines: numberArg(value.metadata.returned_lines),
+    totalLines: numberArg(value.metadata.total_lines),
+    truncated: booleanArg(value.metadata.truncated),
+  };
+  if (!metadata.diff && metadata.files.length === 0 && !metadata.file && metadata.offset === 0) return null;
+  return metadata;
+}
+
+function formatReadRange(metadata: ToolResultMetadata): string {
+  if (metadata.returnedLines === 0) {
+    return metadata.totalLines > 0
+      ? `offset ${metadata.offset || 1} beyond ${metadata.totalLines} lines`
+      : "empty file";
+  }
+  const range = metadata.startLine === metadata.endLine
+    ? `line ${metadata.startLine}`
+    : `lines ${metadata.startLine}-${metadata.endLine}`;
+  const total = metadata.totalLines > 0 ? ` of ${metadata.totalLines}` : "";
+  const limit = metadata.limit ? ` · limit ${metadata.limit}` : "";
+  return `${range}${total}${limit}`;
+}
+
+function readRangeInfo(input: unknown, output: string | undefined, metadata: ToolResultMetadata | null): ToolReadRangeInfo | null {
+  const args = isRecord(input) ? input : {};
+  const file = metadata?.file || stringArg(args.path);
+  if (metadata) {
+    return {
+      file,
+      label: formatReadRange(metadata),
+      truncated: metadata.truncated,
+    };
+  }
+
+  const inputOffset = numberArg(args.offset) || 1;
+  const inputLimit = nullableNumberArg(args.limit);
+  const outputRange = output ? readRangeFromOutput(output) : null;
+  if (outputRange) {
+    const range = outputRange.start === outputRange.end
+      ? `line ${outputRange.start}`
+      : `lines ${outputRange.start}-${outputRange.end}`;
+    const limit = inputLimit ? ` · limit ${inputLimit}` : "";
+    return { file, label: `${range}${limit}`, truncated: false };
+  }
+  if (file || inputOffset !== 1 || inputLimit) {
+    return {
+      file,
+      label: inputLimit ? `offset ${inputOffset} · limit ${inputLimit}` : `offset ${inputOffset}`,
+      truncated: false,
+    };
+  }
+  return null;
+}
+
+function readRangeFromOutput(output: string): { start: number; end: number } | null {
+  const lines = output.split("\n");
+  let start: number | null = null;
+  let end: number | null = null;
+  for (const line of lines) {
+    const match = line.match(/^(\d+):/);
+    if (!match) continue;
+    const lineNumber = Number(match[1]);
+    if (!Number.isFinite(lineNumber)) continue;
+    start ??= lineNumber;
+    end = lineNumber;
+  }
+  return start === null || end === null ? null : { start, end };
+}
+
+function nullableNumberArg(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  const number = numberArg(value);
+  return number === 0 ? null : number;
+}
+
+function booleanArg(value: unknown): boolean {
+  return typeof value === "boolean" ? value : false;
+}
+
+function toolResultLang(name: string, input: unknown): string {
+  const args = isRecord(input) ? input : {};
+  if (name === "read" || name === "write") return languageForPath(stringArg(args.path));
+  if (name === "shell") return "console";
+  if (name === "apply_patch") return "diff";
+  return "text";
+}
+
+function languageForPath(path: string): string {
+  const extension = path.split(".").pop()?.toLowerCase();
+  if (!extension || extension === path) return "text";
+  return LANGUAGE_BY_EXTENSION[extension] ?? extension;
+}
+
+const LANGUAGE_BY_EXTENSION: Record<string, string> = {
+  cjs: "javascript",
+  css: "css",
+  go: "go",
+  h: "c",
+  hpp: "cpp",
+  html: "html",
+  java: "java",
+  js: "javascript",
+  json: "json",
+  jsonc: "jsonc",
+  jsx: "jsx",
+  md: "markdown",
+  mdx: "mdx",
+  mjs: "javascript",
+  py: "python",
+  rb: "ruby",
+  rs: "rust",
+  sh: "shellscript",
+  toml: "toml",
+  ts: "typescript",
+  tsx: "tsx",
+  txt: "text",
+  yaml: "yaml",
+  yml: "yaml",
+};
 
 function summarizeToolResult(result?: Extract<ChatMessagePart, { type: "tool_result" }>): { text: string; isError: boolean } | null {
   if (!result) return null;
@@ -1105,8 +1362,23 @@ function stringArg(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
+function numberArg(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
 function quoteArg(value: string): string {
   return /\s/.test(value) ? JSON.stringify(value) : value;
+}
+
+function summarizePatchText(patch: string): string {
+  if (!patch.trim()) return "patch";
+  const changed = patch
+    .split("\n")
+    .map((line) => line.match(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/)?.[1])
+    .filter((path): path is string => Boolean(path));
+  if (changed.length === 0) return "patch";
+  if (changed.length === 1) return changed[0] ?? "patch";
+  return `${changed.length} files`;
 }
 
 function initialChatPosition() {

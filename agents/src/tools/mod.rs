@@ -848,7 +848,11 @@ async fn apply_patch_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolR
         return failure("apply_patch", "patchText is required".to_string());
     }
     match apply_patch::apply_patch_sandboxed(&patch_text, ctx).await {
-        Ok(applied) => success("apply_patch", apply_patch::model_output(&applied)),
+        Ok(applied) => success_with_metadata(
+            "apply_patch",
+            apply_patch::model_output(&applied),
+            apply_patch::diff_metadata(&applied),
+        ),
         Err(error) => failure("apply_patch", error),
     }
 }
@@ -1736,7 +1740,75 @@ pub(crate) fn success(tool: &str, output: String) -> ToolResult {
         success: true,
         output,
         error: None,
+        metadata: None,
     }
+}
+
+pub(crate) fn success_with_metadata(
+    tool: &str,
+    output: String,
+    metadata: serde_json::Value,
+) -> ToolResult {
+    ToolResult {
+        tool: tool.to_string(),
+        success: true,
+        output,
+        error: None,
+        metadata: Some(metadata),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolDiff {
+    pub diff: String,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+pub(crate) fn unified_diff(path: &str, before: Option<&str>, after: Option<&str>) -> ToolDiff {
+    if before == after {
+        return ToolDiff {
+            diff: String::new(),
+            additions: 0,
+            deletions: 0,
+        };
+    }
+
+    let before_lines = before.map(split_diff_lines).unwrap_or_default();
+    let after_lines = after.map(split_diff_lines).unwrap_or_default();
+    let before_start = if before_lines.is_empty() { 0 } else { 1 };
+    let after_start = if after_lines.is_empty() { 0 } else { 1 };
+    let mut diff = format!(
+        "--- a/{path}\n+++ b/{path}\n@@ -{},{} +{},{} @@\n",
+        before_start,
+        before_lines.len(),
+        after_start,
+        after_lines.len(),
+    );
+
+    for line in &before_lines {
+        diff.push('-');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    for line in &after_lines {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+
+    ToolDiff {
+        diff,
+        additions: after_lines.len(),
+        deletions: before_lines.len(),
+    }
+}
+
+fn split_diff_lines(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.lines().map(str::to_string).collect()
 }
 
 pub(crate) fn failure(tool: &str, error: String) -> ToolResult {
@@ -1745,6 +1817,7 @@ pub(crate) fn failure(tool: &str, error: String) -> ToolResult {
         success: false,
         output: String::new(),
         error: Some(error),
+        metadata: None,
     }
 }
 

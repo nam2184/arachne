@@ -3,7 +3,9 @@ use std::path::Path;
 use crate::file_mutation::FileMutationService;
 use crate::{ToolCall, ToolResult};
 
-use super::{failure, resolve_session_path, string_arg, success, ToolContext};
+use super::{
+    failure, resolve_session_path, string_arg, success_with_metadata, unified_diff, ToolContext,
+};
 
 pub fn run(call: &ToolCall) -> ToolResult {
     run_with_context(call, &ToolContext::default())
@@ -22,9 +24,22 @@ pub fn run_with_path(call: &ToolCall, path: &Path) -> ToolResult {
         Ok(target) => target,
         Err(error) => return failure("write", error.to_string()),
     };
+    let before = std::fs::read_to_string(&target.canonical).ok();
 
     match mutation.write_text_preserving_bom(&target, &content) {
-        Ok(_) => success("write", format!("Wrote {}", target.canonical.display())),
+        Ok(_) => {
+            let diff = unified_diff(&target.resource, before.as_deref(), Some(&content));
+            success_with_metadata(
+                "write",
+                format!("Wrote {}", target.canonical.display()),
+                serde_json::json!({
+                    "file": target.resource,
+                    "diff": diff.diff,
+                    "additions": diff.additions,
+                    "deletions": diff.deletions,
+                }),
+            )
+        }
         Err(error) => failure("write", error.to_string()),
     }
 }

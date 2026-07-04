@@ -10,7 +10,7 @@ import {
 } from "@/features/sessions/providerModels";
 import type { ProviderAuthState, ProviderConfig, ProviderOAuthAuthorization } from "@/features/sessions/sessionStore";
 import { cn } from "@/lib/utils";
-import { useAppStore, type NodeSkin, type WorkspaceMode } from "@/features/app/appStore";
+import { CODE_BLOCK_THEMES, CURSOR_THEMES, useAppStore, type CodeBlockTheme, type CursorTheme, type NodeSkin, type WorkspaceMode } from "@/features/app/appStore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
@@ -35,7 +35,7 @@ const emptyProviderDraft: ProviderDraft = {
 };
 
 export function SettingsPage() {
-  const { settings, saveTheme, saveNodeSkin, saveWorkspaceMode, saveWebSearchSettings, setView } = useAppStore();
+  const { settings, saveTheme, saveNodeSkin, saveWorkspaceMode, saveCodeBlockTheme, saveCursorTheme, saveWebSearchSettings, setView } = useAppStore();
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [providerAuthStates, setProviderAuthStates] = useState<Map<string, ProviderAuthState>>(() => new Map());
   const [selectedProviderName, setSelectedProviderName] = useState("");
@@ -225,7 +225,7 @@ export function SettingsPage() {
           <section className="space-y-4">
             <h2 className="text-sm font-medium text-[var(--text-secondary)]">Appearance</h2>
             <div className="rounded-none border border-[var(--border)] bg-[var(--surface-raised)] p-4">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-4">
                 <div>
                   <p className="text-sm font-medium">Theme</p>
                   <p className="text-xs text-[var(--text-subtle)]">Choose your preferred color scheme</p>
@@ -237,6 +237,48 @@ export function SettingsPage() {
                     <Sun className="h-4 w-4" />
                   )}
                 </Button>
+              </div>
+              <label className="mt-4 block space-y-1.5">
+                <span className="text-xs font-medium text-[var(--text-secondary)]">Code block theme</span>
+                <select
+                  value={settings.code_block_theme}
+                  onChange={(event: ChangeEvent<HTMLSelectElement>) => saveCodeBlockTheme(event.target.value as CodeBlockTheme)}
+                  className="h-9 w-full rounded-none border border-[var(--input-border)] bg-[var(--input-bg)] px-3 text-sm text-[var(--foreground)] outline-none transition-colors hover:border-[var(--node-border-hover)] focus:border-[var(--foreground)]"
+                >
+                  {CODE_BLOCK_THEMES.map((theme) => (
+                    <option key={theme.value} value={theme.value}>{theme.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="mt-4 block space-y-1.5">
+                <span className="text-xs font-medium text-[var(--text-secondary)]">Cursor design</span>
+                <select
+                  value={settings.cursor_theme}
+                  onChange={(event: ChangeEvent<HTMLSelectElement>) => saveCursorTheme(event.target.value as CursorTheme)}
+                  className="h-9 w-full rounded-none border border-[var(--input-border)] bg-[var(--input-bg)] px-3 text-sm text-[var(--foreground)] outline-none transition-colors hover:border-[var(--node-border-hover)] focus:border-[var(--foreground)]"
+                >
+                  {CURSOR_THEMES.map((theme) => (
+                    <option key={theme.value} value={theme.value}>{theme.label}</option>
+                  ))}
+                </select>
+              </label>
+              <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-5">
+                {CURSOR_THEMES.map((theme) => (
+                  <button
+                    key={theme.value}
+                    type="button"
+                    onClick={() => saveCursorTheme(theme.value)}
+                    className={cn(
+                      "cursor-preview flex min-h-20 flex-col justify-between rounded-none border bg-[var(--surface)] p-2 text-left transition-colors hover:border-[var(--node-border-hover)]",
+                      `cursor-preview-${theme.value}`,
+                      settings.cursor_theme === theme.value ? "border-[var(--foreground)]" : "border-[var(--border)]",
+                    )}
+                  >
+                    <span className="text-[11px] font-medium text-[var(--foreground)]">{theme.label}</span>
+                    <span className="text-[10px] leading-snug text-[var(--text-muted)]">{theme.description}</span>
+                    <span className="font-mono text-[10px] text-[var(--node-focus)]">hover</span>
+                  </button>
+                ))}
               </div>
             </div>
           </section>

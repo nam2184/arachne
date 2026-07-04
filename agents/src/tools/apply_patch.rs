@@ -5,7 +5,10 @@ use crate::patch::{self, Hunk};
 use crate::sandbox::{trigger_access, AccessDecision, AccessRequest};
 use crate::{ToolCall, ToolResult};
 
-use super::{failure, resolve_session_path, success, SandboxedContext, ToolContext};
+use super::{
+    failure, resolve_session_path, success_with_metadata, unified_diff, SandboxedContext,
+    ToolContext,
+};
 
 pub fn run(call: &ToolCall) -> ToolResult {
     run_with_context(call, &ToolContext::default())
@@ -23,7 +26,11 @@ pub fn run_with_context(call: &ToolCall, ctx: &ToolContext) -> ToolResult {
         Some(ctx.project_root.clone())
     };
     match apply_patch_in(&patch_text, cwd.as_deref()) {
-        Ok(applied) => success("apply_patch", model_output(&applied)),
+        Ok(applied) => success_with_metadata(
+            "apply_patch",
+            model_output(&applied),
+            diff_metadata(&applied),
+        ),
         Err(error) => failure("apply_patch", error),
     }
 }
@@ -169,7 +176,8 @@ async fn prepare_hunk_sandboxed(
         }
         Hunk::Delete { .. } => {
             require_file(&target)?;
-            Ok(PreparedPatch::Delete { target })
+            let expected = std::fs::read(&target.canonical).map_err(|error| error.to_string())?;
+            Ok(PreparedPatch::Delete { target, expected })
         }
         Hunk::Update { path, chunks, .. } => {
             require_file(&target)?;
@@ -299,6 +307,9 @@ pub struct AppliedPatch {
     pub kind: AppliedPatchKind,
     pub resource: String,
     pub target: String,
+    pub diff: String,
+    pub additions: usize,
+    pub deletions: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -321,6 +332,7 @@ enum PreparedPatch {
     },
     Delete {
         target: FileTarget,
+        expected: Vec<u8>,
     },
 }
 
@@ -329,7 +341,7 @@ impl PreparedPatch {
         match self {
             PreparedPatch::Add { target, .. } => &target.resource,
             PreparedPatch::Update { path, .. } => path,
-            PreparedPatch::Delete { target } => &target.resource,
+            PreparedPatch::Delete { target, .. } => &target.resource,
         }
     }
 }
@@ -380,7 +392,8 @@ fn prepare_hunk_in(
         Hunk::Delete { path } => {
             let target = resolve(&path)?;
             require_file(&target)?;
-            Ok(PreparedPatch::Delete { target })
+            let expected = std::fs::read(&target.canonical).map_err(|error| error.to_string())?;
+            Ok(PreparedPatch::Delete { target, expected })
         }
         Hunk::Update { path, chunks, .. } => {
             let target = resolve(&path)?;
@@ -406,11 +419,13 @@ fn apply_prepared(
 ) -> Result<AppliedPatch, FileMutationError> {
     match change {
         PreparedPatch::Add { target, content } => {
+            let diff = diff_for_bytes(&target.resource, None, Some(content));
             let result = mutation.create(target, content)?;
             Ok(applied(
                 AppliedPatchKind::Add,
                 result.resource,
                 result.target,
+                diff,
             ))
         }
         PreparedPatch::Update {
@@ -419,19 +434,23 @@ fn apply_prepared(
             content,
             ..
         } => {
+            let diff = diff_for_bytes(&target.resource, Some(expected), Some(content));
             let result = mutation.write_if_unmodified(target, expected, content)?;
             Ok(applied(
                 AppliedPatchKind::Update,
                 result.resource,
                 result.target,
+                diff,
             ))
         }
-        PreparedPatch::Delete { target } => {
+        PreparedPatch::Delete { target, expected } => {
+            let diff = diff_for_bytes(&target.resource, Some(expected), None);
             let result = mutation.remove(target)?;
             Ok(applied(
                 AppliedPatchKind::Delete,
                 result.resource,
                 result.target,
+                diff,
             ))
         }
     }
@@ -446,12 +465,42 @@ fn require_file(target: &FileTarget) -> Result<(), String> {
     }
 }
 
-fn applied(kind: AppliedPatchKind, resource: String, target: std::path::PathBuf) -> AppliedPatch {
+fn applied(
+    kind: AppliedPatchKind,
+    resource: String,
+    target: std::path::PathBuf,
+    diff: super::ToolDiff,
+) -> AppliedPatch {
     AppliedPatch {
         kind,
         resource,
         target: target.to_string_lossy().to_string(),
+        diff: diff.diff,
+        additions: diff.additions,
+        deletions: diff.deletions,
     }
+}
+
+fn diff_for_bytes(path: &str, before: Option<&[u8]>, after: Option<&[u8]>) -> super::ToolDiff {
+    let before = before.and_then(|value| std::str::from_utf8(value).ok());
+    let after = after.and_then(|value| std::str::from_utf8(value).ok());
+    unified_diff(path, before, after)
+}
+
+pub(crate) fn diff_metadata(applied: &[AppliedPatch]) -> serde_json::Value {
+    serde_json::json!({
+        "diff": applied.iter().map(|item| item.diff.as_str()).collect::<Vec<_>>().join("\n"),
+        "additions": applied.iter().map(|item| item.additions).sum::<usize>(),
+        "deletions": applied.iter().map(|item| item.deletions).sum::<usize>(),
+        "files": applied.iter().map(|item| {
+            serde_json::json!({
+                "file": item.resource,
+                "diff": item.diff,
+                "additions": item.additions,
+                "deletions": item.deletions,
+            })
+        }).collect::<Vec<_>>(),
+    })
 }
 
 fn partial_error(applied: &[AppliedPatch], path: &str, error: FileMutationError) -> String {

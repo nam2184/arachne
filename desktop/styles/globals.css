@@ -31,6 +31,17 @@
     --scrollbar-track: transparent;
     --scrollbar-thumb: #2d2d2d;
     --scrollbar-thumb-hover: #5a5a5a;
+    --cursor-app-default: default;
+    --cursor-app-pointer: pointer;
+    --cursor-app-canvas: grab;
+    --cursor-app-canvas-active: grabbing;
+    --cursor-svg-pixel-default: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' shape-rendering='crispEdges'%3E%3Cpath d='M3 2h3v2h2v2h2v2h2v2h2v2h2v2h-6v2h-2v6H6v-6H4V2z' fill='%23000000'/%3E%3Cpath d='M5 5h2v2h2v2h2v2h2v1H9v2H7v4H6v-4H5V5z' fill='%23ffffff'/%3E%3Cpath d='M10 14h3v2h-3z' fill='%237ddc8a'/%3E%3C/svg%3E") 3 2, default;
+    --cursor-svg-pixel-pointer: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' shape-rendering='crispEdges'%3E%3Cpath d='M8 1h5v10h2V8h4v9h-2v3H8v-2H6v-6h2V1z' fill='%23000000'/%3E%3Cpath d='M10 3h1v10h2v-3h1v4h1v-3h1v4h1v-5h1v6h-2v3H9v-2H8v-4h2V3z' fill='%23ffffff'/%3E%3Cpath d='M10 3h1v7h-1zM14 11h1v4h-1zM17 11h1v5h-1z' fill='%237ddc8a'/%3E%3C/svg%3E") 10 3, pointer;
+    --cursor-svg-terminal-default: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' shape-rendering='crispEdges'%3E%3Crect x='2' y='2' width='14' height='18' fill='%23000000'/%3E%3Crect x='4' y='4' width='10' height='14' fill='%23ffffff'/%3E%3Crect x='6' y='6' width='6' height='2' fill='%23000000'/%3E%3Crect x='6' y='14' width='6' height='2' fill='%237ddc8a'/%3E%3Crect x='14' y='18' width='6' height='3' fill='%23000000'/%3E%3C/svg%3E") 4 4, default;
+    --cursor-svg-terminal-pointer: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' shape-rendering='crispEdges'%3E%3Crect x='5' y='3' width='14' height='14' fill='%23000000'/%3E%3Crect x='7' y='5' width='10' height='10' fill='%23ffffff'/%3E%3Crect x='9' y='7' width='6' height='2' fill='%237ddc8a'/%3E%3Crect x='9' y='11' width='4' height='2' fill='%23000000'/%3E%3Crect x='10' y='17' width='7' height='3' fill='%23000000'/%3E%3C/svg%3E") 12 10, pointer;
+    --cursor-svg-crosshair: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='25' height='25' viewBox='0 0 25 25' shape-rendering='crispEdges'%3E%3Cpath d='M11 0h3v9h-3V0zM11 16h3v9h-3v-9zM0 11h9v3H0v-3zM16 11h9v3h-9v-3z' fill='%23000000'/%3E%3Cpath d='M12 1h1v8h-1V1zM12 16h1v8h-1v-8zM1 12h8v1H1v-1zM16 12h8v1h-8v-1z' fill='%23ffffff'/%3E%3Crect x='11' y='11' width='3' height='3' fill='%237ddc8a'/%3E%3C/svg%3E") 12 12, crosshair;
+    --cursor-svg-blade-default: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' shape-rendering='crispEdges'%3E%3Cpath d='M4 2h4v2h2v2h2v2h2v2h2v2h2v4h-7v2H9v4H5V2z' fill='%23000000'/%3E%3Cpath d='M6 5h2v2h2v2h2v2h2v2h-5v2H8v3H7V5z' fill='%23ffffff'/%3E%3Cpath d='M12 13h4v2h-4z' fill='%237ddc8a'/%3E%3C/svg%3E") 5 3, default;
+    --cursor-svg-blade-pointer: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' shape-rendering='crispEdges'%3E%3Cpath d='M6 2h4v8h3V7h4v3h2v8h-2v3H8v-2H6V2z' fill='%23000000'/%3E%3Cpath d='M8 4h1v9h4v-3h1v5h1v-4h1v5h1v-4h1v5h-2v3H9v-2H8V4z' fill='%23ffffff'/%3E%3Cpath d='M9 4h1v6H9zM15 11h1v5h-1z' fill='%237ddc8a'/%3E%3C/svg%3E") 8 4, pointer;
   }
 
   :root.light {
@@ -79,9 +90,73 @@
     -moz-osx-font-smoothing: grayscale;
   }
 
+  :root.cursor-pixel-arrow {
+    --cursor-app-default: var(--cursor-svg-pixel-default);
+    --cursor-app-pointer: var(--cursor-svg-pixel-pointer);
+    --cursor-app-canvas: var(--cursor-svg-crosshair);
+    --cursor-app-canvas-active: var(--cursor-svg-pixel-pointer);
+  }
+
+  :root.cursor-terminal {
+    --cursor-app-default: var(--cursor-svg-terminal-default);
+    --cursor-app-pointer: var(--cursor-svg-terminal-pointer);
+    --cursor-app-canvas: var(--cursor-svg-crosshair);
+    --cursor-app-canvas-active: var(--cursor-svg-terminal-pointer);
+  }
+
+  :root.cursor-crosshair {
+    --cursor-app-default: var(--cursor-svg-crosshair);
+    --cursor-app-pointer: var(--cursor-svg-pixel-pointer);
+    --cursor-app-canvas: var(--cursor-svg-crosshair);
+    --cursor-app-canvas-active: var(--cursor-svg-crosshair);
+  }
+
+  :root.cursor-blade {
+    --cursor-app-default: var(--cursor-svg-blade-default);
+    --cursor-app-pointer: var(--cursor-svg-blade-pointer);
+    --cursor-app-canvas: var(--cursor-svg-crosshair);
+    --cursor-app-canvas-active: var(--cursor-svg-blade-pointer);
+  }
+
   body,
   #root {
     min-height: 100vh;
+    cursor: var(--cursor-app-default);
+  }
+
+  a,
+  button,
+  label,
+  select,
+  [role="button"],
+  [role="menuitem"],
+  .react-flow__node,
+  .react-flow__handle,
+  .react-flow__controls-button {
+    cursor: var(--cursor-app-pointer);
+  }
+
+  input,
+  textarea,
+  [contenteditable="true"] {
+    cursor: text;
+  }
+
+  .react-flow,
+  .react-flow__pane,
+  .react-flow__viewport {
+    cursor: var(--cursor-app-canvas);
+  }
+
+  .react-flow__pane.selection,
+  .react-flow__pane.dragging,
+  .react-flow__node.dragging,
+  .cursor-grabbing {
+    cursor: var(--cursor-app-canvas-active) !important;
+  }
+
+  .cursor-grab {
+    cursor: var(--cursor-app-canvas) !important;
   }
 
   button,
@@ -121,6 +196,63 @@
     background: transparent;
   }
 
+  [data-radix-scroll-area-viewport] > div {
+    display: block !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+  }
+
+}
+
+@layer utilities {
+  .cursor-pointer {
+    cursor: var(--cursor-app-pointer) !important;
+  }
+
+  .cursor-grab {
+    cursor: var(--cursor-app-canvas) !important;
+  }
+
+  .cursor-grabbing {
+    cursor: var(--cursor-app-canvas-active) !important;
+  }
+
+  .cursor-col-resize {
+    cursor: col-resize;
+  }
+
+  .react-flow,
+  .react-flow__pane,
+  .react-flow__viewport {
+    cursor: var(--cursor-app-canvas) !important;
+  }
+
+  .react-flow__node,
+  .react-flow__handle,
+  .react-flow__controls-button {
+    cursor: var(--cursor-app-pointer) !important;
+  }
+
+  .cursor-preview-react-flow {
+    cursor: pointer !important;
+  }
+
+  .cursor-preview-pixel-arrow {
+    cursor: var(--cursor-svg-pixel-pointer) !important;
+  }
+
+  .cursor-preview-terminal {
+    cursor: var(--cursor-svg-terminal-pointer) !important;
+  }
+
+  .cursor-preview-crosshair {
+    cursor: var(--cursor-svg-crosshair) !important;
+  }
+
+  .cursor-preview-blade {
+    cursor: var(--cursor-svg-blade-pointer) !important;
+  }
 }
 
 @layer components {
@@ -216,6 +348,9 @@
   }
 
   .markdown-content pre {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
     max-width: 100%;
     overflow-x: auto;
     border: 1px solid var(--border);
@@ -227,7 +362,61 @@
     color: var(--text-secondary);
   }
 
+  .markdown-content [data-component="markdown-code"] {
+    --code-block-bg: var(--surface-raised);
+    position: relative;
+    contain: inline-size;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  .markdown-content [data-component="markdown-code"] pre {
+    margin-bottom: 0.75rem;
+    padding-right: 3.5rem;
+  }
+
+  .markdown-content .shiki {
+    --shiki-light-bg: var(--code-block-bg) !important;
+    --shiki-dark-bg: var(--code-block-bg) !important;
+    width: 100%;
+    min-width: 0;
+    background-color: var(--code-block-bg) !important;
+  }
+
+  .markdown-content .shiki span {
+    background-color: var(--code-block-bg) !important;
+  }
+
+  .markdown-content [data-slot="markdown-copy-button"] {
+    position: absolute;
+    right: 0.4rem;
+    top: 0.4rem;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    padding: 0.1rem 0.35rem;
+    font-family: theme("fontFamily.sans");
+    font-size: 0.72rem;
+    line-height: 1.25;
+    color: var(--text-muted);
+    opacity: 0;
+    transition: opacity 0.12s ease, color 0.12s ease;
+  }
+
+  .markdown-content [data-component="markdown-code"]:hover [data-slot="markdown-copy-button"],
+  .markdown-content [data-slot="markdown-copy-button"]:focus-visible {
+    opacity: 1;
+  }
+
+  .markdown-content [data-slot="markdown-copy-button"]:hover {
+    color: var(--foreground);
+  }
+
   .markdown-content pre code {
+    display: block;
+    min-width: 0;
+    max-width: none;
     font: inherit;
     color: inherit;
     white-space: pre;
@@ -281,5 +470,66 @@
   .markdown-content-thinking pre,
   .markdown-content-thinking :not(pre) > code {
     color: var(--text-muted);
+  }
+
+  .themed-code-block {
+    --code-block-bg: var(--input-bg);
+    contain: inline-size;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  .themed-code-block pre,
+  .themed-code-block-fallback {
+    --shiki-light-bg: var(--code-block-bg) !important;
+    --shiki-dark-bg: var(--code-block-bg) !important;
+    box-sizing: border-box;
+    max-height: inherit;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    overflow: auto;
+    border: 1px solid var(--border);
+    background-color: var(--code-block-bg) !important;
+    margin: 0;
+    padding: 0.75rem;
+    font-family: theme("fontFamily.mono");
+    font-size: 0.92em;
+    line-height: 1.55;
+  }
+
+  .themed-code-block code,
+  .themed-code-block-fallback code {
+    display: block;
+    min-width: 0;
+    max-width: none;
+    font: inherit;
+    white-space: pre;
+  }
+
+  .themed-code-block .shiki span {
+    background-color: var(--code-block-bg) !important;
+  }
+
+  :root.light .markdown-content .shiki,
+  :root.light .markdown-content .shiki span,
+  :root.light .themed-code-block .shiki,
+  :root.light .themed-code-block .shiki span {
+    color: var(--shiki-light) !important;
+    font-style: var(--shiki-light-font-style) !important;
+    font-weight: var(--shiki-light-font-weight) !important;
+    text-decoration: var(--shiki-light-text-decoration) !important;
+  }
+
+  :root:not(.light) .markdown-content .shiki,
+  :root:not(.light) .markdown-content .shiki span,
+  :root:not(.light) .themed-code-block .shiki,
+  :root:not(.light) .themed-code-block .shiki span {
+    color: var(--shiki-dark) !important;
+    font-style: var(--shiki-dark-font-style) !important;
+    font-weight: var(--shiki-dark-font-weight) !important;
+    text-decoration: var(--shiki-dark-text-decoration) !important;
   }
 }

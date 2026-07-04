@@ -15,6 +15,10 @@ pub struct AppSettings {
     pub node_skin: String,
     #[serde(default = "default_workspace_mode")]
     pub workspace_mode: String,
+    #[serde(default = "default_code_block_theme")]
+    pub code_block_theme: String,
+    #[serde(default = "default_cursor_theme")]
+    pub cursor_theme: String,
     #[serde(default)]
     pub searxng_base_url: Option<String>,
     #[serde(default = "default_websearch_max_results")]
@@ -36,6 +40,12 @@ fn default_node_skin() -> String {
 fn default_workspace_mode() -> String {
     "canvas".to_string()
 }
+fn default_code_block_theme() -> String {
+    "github".to_string()
+}
+fn default_cursor_theme() -> String {
+    "react-flow".to_string()
+}
 fn default_websearch_max_results() -> u32 {
     5
 }
@@ -48,6 +58,8 @@ impl Default for AppSettings {
             editor_tab_size: 2,
             node_skin: "default".to_string(),
             workspace_mode: "canvas".to_string(),
+            code_block_theme: default_code_block_theme(),
+            cursor_theme: default_cursor_theme(),
             searxng_base_url: None,
             websearch_max_results: default_websearch_max_results(),
         }
