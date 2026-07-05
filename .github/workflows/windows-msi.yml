@@ -1,0 +1,92 @@
+name: Build Windows MSI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, without the leading v"
+        required: true
+        type: string
+      draft:
+        description: "Create the GitHub release as a draft"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-msi:
+    name: Build MSI
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate version
+        shell: pwsh
+        run: |
+          if ("${{ inputs.version }}" -notmatch '^\d+\.\d+\.\d+$') {
+            throw "MSI version must be major.minor.patch, for example 0.2.0"
+          }
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            src-tauri
+            agents
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply release version
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.version }}"
+
+          npm version $version --no-git-tag-version --allow-same-version
+
+          $tauriConfigPath = "src-tauri/tauri.conf.json"
+          $tauriConfig = Get-Content $tauriConfigPath -Raw | ConvertFrom-Json
+          $tauriConfig.version = $version
+          $tauriConfig | ConvertTo-Json -Depth 100 | Set-Content $tauriConfigPath
+
+          $cargoTomlPath = "src-tauri/Cargo.toml"
+          $cargoToml = Get-Content $cargoTomlPath -Raw
+          $cargoToml = $cargoToml -replace '(?m)^version = ".*"', "version = `"$version`""
+          Set-Content $cargoTomlPath $cargoToml
+
+      - name: Build MSI package
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v${{ inputs.version }}
+          releaseName: Arachne v${{ inputs.version }}
+          releaseBody: |
+            Windows MSI installer for Arachne v${{ inputs.version }}.
+
+            This release was built from GitHub Actions with the version supplied at dispatch time.
+          releaseDraft: ${{ inputs.draft }}
+          prerelease: false
+          args: --features prod-logs --bundles msi
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arachne-${{ inputs.version }}-windows-msi
+          path: src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
