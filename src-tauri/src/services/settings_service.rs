@@ -1,7 +1,10 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use arachne_agents::{McpConfig, McpServerConfig, RuntimeConfig, RuntimeWebSearchConfig, UiConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -23,6 +26,8 @@ pub struct AppSettings {
     pub searxng_base_url: Option<String>,
     #[serde(default = "default_websearch_max_results")]
     pub websearch_max_results: u32,
+    #[serde(default)]
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
 fn default_theme() -> String {
@@ -62,21 +67,9 @@ impl Default for AppSettings {
             cursor_theme: default_cursor_theme(),
             searxng_base_url: None,
             websearch_max_results: default_websearch_max_results(),
+            mcp_servers: BTreeMap::new(),
         }
     }
-}
-
-fn apply_websearch_env(settings: &AppSettings) {
-    match settings.searxng_base_url.as_deref().map(str::trim) {
-        Some(base_url) if !base_url.is_empty() => std::env::set_var("SEARXNG_BASE_URL", base_url),
-        Some(_) => std::env::remove_var("SEARXNG_BASE_URL"),
-        None => {}
-    }
-
-    std::env::set_var(
-        "SEARXNG_MAX_RESULTS",
-        settings.websearch_max_results.clamp(1, 20).to_string(),
-    );
 }
 
 pub struct SettingsService {
@@ -95,7 +88,6 @@ impl SettingsService {
 
     pub fn load(&self) -> Result<(), String> {
         if !self.config_path.exists() {
-            apply_websearch_env(&self.settings.read());
             return Ok(());
         }
 
@@ -105,7 +97,6 @@ impl SettingsService {
         let settings: AppSettings = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse settings: {}", e))?;
 
-        apply_websearch_env(&settings);
         *self.settings.write() = settings;
         Ok(())
     }
@@ -127,9 +118,40 @@ impl SettingsService {
         self.settings.read().clone()
     }
 
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
     pub fn update_settings(&self, updates: AppSettings) {
-        apply_websearch_env(&updates);
         *self.settings.write() = updates;
+    }
+
+    pub fn runtime_config(&self) -> RuntimeConfig {
+        let settings = self.settings.read();
+        RuntimeConfig {
+            ui: UiConfig {
+                theme: Some(settings.theme.clone()),
+                editor_font_size: Some(settings.editor_font_size),
+                editor_tab_size: Some(settings.editor_tab_size),
+                node_skin: Some(settings.node_skin.clone()),
+                workspace_mode: Some(settings.workspace_mode.clone()),
+                code_block_theme: Some(settings.code_block_theme.clone()),
+                cursor_theme: Some(settings.cursor_theme.clone()),
+            },
+            websearch: RuntimeWebSearchConfig {
+                searxng_base_url: settings
+                    .searxng_base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string),
+                max_results: Some(settings.websearch_max_results.clamp(1, 20) as usize),
+            },
+            mcp: McpConfig {
+                servers: settings.mcp_servers.clone(),
+            },
+            ..RuntimeConfig::default()
+        }
     }
 }
 

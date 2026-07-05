@@ -50,6 +50,7 @@ export type AgentStreamEvent =
   | { type: "llm_event"; session_id: string; step: number; event: AgentLlmEvent }
   | { type: "finished"; session_id: string; response: string }
   | { type: "session_diff"; session_id: string; message_id: string; diff: SessionFileDiff[] }
+  | { type: "stopped"; session_id: string }
   | { type: "error"; session_id: string; message: string };
 
 interface ConversationState {

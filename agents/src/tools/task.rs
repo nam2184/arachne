@@ -22,7 +22,7 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use crate::database::{Database, ProjectRepository, SessionGroupRepository, SessionRepository};
-use crate::llm::session::SessionRunner;
+use crate::llm::session::{SessionCancelToken, SessionRunner};
 use crate::llm::{ChildCompletion, ChildKind, ProviderRegistry};
 use crate::permission_v2::{default_ruleset, PermissionService};
 use crate::sandbox::SandboxPolicy;
@@ -231,7 +231,18 @@ async fn run_child_foreground(
         }
     };
 
-    match Box::pin(runner.run(&child_id)).await {
+    let cancellation = SessionCancelToken::new();
+    ephemeral
+        .runtime
+        .subagent_registry
+        .register_cancellation(&child_id, cancellation.clone());
+    let result = Box::pin(runner.with_cancellation(cancellation).run(&child_id)).await;
+    ephemeral
+        .runtime
+        .subagent_registry
+        .unregister_cancellation(&child_id);
+
+    match result {
         Ok(_result) => {
             // Extract the last assistant text from the child's
             // conversation.
@@ -297,6 +308,8 @@ fn prepare_ephemeral_child_runtime(
             subagent_registry: Arc::clone(&runtime.subagent_registry),
             mode: runtime.mode,
             turn_id: runtime.turn_id,
+            runtime_config: runtime.runtime_config.clone(),
+            mcp_manager: Arc::clone(&runtime.mcp_manager),
             project_root: runtime.project_root.clone(),
         },
         _db_dir: db_dir,

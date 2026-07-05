@@ -251,6 +251,8 @@ pub struct ToolRuntime {
     pub subagent_registry: Arc<SubagentRegistry>,
     pub mode: PermissionMode,
     pub turn_id: u64,
+    pub runtime_config: crate::config::RuntimeConfig,
+    pub mcp_manager: Arc<crate::mcp::McpManager>,
     /// Project root for the caller's session. Propagated into the
     /// `ToolContext` used for non-task tools so file-system tools
     /// (read, glob, grep, …) resolve relative paths against the
@@ -321,6 +323,7 @@ pub struct SandboxedContext {
     pub network_policy: NetworkPolicy,
     pub permissions: Arc<V2PermissionService>,
     pub doom: Arc<DoomLoopDetector>,
+    pub runtime_config: crate::config::RuntimeConfig,
     pub session_service: Option<Arc<crate::SessionService>>,
     pub caller_session_id: Option<String>,
 }
@@ -334,6 +337,7 @@ impl SandboxedContext {
             network_policy: NetworkPolicy::new(),
             permissions,
             doom: Arc::new(DoomLoopDetector::default()),
+            runtime_config: crate::config::RuntimeConfig::default(),
             session_service: None,
             caller_session_id: None,
         }
@@ -351,6 +355,11 @@ impl SandboxedContext {
 
     pub fn with_shell_timeout(mut self, timeout: Duration) -> Self {
         self.shell_policy = self.shell_policy.with_timeout(timeout);
+        self
+    }
+
+    pub fn with_runtime_config(mut self, runtime_config: crate::config::RuntimeConfig) -> Self {
+        self.runtime_config = runtime_config;
         self
     }
 
@@ -450,13 +459,28 @@ pub async fn run_tool_async(call: &ToolCall, runtime: &ToolRuntime) -> ToolResul
         return failure(&call.name, error.to_string());
     }
 
+    if crate::mcp::is_mcp_tool_name(&call.name) {
+        if runtime.mode != PermissionMode::Build {
+            return failure(
+                &call.name,
+                "MCP tools are only available in build mode".to_string(),
+            );
+        }
+        return runtime
+            .mcp_manager
+            .run_tool_call(call, &runtime.runtime_config)
+            .await;
+    }
+
     match call.name.as_str() {
         "task" => task::run_async(call, runtime.clone()).await,
         // Network tools perform real HTTP requests. Doing them on the
         // async path keeps the executor unblocked. It doesn't need
         // the `ToolRuntime` (no sub-sessions, no message bus).
         "webfetch" => webfetch::run_async(call).await,
-        "websearch" => websearch::run_async(call).await,
+        "websearch" => {
+            websearch::run_async_with_runtime_config(call, &runtime.runtime_config).await
+        }
         // Everything else: defer to the sync path. The caller is already
         // running in an async context, but the underlying tool is sync.
         // Thread the caller's project_root through so file-system
@@ -485,6 +509,19 @@ pub async fn run_tool_async_sandboxed(
         {
             return failure(&call.name, error);
         }
+    }
+
+    if crate::mcp::is_mcp_tool_name(&call.name) {
+        if runtime.mode != PermissionMode::Build {
+            return failure(
+                &call.name,
+                "MCP tools are only available in build mode".to_string(),
+            );
+        }
+        return runtime
+            .mcp_manager
+            .run_tool_call(call, &runtime.runtime_config)
+            .await;
     }
 
     match call.name.as_str() {
@@ -530,7 +567,8 @@ async fn dispatch_peer_tool_if_requested(
         let peer_ctx = SandboxedContext::new(
             SandboxPolicy::new(peer_directory),
             Arc::clone(&parent_ctx.permissions),
-        );
+        )
+        .with_runtime_config(parent_ctx.runtime_config.clone());
         run_tool_sandboxed(&peer_call, &peer_ctx).await
     } else {
         let ctx = ToolContext::new(runtime.mode).with_project_root(peer_directory);
@@ -1003,7 +1041,9 @@ fn websearch_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> ToolResult {
     if query.trim().is_empty() {
         return failure("websearch", "query is required".to_string());
     }
-    let config = match websearch::config_from_env() {
+    let config = match websearch::config_from_runtime(&ctx.runtime_config)
+        .or_else(|_| websearch::config_from_env())
+    {
         Ok(config) => config,
         Err(error) => return failure("websearch", error),
     };
@@ -1022,7 +1062,9 @@ async fn websearch_async_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> T
     if query.trim().is_empty() {
         return failure("websearch", "query is required".to_string());
     }
-    let config = match websearch::config_from_env() {
+    let config = match websearch::config_from_runtime(&ctx.runtime_config)
+        .or_else(|_| websearch::config_from_env())
+    {
         Ok(config) => config,
         Err(error) => return failure("websearch", error),
     };
@@ -1239,6 +1281,8 @@ mod tests {
             subagent_registry: registry,
             mode: PermissionMode::Plan,
             turn_id: 17,
+            runtime_config: crate::config::RuntimeConfig::default(),
+            mcp_manager: Arc::new(crate::mcp::McpManager::new()),
             project_root: caller_dir.path().to_path_buf(),
         };
         let (permissions, rx) = PermissionService::new("peer-fixture", default_ruleset());
@@ -1491,6 +1535,8 @@ mod tests {
             subagent_registry: registry.clone(),
             mode: PermissionMode::Plan,
             turn_id: 11,
+            runtime_config: crate::config::RuntimeConfig::default(),
+            mcp_manager: Arc::new(crate::mcp::McpManager::new()),
             project_root: caller_dir.path().to_path_buf(),
         };
         let (permissions, rx) = PermissionService::new("peer-read-test", default_ruleset());

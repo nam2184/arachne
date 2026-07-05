@@ -10,7 +10,9 @@ use aisdk::core::{
 use aisdk::providers::OpenAICompatible;
 
 use super::error_parsing::{format_provider_error, parse_provider_error_body};
+#[cfg(test)]
 use super::tool_registry::build_sdk_tool;
+use super::tool_registry::build_sdk_tool_for_definition;
 use super::{LlmError, LlmProvider, LlmStream, ToolDispatcherFn};
 use crate::llm::events::{FinishReason, LlmEvent, ToolResultValue};
 use crate::llm::request::{ContentPart, LlmRequest};
@@ -282,7 +284,8 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
                 // is the AISDK `Tool::builder().name(...).description(
                 // ...).input_schema(...).execute(...)` pattern from
                 // the AISDK docs.
-                builder = builder.with_tool(build_sdk_tool(&tool.name, dispatcher.clone())?);
+                builder =
+                    builder.with_tool(build_sdk_tool_for_definition(tool, dispatcher.clone())?);
             }
             // Stop after one tool-call round so the runner drives the
             // next round-trip. The runner already persists `ToolCall`
@@ -484,7 +487,7 @@ impl LlmProvider for OpenAiCompatibleSdkProvider {
 
         Ok(LlmStream {
             events: Box::pin(stream),
-            abort_tx: None::<Arc<tokio::sync::oneshot::Sender<()>>>,
+            abort_tx: None,
         })
     }
 }

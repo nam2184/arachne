@@ -9,9 +9,10 @@ pub use events::{
     FinishReason, LlmEvent, TaskKind, TaskState, ToolContentPart, ToolDefinition, ToolResultValue,
     Usage,
 };
-pub use providers::{LlmProvider, LlmStream, MiniMaxTokenPlanProvider};
+pub use providers::{LlmProvider, LlmStream, LlmStreamAbortHandle, MiniMaxTokenPlanProvider};
 pub use request::{ContentPart, LlmError, LlmMessage, LlmRequest, LlmResponse, ToolCallEntry};
 pub use session::{
-    ProviderRegistry, RunResult, SessionError, SessionEventSink, SessionRunEvent, SessionRunner,
+    ProviderRegistry, RunResult, SessionCancelToken, SessionError, SessionEventSink,
+    SessionRunEvent, SessionRunner,
 };
 pub use subagent_registry::{ChildCompletion, ChildKind, DenyReason, SubagentRegistry, MAX_DEPTH};

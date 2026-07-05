@@ -55,6 +55,7 @@ interface SessionChatProps {
   streamingMessageId: string | null;
   diffs?: SessionFileDiff[];
   onSendMessage: (content: string, mode: ChatMode) => void | Promise<void>;
+  onStopStreaming: () => void | Promise<void>;
   onRunCommand: (input: string) => Promise<UiCommandResult>;
   onSelectChat: (sessionId: string) => void;
   onCreateChat: () => Promise<void> | void;
@@ -172,6 +173,7 @@ export function SessionChat({
   streamingMessageId,
   diffs = [],
   onSendMessage,
+  onStopStreaming,
   onRunCommand,
   onSelectChat,
   onCreateChat,
@@ -312,6 +314,11 @@ export function SessionChat({
   }, [isSending, messages, isPinnedToBottom]);
 
   const handleSend = async () => {
+    if (isSending && !commandBufferActive) {
+      await onStopStreaming();
+      return;
+    }
+
     const content = input.trim();
     if (!content) return;
 
@@ -887,10 +894,10 @@ export function SessionChat({
                 size="sm"
                 className="h-8 shrink-0 rounded-md px-3 text-[11px] font-semibold"
                 onClick={handleSend}
-                disabled={!input.trim() || isCommandRunning}
+                disabled={isCommandRunning || (!isSending && !input.trim())}
               >
                 {isSending && !isCommandRunning && <span className="mr-1.5 h-3 w-3 animate-spin rounded-full border border-current border-t-transparent" />}
-                {isCommandRunning ? "Run" : commandBufferActive ? "Run" : isSending ? "Queue" : "Send"}
+                {isCommandRunning ? "Run" : commandBufferActive ? "Run" : isSending ? "Stop" : "Send"}
               </Button>
             </div>
           </div>

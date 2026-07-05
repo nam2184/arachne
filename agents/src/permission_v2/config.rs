@@ -1,12 +1,15 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::RuntimeConfigFile;
 use crate::paths;
 
 use super::rule::{PermissionAction, PermissionRule};
 use super::ruleset::PermissionRuleset;
+use super::service::{PermissionRequestReceiver, PermissionService};
 
 /// Top-level config file shape for the `permission` key.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -21,7 +24,7 @@ pub enum PermissionConfigValue {
     /// `"permission": "allow"` — applies to all tools.
     Global(PermissionAction),
     /// `"permission": { "*": "ask", "bash": "allow" }` — per-tool rules.
-    PerTool(HashMap<String, PermissionRuleValue>),
+    PerTool(BTreeMap<String, PermissionRuleValue>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,7 +33,7 @@ pub enum PermissionRuleValue {
     /// `"bash": "allow"`
     Simple(PermissionAction),
     /// `"bash": { "*": "ask", "git *": "allow" }`
-    Patterned(HashMap<String, PermissionAction>),
+    Patterned(BTreeMap<String, PermissionAction>),
 }
 
 impl PermissionConfigFile {
@@ -105,6 +108,62 @@ impl PermissionConfigFile {
         }
         PermissionRuleset { rules }
     }
+}
+
+/// Convert an optional `permission` config section into an executable ruleset,
+/// including the built-in defaults.
+pub fn ruleset_from_config(permission: Option<PermissionConfigValue>) -> PermissionRuleset {
+    let mut ruleset = default_ruleset();
+    if let Some(permission) = permission {
+        let config = PermissionConfigFile {
+            permission: Some(permission),
+        };
+        ruleset.rules.extend(config.into_ruleset().rules);
+    }
+    ruleset
+}
+
+/// Build the permission ruleset for a fully merged runtime config.
+pub fn ruleset_from_runtime_config(config: &RuntimeConfigFile) -> PermissionRuleset {
+    ruleset_from_config(config.permission.clone())
+}
+
+/// Build the permission ruleset for a role in a fully merged runtime config.
+pub fn ruleset_from_runtime_config_for_role(
+    config: &RuntimeConfigFile,
+    role_name: &str,
+) -> PermissionRuleset {
+    let mut ruleset = ruleset_from_runtime_config(config);
+    if let Some(role) = config.agent.roles.get(role_name) {
+        if let Some(permission) = role.permission.clone() {
+            let role_ruleset = PermissionConfigFile {
+                permission: Some(permission),
+            }
+            .into_ruleset();
+            ruleset.rules.extend(role_ruleset.rules);
+        }
+    }
+    ruleset
+}
+
+/// Build a session-scoped permission service from a fully merged runtime config.
+pub fn service_from_runtime_config(
+    session_id: impl Into<String>,
+    config: &RuntimeConfigFile,
+) -> (Arc<PermissionService>, PermissionRequestReceiver) {
+    PermissionService::new(session_id, ruleset_from_runtime_config(config))
+}
+
+/// Build a session-scoped permission service for a runtime-configured role.
+pub fn service_from_runtime_config_for_role(
+    session_id: impl Into<String>,
+    config: &RuntimeConfigFile,
+    role_name: &str,
+) -> (Arc<PermissionService>, PermissionRequestReceiver) {
+    PermissionService::new(
+        session_id,
+        ruleset_from_runtime_config_for_role(config, role_name),
+    )
 }
 
 /// Standard global config path for the current platform.
@@ -281,7 +340,7 @@ mod tests {
         let home = std::ffi::OsStr::new("/home/test");
         let cfg = PermissionConfigFile {
             permission: Some(PermissionConfigValue::PerTool({
-                let mut m = HashMap::new();
+                let mut m = BTreeMap::new();
                 m.insert(
                     "external_directory".to_string(),
                     PermissionRuleValue::Simple(PermissionAction::Allow),
@@ -289,7 +348,7 @@ mod tests {
                 m.insert(
                     "edit".to_string(),
                     PermissionRuleValue::Patterned({
-                        let mut p = HashMap::new();
+                        let mut p = BTreeMap::new();
                         p.insert("~/projects/**".to_string(), PermissionAction::Allow);
                         p
                     }),
@@ -307,7 +366,7 @@ mod tests {
     fn into_ruleset_without_home_passes_through() {
         let cfg = PermissionConfigFile {
             permission: Some(PermissionConfigValue::PerTool({
-                let mut m = HashMap::new();
+                let mut m = BTreeMap::new();
                 m.insert(
                     "edit".to_string(),
                     PermissionRuleValue::Simple(PermissionAction::Allow),

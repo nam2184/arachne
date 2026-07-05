@@ -9,8 +9,9 @@ import { cn } from "@/lib/utils";
 
 export function AppShell() {
   const currentProject = useProjectStore((state) => state.currentProject);
-  const { view, loadSettings, setView } = useAppStore();
+  const { loadSettings } = useAppStore();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
     loadSettings();
@@ -30,12 +31,13 @@ export function AppShell() {
           )}
           aria-hidden={sidebarCollapsed}
         >
-          <ProjectSidebar project={currentProject} onOpenSettings={() => setView("settings")} />
+          <ProjectSidebar project={currentProject} onOpenSettings={() => setSettingsOpen(true)} />
         </div>
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
-          {view === "settings" ? <SettingsPage /> : <SessionWorkspace />}
+          <SessionWorkspace />
         </main>
       </div>
+      <SettingsPage open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>
   );
 }

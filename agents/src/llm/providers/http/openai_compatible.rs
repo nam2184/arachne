@@ -2,13 +2,12 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::oneshot;
 
 use super::error_parsing::{format_provider_error, parse_provider_error_body};
 use super::{log_sse_event_body, openai_compatible_endpoint_url, LlmError, LlmProvider, LlmStream};
 use crate::llm::events::{FinishReason, LlmEvent, ToolDefinition};
+use crate::llm::providers::LlmStreamAbortHandle;
 use crate::llm::request::{ContentPart, LlmRequest};
 
 pub struct OpenAiCompatibleHttpProvider {
@@ -172,8 +171,7 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
             "attaching bearer auth header for llm request"
         );
 
-        let (abort_tx, mut abort_rx) = oneshot::channel();
-        let abort_tx = Arc::new(abort_tx);
+        let (abort_tx, mut abort_rx) = LlmStreamAbortHandle::new();
         let auth_header = format!("Bearer {api_key}");
         let response = self
             .http_client
@@ -258,9 +256,29 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
             // provider turn. Tool results are produced by the runner
             // after the stream ends and are included in the next request
             // via persisted conversation history.
-            while let Some(chunk) = event_stream.next().await {
-                match abort_rx.try_recv() {
-                    Ok(()) => {
+            loop {
+                let chunk = tokio::select! {
+                    changed = abort_rx.changed() => {
+                        if changed.is_err() || *abort_rx.borrow() {
+                            termination_path = "local_abort_signal";
+                            tracing::warn!(
+                                provider = %stream_provider,
+                                model = %stream_model,
+                                termination_path,
+                                "llm http stream stopping because local abort signal was received"
+                            );
+                            break;
+                        }
+                        continue;
+                    }
+                    chunk = event_stream.next() => chunk,
+                };
+
+                let Some(chunk) = chunk else {
+                    break;
+                };
+
+                if *abort_rx.borrow() {
                         termination_path = "local_abort_signal";
                         tracing::warn!(
                             provider = %stream_provider,
@@ -269,18 +287,6 @@ impl LlmProvider for OpenAiCompatibleHttpProvider {
                             "llm http stream stopping because local abort signal was received"
                         );
                         break;
-                    }
-                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                        termination_path = "local_abort_sender_dropped";
-                        tracing::warn!(
-                            provider = %stream_provider,
-                            model = %stream_model,
-                            termination_path,
-                            "llm http stream stopping because local abort sender was dropped"
-                        );
-                        break;
-                    }
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                 }
 
                 let bytes = match chunk {

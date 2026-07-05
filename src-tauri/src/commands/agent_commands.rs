@@ -38,3 +38,11 @@ pub async fn update_session_provider(
         .update_session_provider(&session_id, provider, model)
         .await
 }
+
+#[tauri::command]
+pub async fn stop_session_stream(
+    session_id: String,
+    agent_service: State<'_, Arc<AgentService>>,
+) -> Result<bool, String> {
+    Ok(agent_service.send_cancel(&session_id))
+}

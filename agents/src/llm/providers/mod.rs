@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio_stream::Stream;
 
 use super::events::LlmEvent;
@@ -68,16 +68,30 @@ pub trait LlmProvider: Send + Sync {
 
 pub struct LlmStream {
     pub events: Pin<Box<dyn Stream<Item = LlmEvent> + Send>>,
-    pub abort_tx: Option<Arc<oneshot::Sender<()>>>,
+    pub abort_tx: Option<LlmStreamAbortHandle>,
 }
 
 impl LlmStream {
     pub fn abort(&self) {
         if let Some(tx) = self.abort_tx.as_ref() {
-            if let Ok(sender) = Arc::try_unwrap(tx.clone()) {
-                let _ = sender.send(());
-            }
+            tx.abort();
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LlmStreamAbortHandle {
+    tx: watch::Sender<bool>,
+}
+
+impl LlmStreamAbortHandle {
+    pub fn new() -> (Self, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
+        (Self { tx }, rx)
+    }
+
+    pub fn abort(&self) {
+        let _ = self.tx.send(true);
     }
 }
 
