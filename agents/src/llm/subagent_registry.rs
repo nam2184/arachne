@@ -19,6 +19,8 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+use crate::llm::session::SessionCancelToken;
+
 /// A `task` result delivered to a parent after its child
 /// finishes. The parent's `SessionRunner` drains these before the next
 /// LLM turn and includes them as a synthetic user message.
@@ -57,6 +59,9 @@ struct State {
     parent_of: HashMap<String, String>,
     /// Completed child results waiting to be drained by the parent.
     completions: HashMap<String, Vec<ChildCompletion>>,
+    /// Active cancellation handles for in-process child runs, keyed by the
+    /// child's own session id so stop requests can target an exact child.
+    cancellations: HashMap<String, SessionCancelToken>,
 }
 
 pub struct SubagentRegistry {
@@ -131,6 +136,28 @@ impl SubagentRegistry {
             }
         }
         state.parent_of.remove(child_id);
+        state.cancellations.remove(child_id);
+    }
+
+    pub fn register_cancellation(&self, session_id: &str, cancellation: SessionCancelToken) {
+        self.state
+            .write()
+            .cancellations
+            .insert(session_id.to_string(), cancellation);
+    }
+
+    pub fn unregister_cancellation(&self, session_id: &str) {
+        self.state.write().cancellations.remove(session_id);
+    }
+
+    pub fn cancel_session(&self, session_id: &str) -> bool {
+        let cancellation = self.state.read().cancellations.get(session_id).cloned();
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+            true
+        } else {
+            false
+        }
     }
 
     /// Push a completion for a child. The parent drains via

@@ -81,6 +81,17 @@ pub async fn run_async(call: &ToolCall) -> ToolResult {
     run_with_async(call, &reqwest::Client::new(), &config).await
 }
 
+pub async fn run_async_with_runtime_config(
+    call: &ToolCall,
+    runtime_config: &crate::config::RuntimeConfig,
+) -> ToolResult {
+    let config = match config_from_runtime(runtime_config).or_else(|_| config_from_env()) {
+        Ok(config) => config,
+        Err(error) => return failure("websearch", error),
+    };
+    run_with_async(call, &reqwest::Client::new(), &config).await
+}
+
 pub async fn run_with_async(
     call: &ToolCall,
     client: &reqwest::Client,
@@ -160,6 +171,33 @@ pub fn config_from_env() -> Result<WebSearchConfig, String> {
     let max_results = std::env::var("SEARXNG_MAX_RESULTS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+        .clamp(1, HARD_MAX_RESULTS);
+
+    Ok(WebSearchConfig {
+        base_url,
+        max_results,
+    })
+}
+
+pub fn config_from_runtime(
+    config: &crate::config::RuntimeConfig,
+) -> Result<WebSearchConfig, String> {
+    let base_url = config
+        .websearch
+        .searxng_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "websearch requires a SearXNG base URL in runtime config or SEARXNG_BASE_URL"
+                .to_string()
+        })?
+        .to_string();
+
+    let max_results = config
+        .websearch
+        .max_results
         .unwrap_or(DEFAULT_MAX_RESULTS)
         .clamp(1, HARD_MAX_RESULTS);
 

@@ -437,6 +437,14 @@ export function SessionWorkspace() {
     void drainSendQueue(chatSessionId);
   }, [chatSessionId, drainSendQueue, setSessionQueuedCount]);
 
+  const stopChatStream = useCallback(async () => {
+    if (!chatSessionId) return;
+    sendQueuesRef.current.delete(chatSessionId);
+    pendingPromptKeysRef.current.delete(chatSessionId);
+    setSessionQueuedCount(chatSessionId, 0);
+    await invoke<boolean>("stop_session_stream", { sessionId: chatSessionId });
+  }, [chatSessionId, setSessionQueuedCount]);
+
   const createChatForCurrentSession = useCallback(async () => {
     if (!chatSessionId) return;
     const result = await createSessionChat(chatSessionId);
@@ -561,6 +569,7 @@ export function SessionWorkspace() {
               streamingMessageId={streamingMessageId}
               diffs={chatDiff}
               onSendMessage={sendChatMessage}
+              onStopStreaming={stopChatStream}
               onRunCommand={runUiCommand}
               onSelectChat={setChatSessionId}
               onCreateChat={createChatForCurrentSession}
@@ -658,6 +667,7 @@ export function SessionWorkspace() {
           streamingMessageId={streamingMessageId}
           diffs={chatDiff}
           onSendMessage={sendChatMessage}
+          onStopStreaming={stopChatStream}
           onRunCommand={runUiCommand}
           onSelectChat={setChatSessionId}
           onCreateChat={createChatForCurrentSession}

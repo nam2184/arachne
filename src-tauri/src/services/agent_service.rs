@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 use arachne_agents::{
     llm::providers::{
@@ -13,12 +17,14 @@ use arachne_agents::{
     tools::SandboxedContext,
     CompactionConfig, CompactionOutcome, CompactionRequest, CompactionService, ConversationService,
     LlmProvider, MessageRole, ModelRegistry, ProviderConfig, ProviderProtocol, ProviderRegistry,
-    ProviderService, SessionError, SessionFileDiff, SessionRunEvent, SessionRunner, SessionService,
-    SnapshotService,
+    ProviderService, SessionCancelToken, SessionError, SessionFileDiff, SessionRunEvent,
+    SessionRunner, SessionService, SnapshotService,
 };
+use parking_lot::Mutex;
 use tauri::{AppHandle, Emitter};
 
 use crate::services::permission_map::PermissionMap;
+use crate::services::settings_service::SettingsService;
 
 const AGENT_EVENT: &str = "agent:event";
 
@@ -46,6 +52,33 @@ pub enum AgentUiEvent {
         message_id: String,
         diff: Vec<SessionFileDiff>,
     },
+    Stopped {
+        session_id: String,
+    },
+}
+
+#[derive(Clone)]
+struct ActiveRun {
+    run_id: u64,
+    cancellation: SessionCancelToken,
+}
+
+struct ActiveRunGuard {
+    session_id: String,
+    run_id: u64,
+    active_runs: Arc<Mutex<HashMap<String, ActiveRun>>>,
+}
+
+impl Drop for ActiveRunGuard {
+    fn drop(&mut self) {
+        let mut active_runs = self.active_runs.lock();
+        if active_runs
+            .get(&self.session_id)
+            .is_some_and(|active| active.run_id == self.run_id)
+        {
+            active_runs.remove(&self.session_id);
+        }
+    }
 }
 
 pub struct AgentService {
@@ -55,9 +88,12 @@ pub struct AgentService {
     provider_service: Arc<ProviderService>,
     subagent_registry: Arc<SubagentRegistry>,
     permission_map: Arc<PermissionMap>,
+    settings_service: Arc<SettingsService>,
     compactor: Arc<CompactionService>,
     sse_proxy: Arc<SseProxyManager>,
     snapshot_service: Arc<SnapshotService>,
+    active_runs: Arc<Mutex<HashMap<String, ActiveRun>>>,
+    next_run_id: AtomicU64,
 }
 
 impl AgentService {
@@ -67,6 +103,7 @@ impl AgentService {
         provider_service: Arc<ProviderService>,
         subagent_registry: Arc<SubagentRegistry>,
         permission_map: Arc<PermissionMap>,
+        settings_service: Arc<SettingsService>,
         snapshot_service: Arc<SnapshotService>,
     ) -> Arc<Self> {
         let providers = Arc::new(ProviderRegistry::new());
@@ -86,10 +123,47 @@ impl AgentService {
             provider_service,
             subagent_registry,
             permission_map,
+            settings_service,
             compactor,
             sse_proxy,
             snapshot_service,
+            active_runs: Arc::new(Mutex::new(HashMap::new())),
+            next_run_id: AtomicU64::new(1),
         })
+    }
+
+    fn begin_active_run(&self, session_id: &str) -> (SessionCancelToken, ActiveRunGuard) {
+        let run_id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+        let cancellation = SessionCancelToken::new();
+        self.active_runs.lock().insert(
+            session_id.to_string(),
+            ActiveRun {
+                run_id,
+                cancellation: cancellation.clone(),
+            },
+        );
+        (
+            cancellation,
+            ActiveRunGuard {
+                session_id: session_id.to_string(),
+                run_id,
+                active_runs: Arc::clone(&self.active_runs),
+            },
+        )
+    }
+
+    pub fn send_cancel(&self, session_id: &str) -> bool {
+        let cancellation = self
+            .active_runs
+            .lock()
+            .get(session_id)
+            .map(|active| active.cancellation.clone());
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+            true
+        } else {
+            self.subagent_registry.cancel_session(session_id)
+        }
     }
 
     pub fn sse_proxy(&self) -> Arc<SseProxyManager> {
@@ -110,24 +184,80 @@ impl AgentService {
             Arc::clone(&self.providers),
         )
         .with_compactor(Arc::clone(&self.compactor))
+        .with_runtime_config(self.settings_service.runtime_config())
     }
 
     /// Build a production runner for a concrete session. Tool execution is
     /// rooted at `directory` and enforced by the v2 sandbox path.
     pub fn build_runner_for_session(&self, session_id: &str, directory: &str) -> SessionRunner {
-        let permissions = self.permission_map.get_or_create(session_id);
+        let runtime_config = self.runtime_config_for_session(session_id, directory);
+        let permissions = self
+            .permission_map
+            .get_or_create_with_runtime_config(session_id, &runtime_config);
         let mut sandbox = SandboxPolicy::new(std::path::PathBuf::from(directory));
         for root in permissions.external_roots() {
             sandbox = sandbox.with_external(root);
         }
         let sandboxed_ctx = Arc::new(
             SandboxedContext::new(sandbox, Arc::clone(&permissions))
+                .with_runtime_config(runtime_config.clone())
                 .with_caller_session(session_id.to_string(), Arc::clone(&self.session_service)),
         );
 
         self.build_runner()
+            .with_runtime_config(runtime_config)
             .with_permissions(permissions)
             .with_sandboxed_context(sandboxed_ctx)
+    }
+
+    fn runtime_config_for_session(
+        &self,
+        session_id: &str,
+        directory: &str,
+    ) -> arachne_agents::RuntimeConfig {
+        let mut runtime_config = arachne_agents::RuntimeConfig::default();
+        tracing::info!(
+            session_id,
+            directory,
+            precedence = ?arachne_agents::CONFIG_PRECEDENCE,
+            summary = ?runtime_config.trace_summary(),
+            "runtime config resolution started"
+        );
+
+        merge_runtime_config_layer(
+            &mut runtime_config,
+            session_id,
+            directory,
+            "global/user config.json",
+            &arachne_agents::paths::config_file(),
+        );
+        merge_runtime_config_layer(
+            &mut runtime_config,
+            session_id,
+            directory,
+            "project .arachne/config.json",
+            &arachne_agents::paths::project_config_file(directory),
+        );
+
+        let settings_config = self.settings_service.runtime_config();
+        tracing::info!(
+            session_id,
+            directory,
+            layer = "app settings UI overrides",
+            path = %self.settings_service.config_path().display(),
+            decision = "loaded_merge",
+            summary = ?settings_config.trace_summary(),
+            "runtime config layer decision"
+        );
+        runtime_config.merge(settings_config);
+        tracing::info!(
+            session_id,
+            directory,
+            summary = ?runtime_config.trace_summary(),
+            "runtime config resolution finished"
+        );
+
+        runtime_config
     }
 
     pub async fn compact_now(&self, session_id: &str) -> Result<CompactionOutcome, String> {
@@ -234,6 +364,8 @@ impl AgentService {
             .get_session(session_id)?
             .ok_or_else(|| "Session not found".to_string())?;
 
+        let (cancellation, _active_run) = self.begin_active_run(session_id);
+
         self.refresh_provider(&session.provider).await;
         let before_snapshot = self.snapshot_service.track(&session);
 
@@ -255,25 +387,39 @@ impl AgentService {
             .build_runner_for_session(session_id, &session.directory)
             .with_event_sink(event_sink)
             .with_subagent_registry(Arc::clone(&registry))
+            .with_cancellation(cancellation)
             .with_mode(mode);
         let run_result = runner.run(&session_id_clone).await;
         self.capture_session_diff(&app, &session, &user_message_id, before_snapshot.as_deref());
 
-        if let Err(error) = run_result {
-            let message = chat_error_message(&error);
-            if let Err(append_error) =
-                append_assistant_error(&self.conversation_service, session_id, &message)
-            {
-                tracing::warn!("failed to append LLM error to chat: {}", append_error);
+        let run_result = match run_result {
+            Ok(result) => result,
+            Err(error) => {
+                let message = chat_error_message(&error);
+                if let Err(append_error) =
+                    append_assistant_error(&self.conversation_service, session_id, &message)
+                {
+                    tracing::warn!("failed to append LLM error to chat: {}", append_error);
+                }
+                emit_agent_event(
+                    &app,
+                    AgentUiEvent::Error {
+                        session_id: session_id.to_string(),
+                        message: message.clone(),
+                    },
+                );
+                return Err(message);
             }
+        };
+
+        if run_result.stopped {
             emit_agent_event(
                 &app,
-                AgentUiEvent::Error {
+                AgentUiEvent::Stopped {
                     session_id: session_id.to_string(),
-                    message: message.clone(),
                 },
             );
-            return Err(message);
+            return Ok(String::new());
         }
 
         let messages = self.conversation_service.get_messages(session_id)?;
@@ -326,6 +472,60 @@ impl AgentService {
                 diff,
             },
         );
+    }
+}
+
+fn merge_runtime_config_layer(
+    runtime_config: &mut arachne_agents::RuntimeConfig,
+    session_id: &str,
+    directory: &str,
+    layer: &str,
+    path: &std::path::Path,
+) {
+    if !path.exists() {
+        tracing::info!(
+            session_id,
+            directory,
+            layer,
+            path = %path.display(),
+            decision = "skipped_missing",
+            "runtime config layer decision"
+        );
+        return;
+    }
+
+    match arachne_agents::RuntimeConfig::load(path) {
+        Ok(layer_config) => {
+            tracing::info!(
+                session_id,
+                directory,
+                layer,
+                path = %path.display(),
+                decision = "loaded_merge",
+                summary = ?layer_config.trace_summary(),
+                "runtime config layer decision"
+            );
+            runtime_config.merge(layer_config);
+            tracing::debug!(
+                session_id,
+                directory,
+                layer,
+                path = %path.display(),
+                merged_summary = ?runtime_config.trace_summary(),
+                "runtime config layer merged"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                session_id,
+                directory,
+                layer,
+                path = %path.display(),
+                decision = "failed_ignored",
+                error = %error,
+                "runtime config layer decision"
+            );
+        }
     }
 }
 

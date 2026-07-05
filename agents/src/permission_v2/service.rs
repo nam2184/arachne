@@ -28,6 +28,8 @@ pub struct PermissionRequest {
     pub always: Vec<String>,
 }
 
+pub type PermissionRequestReceiver = mpsc::UnboundedReceiver<PermissionRequest>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UserReply {
@@ -46,7 +48,7 @@ struct PendingEntry {
 /// approved rules are scoped to that session.
 pub struct PermissionService {
     session_id: String,
-    base_ruleset: PermissionRuleset,
+    base_ruleset: RwLock<PermissionRuleset>,
     approved: RwLock<Vec<PermissionRule>>,
     external_roots: RwLock<Vec<PathBuf>>,
     pending: RwLock<HashMap<RequestId, PendingEntry>>,
@@ -58,11 +60,11 @@ impl PermissionService {
     pub fn new(
         session_id: impl Into<String>,
         base_ruleset: PermissionRuleset,
-    ) -> (Arc<Self>, mpsc::UnboundedReceiver<PermissionRequest>) {
+    ) -> (Arc<Self>, PermissionRequestReceiver) {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let service = Arc::new(Self {
             session_id: session_id.into(),
-            base_ruleset,
+            base_ruleset: RwLock::new(base_ruleset),
             approved: RwLock::new(Vec::new()),
             external_roots: RwLock::new(Vec::new()),
             pending: RwLock::new(HashMap::new()),
@@ -88,8 +90,9 @@ impl PermissionService {
                 rules: self.approved.read().clone(),
             };
             // Order matters: base first, approved later so they win (last-match wins).
+            let base_ruleset = self.base_ruleset.read();
             PermissionRuleset::evaluate_merged(
-                &[&self.base_ruleset, &approved_ruleset],
+                &[&*base_ruleset, &approved_ruleset],
                 &permission,
                 &pattern,
             )
@@ -155,8 +158,9 @@ impl PermissionService {
                 rules: self.approved.read().clone(),
             };
             // Order matters: base first, approved later so they win (last-match wins).
+            let base_ruleset = self.base_ruleset.read();
             PermissionRuleset::evaluate_merged(
-                &[&self.base_ruleset, &approved_ruleset],
+                &[&*base_ruleset, &approved_ruleset],
                 &permission,
                 &pattern,
             )
@@ -282,8 +286,12 @@ impl PermissionService {
         &self.session_id
     }
 
-    pub fn base_ruleset(&self) -> &PermissionRuleset {
-        &self.base_ruleset
+    pub fn base_ruleset(&self) -> PermissionRuleset {
+        self.base_ruleset.read().clone()
+    }
+
+    pub fn replace_base_ruleset(&self, ruleset: PermissionRuleset) {
+        *self.base_ruleset.write() = ruleset;
     }
 }
 
@@ -469,5 +477,37 @@ mod tests {
         let (svc, _rx) = make_service(vec![]);
         let result = svc.reply(&RequestId("nope".to_string()), UserReply::Once);
         assert!(matches!(result, Err(CheckError::NotFound { .. })));
+    }
+
+    #[test]
+    fn replacing_base_ruleset_preserves_session_state() {
+        let (svc, _rx) = make_service(vec![PermissionRule::allow("bash", "git *")]);
+        svc.add_external_root("/tmp/external");
+        svc.approved
+            .write()
+            .push(PermissionRule::allow("bash", "npm *"));
+
+        svc.replace_base_ruleset(PermissionRuleset {
+            rules: vec![PermissionRule::deny("bash", "git push *")],
+        });
+
+        assert_eq!(svc.approved_rule_count(), 1);
+        assert_eq!(svc.external_roots(), vec![PathBuf::from("/tmp/external")]);
+        assert_eq!(
+            svc.base_ruleset()
+                .evaluate("bash", "git push origin main")
+                .action,
+            PermissionAction::Deny
+        );
+        assert!(matches!(
+            svc.check(CheckRequest {
+                permission: "bash".to_string(),
+                pattern: "npm test".to_string(),
+                tool: "bash".to_string(),
+                always: vec![],
+                request_id: None,
+            }),
+            Ok(CheckOutcome::Allowed)
+        ));
     }
 }

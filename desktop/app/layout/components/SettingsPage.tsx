@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { ArrowLeft, Moon, Sun, Plus, Save, Settings } from "lucide-react";
+import { Moon, Sun, Plus, Save, Settings, X } from "lucide-react";
 import { useEffect, useMemo, useState, type ChangeEvent } from "react";
 import {
   getContextWindow,
@@ -10,7 +10,7 @@ import {
 } from "@/features/sessions/providerModels";
 import type { ProviderAuthState, ProviderConfig, ProviderOAuthAuthorization } from "@/features/sessions/sessionStore";
 import { cn } from "@/lib/utils";
-import { CODE_BLOCK_THEMES, CURSOR_THEMES, useAppStore, type CodeBlockTheme, type CursorTheme, type NodeSkin, type WorkspaceMode } from "@/features/app/appStore";
+import { CODE_BLOCK_THEMES, CURSOR_THEMES, useAppStore, type CodeBlockTheme, type CursorTheme, type McpServerConfig, type McpTransport, type NodeSkin, type WorkspaceMode } from "@/features/app/appStore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
@@ -24,6 +24,19 @@ interface ProviderDraft {
   enabled: boolean;
 }
 
+interface McpServerDraft {
+  originalName: string | null;
+  name: string;
+  enabled: boolean;
+  transport: McpTransport;
+  command: string;
+  argsText: string;
+  cwd: string;
+  envText: string;
+  url: string;
+  headersText: string;
+}
+
 const emptyProviderDraft: ProviderDraft = {
   name: "",
   model: "",
@@ -34,22 +47,67 @@ const emptyProviderDraft: ProviderDraft = {
   enabled: true,
 };
 
-export function SettingsPage() {
-  const { settings, saveTheme, saveNodeSkin, saveWorkspaceMode, saveCodeBlockTheme, saveCursorTheme, saveWebSearchSettings, setView } = useAppStore();
+const emptyMcpServerDraft: McpServerDraft = {
+  originalName: null,
+  name: "",
+  enabled: true,
+  transport: "stdio",
+  command: "",
+  argsText: "",
+  cwd: "",
+  envText: "",
+  url: "",
+  headersText: "",
+};
+
+const MCP_TRANSPORTS: Array<{ value: McpTransport; label: string; description: string }> = [
+  { value: "stdio", label: "stdio", description: "Start a local command and speak MCP over stdin/stdout." },
+  { value: "streamable_http", label: "Streamable HTTP", description: "Use the MCP Streamable HTTP endpoint directly." },
+  { value: "sse", label: "SSE", description: "Use the legacy MCP SSE transport with server-provided POST endpoint." },
+  { value: "polling_http", label: "Polling HTTP", description: "Use plain non-streaming JSON-RPC over HTTP POST." },
+];
+
+type SettingsTab = "appearance" | "workspace" | "nodes" | "mcp" | "providers";
+
+const SETTINGS_TABS: Array<{ id: SettingsTab; label: string; description: string }> = [
+  { id: "appearance", label: "Appearance", description: "Theme, code, cursor" },
+  { id: "workspace", label: "Workspace", description: "Canvas or agent mode" },
+  { id: "nodes", label: "Node Style", description: "Canvas node visuals" },
+  { id: "mcp", label: "MCP", description: "Runtime tool servers" },
+  { id: "providers", label: "Providers", description: "Models and auth" },
+];
+
+interface SettingsPageProps {
+  open: boolean;
+  onClose: () => void;
+}
+
+export function SettingsPage({ open, onClose }: SettingsPageProps) {
+  const { settings, saveTheme, saveNodeSkin, saveWorkspaceMode, saveCodeBlockTheme, saveCursorTheme, saveMcpServers } = useAppStore();
+  const [activeTab, setActiveTab] = useState<SettingsTab>("appearance");
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [providerAuthStates, setProviderAuthStates] = useState<Map<string, ProviderAuthState>>(() => new Map());
   const [selectedProviderName, setSelectedProviderName] = useState("");
   const [providerDraft, setProviderDraft] = useState<ProviderDraft>(emptyProviderDraft);
-  const [searxngBaseUrl, setSearxngBaseUrl] = useState(settings.searxng_base_url ?? "");
-  const [websearchMaxResults, setWebsearchMaxResults] = useState(settings.websearch_max_results);
-  const [websearchStatus, setWebsearchStatus] = useState<string | null>(null);
-  const [websearchError, setWebsearchError] = useState<string | null>(null);
+  const [selectedMcpServerName, setSelectedMcpServerName] = useState("");
+  const [mcpDraft, setMcpDraft] = useState<McpServerDraft>(emptyMcpServerDraft);
+  const [mcpStatus, setMcpStatus] = useState<string | null>(null);
+  const [mcpError, setMcpError] = useState<string | null>(null);
+  const [isSavingMcp, setIsSavingMcp] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
-  const [isSavingWebSearch, setIsSavingWebSearch] = useState(false);
   const [isConnectingOAuth, setIsConnectingOAuth] = useState(false);
   const [oauthAuthorizationUrl, setOauthAuthorizationUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose]);
 
   useEffect(() => {
     loadProviders().catch((loadError) => {
@@ -58,9 +116,18 @@ export function SettingsPage() {
   }, []);
 
   useEffect(() => {
-    setSearxngBaseUrl(settings.searxng_base_url ?? "");
-    setWebsearchMaxResults(settings.websearch_max_results);
-  }, [settings.searxng_base_url, settings.websearch_max_results]);
+    const serverNames = Object.keys(settings.mcp_servers).sort();
+    const selected = selectedMcpServerName && settings.mcp_servers[selectedMcpServerName]
+      ? selectedMcpServerName
+      : serverNames[0] ?? "";
+
+    setSelectedMcpServerName(selected);
+    if (selected) {
+      setMcpDraft(mcpServerToDraft(selected, settings.mcp_servers[selected]));
+    } else {
+      setMcpDraft(emptyMcpServerDraft);
+    }
+  }, [settings.mcp_servers]);
 
   async function loadProviders() {
     const [configs, authStates] = await Promise.all([
@@ -165,35 +232,86 @@ export function SettingsPage() {
     await saveTheme(newTheme);
   }
 
-  async function saveWebSearchConfig() {
-    const trimmedBaseUrl = searxngBaseUrl.trim();
-    const maxResults = Math.min(20, Math.max(1, Math.trunc(Number(websearchMaxResults) || 5)));
+  function selectMcpServer(name: string) {
+    setSelectedMcpServerName(name);
+    const server = settings.mcp_servers[name];
+    setMcpDraft(server ? mcpServerToDraft(name, server) : emptyMcpServerDraft);
+    setMcpStatus(null);
+    setMcpError(null);
+  }
 
-    if (trimmedBaseUrl) {
+  async function saveMcpConfig() {
+    const name = mcpDraft.name.trim();
+    if (!name) {
+      setMcpError("MCP server name is required.");
+      return;
+    }
+    if (mcpDraft.transport === "stdio" && !mcpDraft.command.trim()) {
+      setMcpError("MCP stdio server command is required.");
+      return;
+    }
+    if (mcpDraft.transport !== "stdio") {
+      const url = mcpDraft.url.trim();
+      if (!url) {
+        setMcpError("MCP URL is required for HTTP/SSE transports.");
+        return;
+      }
       try {
-        const parsed = new URL(trimmedBaseUrl);
+        const parsed = new URL(url);
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-          setWebsearchError("SearXNG base URL must use http or https.");
+          setMcpError("MCP URL must use http or https.");
           return;
         }
       } catch {
-        setWebsearchError("SearXNG base URL is not valid.");
+        setMcpError("MCP URL is not valid.");
         return;
       }
     }
 
-    setIsSavingWebSearch(true);
-    setWebsearchError(null);
-    setWebsearchStatus(null);
+    setIsSavingMcp(true);
+    setMcpStatus(null);
+    setMcpError(null);
 
     try {
-      await saveWebSearchSettings(trimmedBaseUrl, maxResults);
-      setWebsearchMaxResults(maxResults);
-      setWebsearchStatus(trimmedBaseUrl ? "Web search config saved." : "Web search disabled until a SearXNG URL is set.");
+      const next = { ...settings.mcp_servers };
+      if (mcpDraft.originalName && mcpDraft.originalName !== name) {
+        delete next[mcpDraft.originalName];
+      }
+      next[name] = draftToMcpServer(mcpDraft);
+      await saveMcpServers(next);
+      setSelectedMcpServerName(name);
+      setMcpDraft((draft) => ({ ...draft, originalName: name }));
+      setMcpStatus("MCP server saved. New sessions will discover its tools from runtime config.");
     } catch (saveError) {
-      setWebsearchError(formatError(saveError));
+      setMcpError(formatError(saveError));
     } finally {
-      setIsSavingWebSearch(false);
+      setIsSavingMcp(false);
+    }
+  }
+
+  async function deleteMcpConfig() {
+    const name = mcpDraft.originalName;
+    if (!name) {
+      setMcpDraft(emptyMcpServerDraft);
+      setSelectedMcpServerName("");
+      return;
+    }
+
+    setIsSavingMcp(true);
+    setMcpStatus(null);
+    setMcpError(null);
+
+    try {
+      const next = { ...settings.mcp_servers };
+      delete next[name];
+      await saveMcpServers(next);
+      setMcpDraft(emptyMcpServerDraft);
+      setSelectedMcpServerName("");
+      setMcpStatus("MCP server removed.");
+    } catch (deleteError) {
+      setMcpError(formatError(deleteError));
+    } finally {
+      setIsSavingMcp(false);
     }
   }
 
@@ -208,20 +326,54 @@ export function SettingsPage() {
   const hasOAuthAccessToken = Boolean(selectedAuthState?.access_token);
   const hasOAuthRefreshToken = Boolean(selectedAuthState?.refresh_token);
 
-  return (
-    <div className="flex h-full flex-col bg-[var(--background)] text-[var(--foreground)]">
-      <header className="flex items-center gap-4 border-b border-[var(--border)] px-6 py-4">
-        <Button variant="ghost" size="icon" onClick={() => setView("canvas")} aria-label="Back to canvas">
-          <ArrowLeft className="h-5 w-5" />
-        </Button>
-        <div className="flex items-center gap-2">
-          <Settings className="h-5 w-5" />
-          <h1 className="text-lg font-semibold">Settings</h1>
-        </div>
-      </header>
+  if (!open) return null;
 
-      <div className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-2xl space-y-8 p-6">
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/55 p-3 text-[var(--foreground)] sm:p-5" role="dialog" aria-modal="true" aria-label="Settings">
+      <div className="flex h-[min(760px,calc(100vh-1.5rem))] w-[min(1040px,calc(100vw-1.5rem))] flex-col overflow-hidden border border-[var(--border)] bg-[var(--background)] shadow-2xl sm:h-[min(760px,calc(100vh-2.5rem))] sm:w-[min(1040px,calc(100vw-2.5rem))]">
+        <header className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3 sm:px-5">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center border border-[var(--border)] bg-[var(--surface-raised)]">
+              <Settings className="h-4 w-4" />
+            </span>
+            <div className="min-w-0">
+              <h1 className="text-sm font-semibold">Settings</h1>
+              <p className="truncate text-xs text-[var(--text-subtle)]">Configure appearance, workspace behavior, runtime tools, and providers.</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex h-8 w-8 shrink-0 items-center justify-center text-[var(--text-muted)] transition-colors hover:text-[var(--foreground)]"
+            aria-label="Close settings"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </header>
+
+        <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
+          <aside className="flex shrink-0 gap-1 overflow-x-auto border-b border-[var(--border)] bg-[var(--surface)] p-2 sm:w-56 sm:flex-col sm:overflow-x-visible sm:border-b-0 sm:border-r">
+            {SETTINGS_TABS.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setActiveTab(tab.id)}
+                className={cn(
+                  "min-w-36 rounded-none border px-3 py-2 text-left transition-colors sm:min-w-0",
+                  activeTab === tab.id
+                    ? "border-[var(--foreground)] bg-[var(--surface-raised)] text-[var(--foreground)]"
+                    : "border-transparent text-[var(--text-secondary)] hover:border-[var(--border)] hover:bg-[var(--surface-raised)] hover:text-[var(--foreground)]",
+                )}
+              >
+                <span className="block text-xs font-medium">{tab.label}</span>
+                <span className="mt-0.5 hidden text-[10px] leading-snug text-[var(--text-subtle)] sm:block">{tab.description}</span>
+              </button>
+            ))}
+          </aside>
+
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            <div className="mx-auto max-w-3xl space-y-6 p-4 sm:p-6">
+              {activeTab === "appearance" && (
           <section className="space-y-4">
             <h2 className="text-sm font-medium text-[var(--text-secondary)]">Appearance</h2>
             <div className="rounded-none border border-[var(--border)] bg-[var(--surface-raised)] p-4">
@@ -262,27 +414,11 @@ export function SettingsPage() {
                   ))}
                 </select>
               </label>
-              <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-5">
-                {CURSOR_THEMES.map((theme) => (
-                  <button
-                    key={theme.value}
-                    type="button"
-                    onClick={() => saveCursorTheme(theme.value)}
-                    className={cn(
-                      "cursor-preview flex min-h-20 flex-col justify-between rounded-none border bg-[var(--surface)] p-2 text-left transition-colors hover:border-[var(--node-border-hover)]",
-                      `cursor-preview-${theme.value}`,
-                      settings.cursor_theme === theme.value ? "border-[var(--foreground)]" : "border-[var(--border)]",
-                    )}
-                  >
-                    <span className="text-[11px] font-medium text-[var(--foreground)]">{theme.label}</span>
-                    <span className="text-[10px] leading-snug text-[var(--text-muted)]">{theme.description}</span>
-                    <span className="font-mono text-[10px] text-[var(--node-focus)]">hover</span>
-                  </button>
-                ))}
-              </div>
             </div>
           </section>
+              )}
 
+              {activeTab === "workspace" && (
           <section className="space-y-4">
             <h2 className="text-sm font-medium text-[var(--text-secondary)]">Workspace</h2>
             <p className="text-xs text-[var(--text-subtle)]">Choose between the node canvas and a normal docked agent chat.</p>
@@ -303,7 +439,9 @@ export function SettingsPage() {
               />
             </div>
           </section>
+              )}
 
+              {activeTab === "nodes" && (
           <section className="space-y-4">
             <h2 className="text-sm font-medium text-[var(--text-secondary)]">Node Style</h2>
             <p className="text-xs text-[var(--text-subtle)]">Choose how session nodes render on the canvas.</p>
@@ -331,42 +469,167 @@ export function SettingsPage() {
               />
             </div>
           </section>
-
-          <section className="space-y-4">
-            <h2 className="text-sm font-medium text-[var(--text-secondary)]">Web Search</h2>
-            <div className="space-y-4 rounded-none border border-[var(--border)] bg-[var(--surface-raised)] p-4">
-              <div>
-                <p className="text-sm font-medium">SearXNG JSON API</p>
-                <p className="text-xs text-[var(--text-subtle)]">Used by the agent websearch tool. Leave blank to disable web search.</p>
-              </div>
-              <label className="block space-y-1.5">
-                <span className="text-xs font-medium text-[var(--text-secondary)]">Base URL</span>
-                <Input
-                  value={searxngBaseUrl}
-                  onChange={(event: ChangeEvent<HTMLInputElement>) => setSearxngBaseUrl(event.target.value)}
-                  placeholder="https://search.example.com"
-                />
-              </label>
-              <label className="block space-y-1.5">
-                <span className="text-xs font-medium text-[var(--text-secondary)]">Max Results</span>
-                <Input
-                  type="number"
-                  min={1}
-                  max={20}
-                  value={websearchMaxResults}
-                  onChange={(event: ChangeEvent<HTMLInputElement>) => setWebsearchMaxResults(Number(event.target.value))}
-                />
-              </label>
-              <Button className="w-full" onClick={saveWebSearchConfig} disabled={isSavingWebSearch}>
-                <Save className="h-4 w-4" />
-                Save Web Search
-              </Button>
-              {(websearchStatus || websearchError) && (
-                <p className={cn("text-xs", websearchError ? "text-[#ff5f5f]" : "text-[var(--text-secondary)]")}>{websearchError ?? websearchStatus}</p>
               )}
+
+              {activeTab === "mcp" && (
+          <section className="space-y-4">
+            <div>
+              <h2 className="text-sm font-medium text-[var(--text-secondary)]">MCP Servers</h2>
+              <p className="mt-1 text-xs text-[var(--text-subtle)]">Configure explicit MCP transports. URL transports may point at localhost or a remote host.</p>
+            </div>
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-[220px_minmax(0,1fr)]">
+              <div className="space-y-2 rounded-none border border-[var(--border)] bg-[var(--surface-raised)] p-3">
+                <Button
+                  className="w-full"
+                  variant="secondary"
+                  onClick={() => {
+                    setSelectedMcpServerName("");
+                    setMcpDraft(emptyMcpServerDraft);
+                    setMcpStatus(null);
+                    setMcpError(null);
+                  }}
+                >
+                  <Plus className="h-4 w-4" />
+                  New MCP Server
+                </Button>
+                <div className="space-y-1">
+                  {Object.keys(settings.mcp_servers).sort().length === 0 ? (
+                    <p className="rounded-none border border-dashed border-[var(--border)] p-3 text-xs text-[var(--text-subtle)]">No MCP servers configured.</p>
+                  ) : (
+                    Object.keys(settings.mcp_servers).sort().map((name) => (
+                      <button
+                        key={name}
+                        type="button"
+                        onClick={() => selectMcpServer(name)}
+                        className={cn(
+                          "flex w-full items-center justify-between gap-2 rounded-none border px-3 py-2 text-left text-xs transition-colors",
+                          selectedMcpServerName === name
+                            ? "border-[var(--foreground)] bg-[var(--surface)] text-[var(--foreground)]"
+                            : "border-transparent text-[var(--text-secondary)] hover:border-[var(--border)] hover:bg-[var(--surface)] hover:text-[var(--foreground)]",
+                        )}
+                      >
+                        <span className="min-w-0 truncate">{name}</span>
+                        <span className={cn("h-2 w-2 shrink-0 rounded-full", settings.mcp_servers[name]?.enabled === false ? "bg-[var(--text-muted)]" : "bg-[var(--node-focus)]")} />
+                      </button>
+                    ))
+                  )}
+                </div>
+              </div>
+
+              <div className="space-y-4 rounded-none border border-[var(--border)] bg-[var(--surface-raised)] p-4">
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-[var(--text-secondary)]">Server name</span>
+                  <Input
+                    value={mcpDraft.name}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setMcpDraft((draft) => ({ ...draft, name: event.target.value }))}
+                    placeholder="filesystem"
+                  />
+                </label>
+                <label className="flex items-center gap-2 text-sm text-[var(--text-secondary)]">
+                  <input
+                    type="checkbox"
+                    checked={mcpDraft.enabled}
+                    onChange={(event) => setMcpDraft((draft) => ({ ...draft, enabled: event.target.checked }))}
+                    className="h-4 w-4 rounded-none border-[var(--border)] bg-[var(--input-bg)] accent-[var(--foreground)]"
+                  />
+                  Enabled
+                </label>
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-[var(--text-secondary)]">Transport</span>
+                  <select
+                    value={mcpDraft.transport}
+                    onChange={(event: ChangeEvent<HTMLSelectElement>) => setMcpDraft((draft) => ({ ...draft, transport: event.target.value as McpTransport }))}
+                    className="h-9 w-full rounded-none border border-[var(--input-border)] bg-[var(--input-bg)] px-3 text-sm text-[var(--foreground)] outline-none transition-colors hover:border-[var(--node-border-hover)] focus:border-[var(--foreground)]"
+                  >
+                    {MCP_TRANSPORTS.map((transport) => (
+                      <option key={transport.value} value={transport.value}>{transport.label}</option>
+                    ))}
+                  </select>
+                  <span className="text-[10px] text-[var(--text-subtle)]">{MCP_TRANSPORTS.find((transport) => transport.value === mcpDraft.transport)?.description}</span>
+                </label>
+                {mcpDraft.transport === "stdio" ? (
+                  <>
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-[var(--text-secondary)]">Command</span>
+                  <Input
+                    value={mcpDraft.command}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setMcpDraft((draft) => ({ ...draft, command: event.target.value }))}
+                    placeholder="npx"
+                  />
+                </label>
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-[var(--text-secondary)]">Arguments</span>
+                  <textarea
+                    value={mcpDraft.argsText}
+                    onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setMcpDraft((draft) => ({ ...draft, argsText: event.target.value }))}
+                    placeholder={"-y\n@modelcontextprotocol/server-filesystem\n/path/to/project"}
+                    className="min-h-24 w-full resize-y rounded-none border border-[var(--input-border)] bg-[var(--input-bg)] px-3 py-2 font-mono text-xs text-[var(--foreground)] outline-none transition-colors hover:border-[var(--node-border-hover)] focus:border-[var(--foreground)]"
+                  />
+                  <span className="text-[10px] text-[var(--text-subtle)]">One argument per line. Values are passed directly to the stdio process.</span>
+                </label>
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-[var(--text-secondary)]">Working directory</span>
+                  <Input
+                    value={mcpDraft.cwd}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setMcpDraft((draft) => ({ ...draft, cwd: event.target.value }))}
+                    placeholder="Optional"
+                  />
+                </label>
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-[var(--text-secondary)]">Environment</span>
+                  <textarea
+                    value={mcpDraft.envText}
+                    onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setMcpDraft((draft) => ({ ...draft, envText: event.target.value }))}
+                    placeholder={"TOKEN=...\nDEBUG=1"}
+                    className="min-h-20 w-full resize-y rounded-none border border-[var(--input-border)] bg-[var(--input-bg)] px-3 py-2 font-mono text-xs text-[var(--foreground)] outline-none transition-colors hover:border-[var(--node-border-hover)] focus:border-[var(--foreground)]"
+                  />
+                  <span className="text-[10px] text-[var(--text-subtle)]">One KEY=VALUE pair per line. Stored in local settings and injected by runtime.</span>
+                </label>
+                  </>
+                ) : (
+                  <>
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-[var(--text-secondary)]">URL</span>
+                  <Input
+                    value={mcpDraft.url}
+                    onChange={(event: ChangeEvent<HTMLInputElement>) => setMcpDraft((draft) => ({ ...draft, url: event.target.value }))}
+                    placeholder="https://mcp.example.com/mcp"
+                  />
+                  <span className="text-[10px] text-[var(--text-subtle)]">Use the protocol-specific endpoint. Localhost URLs are valid.</span>
+                </label>
+                <label className="block space-y-1.5">
+                  <span className="text-xs font-medium text-[var(--text-secondary)]">Headers</span>
+                  <textarea
+                    value={mcpDraft.headersText}
+                    onChange={(event: ChangeEvent<HTMLTextAreaElement>) => setMcpDraft((draft) => ({ ...draft, headersText: event.target.value }))}
+                    placeholder={"Authorization=Bearer ...\nX-Client=arachne"}
+                    className="min-h-20 w-full resize-y rounded-none border border-[var(--input-border)] bg-[var(--input-bg)] px-3 py-2 font-mono text-xs text-[var(--foreground)] outline-none transition-colors hover:border-[var(--node-border-hover)] focus:border-[var(--foreground)]"
+                  />
+                  <span className="text-[10px] text-[var(--text-subtle)]">One HEADER=VALUE pair per line. Stored locally and sent by runtime.</span>
+                </label>
+                  </>
+                )}
+                <div className="rounded-none border border-[var(--border)] bg-[var(--surface)] p-3 text-xs text-[var(--text-secondary)]">
+                  Tools from this server are advertised as <span className="font-mono text-[var(--foreground)]">mcp__{mcpDraft.name.trim() || "server"}__tool</span> after discovery.
+                </div>
+                <div className="flex flex-col gap-2 sm:flex-row">
+                  <Button className="flex-1" onClick={saveMcpConfig} disabled={isSavingMcp}>
+                    <Save className="h-4 w-4" />
+                    Save MCP Server
+                  </Button>
+                  <Button className="flex-1" variant="secondary" onClick={deleteMcpConfig} disabled={isSavingMcp}>
+                    Delete
+                  </Button>
+                </div>
+                {(mcpStatus || mcpError) && (
+                  <p className={cn("text-xs", mcpError ? "text-[#ff5f5f]" : "text-[var(--text-secondary)]")}>{mcpError ?? mcpStatus}</p>
+                )}
+              </div>
             </div>
           </section>
+              )}
 
+              {activeTab === "providers" && (
           <section className="space-y-4">
             <h2 className="text-sm font-medium text-[var(--text-secondary)]">AI Configuration</h2>
             <div className="space-y-4 rounded-none border border-[var(--border)] bg-[var(--surface-raised)] p-4">
@@ -533,8 +796,11 @@ export function SettingsPage() {
               )}
             </div>
           </section>
+              )}
         </div>
       </div>
+      </div>
+    </div>
     </div>
   );
 }
@@ -549,6 +815,61 @@ function providerToDraft(provider: ProviderConfig, auth?: ProviderAuthState): Pr
     protocol: provider.protocol ?? inferProtocol(provider.name),
     enabled: provider.enabled,
   };
+}
+
+function mcpServerToDraft(name: string, server: McpServerConfig): McpServerDraft {
+  return {
+    originalName: name,
+    name,
+    enabled: server.enabled !== false,
+    transport: server.transport,
+    command: server.command ?? "",
+    argsText: server.args.join("\n"),
+    cwd: server.cwd ?? "",
+    envText: serializeStringRecord(server.env),
+    url: server.url ?? "",
+    headersText: serializeStringRecord(server.headers),
+  };
+}
+
+function draftToMcpServer(draft: McpServerDraft): McpServerConfig {
+  return {
+    enabled: draft.enabled,
+    transport: draft.transport,
+    command: draft.transport === "stdio" ? draft.command.trim() || null : null,
+    args: draft.transport === "stdio" ? splitLines(draft.argsText) : [],
+    env: draft.transport === "stdio" ? parseStringRecord(draft.envText) : {},
+    cwd: draft.transport === "stdio" ? draft.cwd.trim() || null : null,
+    url: draft.transport === "stdio" ? null : draft.url.trim() || null,
+    headers: draft.transport === "stdio" ? {} : parseStringRecord(draft.headersText),
+  };
+}
+
+function splitLines(value: string): string[] {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function parseStringRecord(value: string): Record<string, string> {
+  const record: Record<string, string> = {};
+  for (const line of value.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const separator = trimmed.indexOf("=");
+    if (separator <= 0) continue;
+    const key = trimmed.slice(0, separator).trim();
+    const itemValue = trimmed.slice(separator + 1).trim();
+    if (key) record[key] = itemValue;
+  }
+  return record;
+}
+
+function serializeStringRecord(record: Record<string, string>) {
+  return Object.entries(record)
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n");
 }
 
 function selectedAuthValue(provider: ProviderDraft) {

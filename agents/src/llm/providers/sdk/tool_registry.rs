@@ -34,6 +34,7 @@ use aisdk::core::tools::{Tool, ToolExecute};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::llm::events::ToolDefinition;
 use crate::llm::providers::ToolDispatcherFn;
 use crate::llm::request::LlmError;
 
@@ -298,4 +299,38 @@ pub fn build_sdk_tool(name: &str, dispatcher: Arc<ToolDispatcherFn>) -> Result<T
     };
 
     Ok(tool)
+}
+
+pub fn build_sdk_tool_for_definition(
+    definition: &ToolDefinition,
+    dispatcher: Arc<ToolDispatcherFn>,
+) -> Result<Tool, LlmError> {
+    if !crate::mcp::is_mcp_tool_name(&definition.name) {
+        return build_sdk_tool(&definition.name, dispatcher);
+    }
+
+    let name_owned = definition.name.clone();
+    let executor = ToolExecute::new(Box::new(move |input| {
+        tracing::info!(tool = %name_owned, input = %input, "sdk MCP tool execution started");
+        let started = std::time::Instant::now();
+        let result = (dispatcher.as_ref())(&name_owned, input);
+        tracing::info!(
+            tool = %name_owned,
+            elapsed_ms = started.elapsed().as_millis(),
+            success = result.is_ok(),
+            "sdk MCP tool execution finished"
+        );
+        result
+    }));
+
+    let schema = schemars::Schema::try_from(definition.parameters.clone())
+        .unwrap_or_else(|_| schemars::Schema::default());
+
+    Tool::builder()
+        .name(definition.name.clone())
+        .description(definition.description.clone())
+        .input_schema(schema)
+        .execute(executor)
+        .build()
+        .map_err(|error| LlmError::new("sdk_tool", &error.to_string()))
 }

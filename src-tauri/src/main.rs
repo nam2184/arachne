@@ -148,6 +148,7 @@ pub fn run() {
         Arc::clone(&provider_service),
         Arc::clone(&subagent_registry),
         Arc::clone(&permission_map),
+        Arc::clone(&settings_service),
         Arc::clone(&snapshot_service),
     );
 
@@ -193,6 +194,7 @@ pub fn run() {
             commands::file_commands::search_files,
             commands::file_commands::get_file_tree,
             commands::agent_commands::send_message,
+            commands::agent_commands::stop_session_stream,
             commands::agent_commands::update_session_provider,
             commands::session_commands::init_sessions,
             commands::session_commands::create_session,

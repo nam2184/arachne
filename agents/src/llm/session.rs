@@ -2,19 +2,22 @@ use std::collections::HashMap;
 
 use std::path::PathBuf;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use tokio::runtime::Handle;
 
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use tokio_stream::StreamExt;
 
 use crate::domain::ToolCall;
 
-use crate::llm::events::{FinishReason, LlmEvent, ToolDefinition, ToolResultValue};
+use crate::llm::events::{FinishReason, LlmEvent, ToolResultValue};
 
-use crate::llm::providers::{LlmProvider, ToolDispatcherFn};
+use crate::llm::providers::{LlmProvider, LlmStreamAbortHandle, ToolDispatcherFn};
 
 use crate::llm::request::{ContentPart, LlmMessage, LlmRequest};
 
@@ -41,6 +44,68 @@ use crate::sessions::conversation::ConversationFile;
 const MAX_STEPS: u32 = 25;
 
 pub type SessionEventSink = Arc<dyn Fn(SessionRunEvent) + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct SessionCancelToken {
+    inner: Arc<SessionCancelState>,
+}
+
+#[derive(Default)]
+struct SessionCancelState {
+    cancelled: AtomicBool,
+    notify: Notify,
+    stream_abort: Mutex<Option<LlmStreamAbortHandle>>,
+}
+
+impl SessionCancelToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
+        if let Some(abort) = self.stream_abort() {
+            abort.abort();
+        }
+    }
+
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        self.inner.notify.notified().await;
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub fn set_stream_abort(&self, abort: Option<LlmStreamAbortHandle>) {
+        *self
+            .inner
+            .stream_abort
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = abort;
+        if self.is_cancelled() {
+            if let Some(abort) = self.stream_abort() {
+                abort.abort();
+            }
+        }
+    }
+
+    pub fn clear_stream_abort(&self) {
+        self.set_stream_abort(None);
+    }
+
+    fn stream_abort(&self) -> Option<LlmStreamAbortHandle> {
+        self.inner
+            .stream_abort
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 
@@ -125,6 +190,21 @@ pub struct SessionRunner {
     /// trigger manual compaction.
     compactor: Option<Arc<crate::sessions::CompactionService>>,
 
+    /// Runtime-owned tool/config settings. This keeps app and project
+    /// configuration out of user prompt text and makes tools consume
+    /// normalized config directly from the runner.
+    runtime_config: crate::config::RuntimeConfig,
+
+    /// Per-runner MCP process manager. Shared with all tool-runtime clones
+    /// so MCP stdio servers are initialized once and reused across discovery
+    /// and tool calls for the runner's lifetime.
+    mcp_manager: Arc<crate::mcp::McpManager>,
+
+    /// In-flight cancellation for the current session run. This is runtime
+    /// state only; callers register it in an active-run map and clear it when
+    /// the run exits.
+    cancellation: Option<SessionCancelToken>,
+
     /// Sandboxed tool dispatch context. When set, every tool
 
     /// call goes through `run_tool_sandboxed`, which enforces
@@ -204,6 +284,12 @@ impl SessionRunner {
             model_registry,
 
             compactor: None,
+
+            runtime_config: crate::config::RuntimeConfig::default(),
+
+            mcp_manager: Arc::new(crate::mcp::McpManager::new()),
+
+            cancellation: None,
 
             sandboxed_ctx: None,
         }
@@ -343,6 +429,19 @@ impl SessionRunner {
         self
     }
 
+    pub fn with_runtime_config(mut self, runtime_config: crate::config::RuntimeConfig) -> Self {
+        self.runtime_config = runtime_config;
+        self.mcp_manager = Arc::new(crate::mcp::McpManager::new());
+
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: SessionCancelToken) -> Self {
+        self.cancellation = Some(cancellation);
+
+        self
+    }
+
     /// Wire a `CompactionService` so the runner auto-compacts when
 
     /// the assembled request would exceed the model context window.
@@ -394,6 +493,26 @@ impl SessionRunner {
         }
     }
 
+    fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(SessionCancelToken::is_cancelled)
+    }
+
+    fn mark_cancelled_tool_calls(
+        &self,
+        assistant_parts: &mut Vec<ContentPart>,
+        pending_tool_calls: impl IntoIterator<Item = (String, String, String)>,
+    ) {
+        for (id, name, _) in pending_tool_calls {
+            assistant_parts.push(ContentPart::tool_result(
+                &id,
+                &name,
+                serde_json::json!({ "error": "cancelled by user before execution" }),
+            ));
+        }
+    }
+
     /// Decide whether a `SessionError` from `run_turn` should trigger
 
     /// an auto-compaction attempt. The runner decides purely from the
@@ -434,6 +553,7 @@ impl SessionRunner {
 
     pub async fn run(&self, session_id: &str) -> Result<RunResult, SessionError> {
         let mut step = 0u32;
+        let mut stopped = false;
 
         // Auto-compaction can be tried up to this many times per
 
@@ -468,9 +588,19 @@ impl SessionRunner {
         // assistant emitted tool calls.
 
         while step < self.max_steps {
+            if self.is_cancelled() {
+                stopped = true;
+                break;
+            }
+
             match self.run_turn(session_id, step).await {
                 Ok(continue_loop) => {
                     step += 1;
+
+                    if self.is_cancelled() {
+                        stopped = true;
+                        break;
+                    }
 
                     if !continue_loop {
                         break;
@@ -573,7 +703,10 @@ impl SessionRunner {
             });
         }
 
-        Ok(RunResult { steps: step })
+        Ok(RunResult {
+            steps: step,
+            stopped,
+        })
     }
 
     /// Inspect the most recent assistant message in the persisted
@@ -695,6 +828,9 @@ impl SessionRunner {
 
         let noop_registry = self.subagent_registry_noop();
 
+        let runtime_config = self.runtime_config.clone();
+        let mcp_manager = Arc::clone(&self.mcp_manager);
+
         Arc::new(move |tool_name: &str, input: serde_json::Value| {
             // The executor runs synchronously inside the SDK's
 
@@ -780,7 +916,8 @@ impl SessionRunner {
 
             let needs_async_dispatch = needs_async_runtime
                 || tool_name_owned == "webfetch"
-                || tool_name_owned == "websearch";
+                || tool_name_owned == "websearch"
+                || crate::mcp::is_mcp_tool_name(&tool_name_owned);
 
             tracing::debug!(
                 tool = %tool_name_owned,
@@ -808,6 +945,10 @@ impl SessionRunner {
                             mode,
 
                             turn_id: step as u64,
+
+                            runtime_config: runtime_config.clone(),
+
+                            mcp_manager: Arc::clone(&mcp_manager),
 
                             project_root: project_root.clone(),
                         };
@@ -840,6 +981,10 @@ impl SessionRunner {
                             mode,
 
                             turn_id: step as u64,
+
+                            runtime_config: runtime_config.clone(),
+
+                            mcp_manager: Arc::clone(&mcp_manager),
 
                             project_root: project_root.clone(),
                         };
@@ -1194,7 +1339,13 @@ impl SessionRunner {
 
         // provider is about to receive.
 
-        let tools = tools_for_model(&session.model, self.readonly_tools);
+        let tools = tools_for_model_with_runtime(
+            &session.model,
+            self.readonly_tools,
+            &self.runtime_config,
+            &self.mcp_manager,
+        )
+        .await;
 
         let precheck_request = LlmRequest::new(&session.model, &session.provider)
             .with_system(system_prompt.clone())
@@ -1376,10 +1527,23 @@ impl SessionRunner {
 
         provider.set_tool_dispatcher(dispatcher);
 
+        if self.is_cancelled() {
+            tracing::info!(
+                session_id = %session_id,
+                step = step,
+                "session run cancelled before provider stream opened"
+            );
+            return Ok(false);
+        }
+
         let stream = provider
             .stream(request)
             .await
             .map_err(|e| SessionError::Llm(e))?;
+
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.set_stream_abort(stream.abort_tx.clone());
+        }
 
         tracing::info!(
 
@@ -1508,7 +1672,39 @@ impl SessionRunner {
 
         tokio::pin!(stream);
 
-        while let Some(event) = stream.events.as_mut().next().await {
+        loop {
+            let event = if let Some(cancellation) = &self.cancellation {
+                let mut events = stream.events.as_mut();
+                let next_event = events.next();
+                tokio::pin!(next_event);
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        tracing::info!(
+                            session_id = %session_id,
+                            step = step,
+                            "session run cancelled while waiting for provider stream event"
+                        );
+                        break;
+                    }
+                    event = &mut next_event => event,
+                }
+            } else {
+                stream.events.as_mut().next().await
+            };
+
+            let Some(event) = event else {
+                break;
+            };
+
+            if self.is_cancelled() {
+                tracing::info!(
+                    session_id = %session_id,
+                    step = step,
+                    "session run cancelled while consuming provider stream"
+                );
+                break;
+            }
+
             self.emit_event(session_id, step, &event);
 
             let event_kind = match &event {
@@ -1725,6 +1921,10 @@ impl SessionRunner {
 
                     let _ = flush_parts(&assistant_parts);
 
+                    if let Some(cancellation) = &self.cancellation {
+                        cancellation.clear_stream_abort();
+                    }
+
                     return Err(SessionError::Provider(message));
                 }
 
@@ -1752,6 +1952,10 @@ impl SessionRunner {
                     );
                 }
             }
+        }
+
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.clear_stream_abort();
         }
 
         if !text_buffer.is_empty() || in_think_block {
@@ -1868,6 +2072,20 @@ impl SessionRunner {
             let _ = flush_parts(&assistant_parts);
         }
 
+        if self.is_cancelled() {
+            tracing::info!(
+                session_id = %session_id,
+                step = step,
+                pending_tool_calls = pending_tool_calls.len(),
+                "session run cancelled after stream; skipping pending tool dispatch"
+            );
+            self.mark_cancelled_tool_calls(&mut assistant_parts, pending_tool_calls.drain(..));
+            needs_continuation = false;
+            if !assistant_parts.is_empty() {
+                let _ = flush_parts(&assistant_parts);
+            }
+        }
+
         // After the stream is done, dispatch the pending tool calls.
 
         // Tool results are appended to `assistant_parts` so the
@@ -1913,7 +2131,25 @@ impl SessionRunner {
 
             );
 
-            for (id, name, input_str) in pending_tool_calls {
+            let mut pending_iter = pending_tool_calls.into_iter();
+            while let Some((id, name, input_str)) = pending_iter.next() {
+                if self.is_cancelled() {
+                    tracing::info!(
+                        session_id = %session_id,
+                        step = step,
+                        tool = %name,
+                        tool_call_id = %id,
+                        "session run cancelled before tool dispatch"
+                    );
+                    self.mark_cancelled_tool_calls(
+                        &mut assistant_parts,
+                        std::iter::once((id, name, input_str)).chain(pending_iter),
+                    );
+                    needs_continuation = false;
+                    let _ = flush_parts(&assistant_parts);
+                    break;
+                }
+
                 let input: serde_json::Value = serde_json::from_str(&input_str).unwrap_or_default();
 
                 let arguments = if let Some(obj) = input.as_object() {
@@ -2154,8 +2390,10 @@ impl SessionRunner {
 
                 let needs_async_runtime = name == "task" || has_peer_session_id;
 
-                let needs_async_dispatch =
-                    needs_async_runtime || name == "webfetch" || name == "websearch";
+                let needs_async_dispatch = needs_async_runtime
+                    || name == "webfetch"
+                    || name == "websearch"
+                    || crate::mcp::is_mcp_tool_name(&name);
 
                 let sandboxed = self.sandboxed_ctx.as_deref();
 
@@ -2174,6 +2412,10 @@ impl SessionRunner {
                         mode: self.mode,
 
                         turn_id: step as u64,
+
+                        runtime_config: self.runtime_config.clone(),
+
+                        mcp_manager: Arc::clone(&self.mcp_manager),
 
                         project_root: project_root.clone(),
                     };
@@ -2219,7 +2461,11 @@ impl SessionRunner {
                             run_tool_with_context(&tool_call, &ctx)
                         }
                     }
-                } else if needs_async_dispatch && (name == "webfetch" || name == "websearch") {
+                } else if needs_async_dispatch
+                    && (name == "webfetch"
+                        || name == "websearch"
+                        || crate::mcp::is_mcp_tool_name(&name))
+                {
                     tracing::debug!(
 
                         session_id = %session_id,
@@ -2252,6 +2498,10 @@ impl SessionRunner {
                         mode: self.mode,
 
                         turn_id: step as u64,
+
+                        runtime_config: self.runtime_config.clone(),
+
+                        mcp_manager: Arc::clone(&self.mcp_manager),
 
                         project_root: project_root.clone(),
                     };
@@ -2429,6 +2679,20 @@ impl SessionRunner {
                 );
 
                 let _ = flush_parts(&assistant_parts);
+
+                if self.is_cancelled() {
+                    tracing::info!(
+                        session_id = %session_id,
+                        step = step,
+                        tool = %name,
+                        tool_call_id = %id,
+                        "session run cancelled after tool dispatch"
+                    );
+                    self.mark_cancelled_tool_calls(&mut assistant_parts, pending_iter);
+                    needs_continuation = false;
+                    let _ = flush_parts(&assistant_parts);
+                    break;
+                }
             }
         }
 
@@ -3172,6 +3436,18 @@ pub fn tools_for_model(model_id: &str, readonly: bool) -> Vec<crate::llm::events
     tools
 }
 
+async fn tools_for_model_with_runtime(
+    model_id: &str,
+    readonly: bool,
+    runtime_config: &crate::config::RuntimeConfig,
+    mcp_manager: &crate::mcp::McpManager,
+) -> Vec<crate::llm::events::ToolDefinition> {
+    let mut tools = tools_for_model(model_id, readonly);
+    tools.extend(mcp_manager.tool_definitions(runtime_config, readonly).await);
+    sort_tools_by_name(&mut tools);
+    tools
+}
+
 /// Sort tool definitions in-place by name. Tool order on the wire
 
 /// is significant for prompt caching (Anthropic and OpenAI both
@@ -3192,6 +3468,7 @@ fn sort_tools_by_name(tools: &mut [crate::llm::events::ToolDefinition]) {
 
 pub struct RunResult {
     pub steps: u32,
+    pub stopped: bool,
 }
 
 #[derive(Debug)]
