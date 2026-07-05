@@ -3,13 +3,15 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::database::{Database, ProviderAuthStateRepository, ProviderConfigRepository};
+use crate::database::{
+    Database, ProviderAuthStateRepository, ProviderConfigRepository, ProviderOAuthProfileRepository,
+};
 use crate::llm::providers::{
     aisdk_provider_base_url_env, aisdk_provider_model_env, aisdk_supported_provider_names,
 };
 use crate::{
     ProviderAuthFieldType, ProviderAuthState, ProviderConfig, ProviderOAuthAuthorization,
-    ProviderProtocol,
+    ProviderOAuthProfile, ProviderProtocol,
 };
 
 use crate::provider_oauth::ProviderOAuthCoordinator;
@@ -109,7 +111,11 @@ impl ProviderService {
             }
         }
         self.seed_auth_states_from_legacy_api_keys(&db, &configs)?;
+        ProviderOAuthProfileRepository::backfill_from_auth_states(&db)?;
         let auth_states = ProviderAuthStateRepository::list(&db)?
+            .into_iter()
+            .map(|auth| self.hydrate_auth_state_from_active_profile(&db, auth))
+            .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .map(normalize_auth_state)
             .collect::<Vec<_>>();
@@ -166,7 +172,9 @@ impl ProviderService {
     pub fn get_auth_state(&self, provider_name: &str) -> Result<ProviderAuthState, String> {
         let db = self.db()?;
         if let Some(auth) = ProviderAuthStateRepository::find_by_provider(&db, provider_name)? {
-            return Ok(normalize_auth_state(auth));
+            return self
+                .hydrate_auth_state_from_active_profile(&db, auth)
+                .map(normalize_auth_state);
         }
 
         let mut auth = ProviderAuthState::new(provider_name.to_string());
@@ -174,6 +182,36 @@ impl ProviderService {
             .and_then(|config| config.api_key)
             .and_then(non_empty);
         Ok(auth)
+    }
+
+    fn hydrate_auth_state_from_active_profile(
+        &self,
+        db: &Database,
+        mut auth: ProviderAuthState,
+    ) -> Result<ProviderAuthState, String> {
+        if auth.field_type != ProviderAuthFieldType::OAuth {
+            return Ok(auth);
+        }
+        if let Some(profile) =
+            ProviderOAuthProfileRepository::active_for_provider(db, &auth.provider_name)?
+        {
+            auth.access_token = Some(profile.access_token);
+            auth.refresh_token = profile.refresh_token;
+            auth.account_id = profile.account_id;
+        }
+        Ok(auth)
+    }
+
+    fn refresh_runtime_auth(&self, provider_name: &str, auth: &ProviderAuthState) {
+        let mut configs = self.configs.write();
+        if let Some(config) = configs
+            .iter_mut()
+            .find(|config| config.name == provider_name)
+        {
+            config.auth_field_type = auth.field_type.clone();
+            config.api_key = auth.selected_token().and_then(non_empty);
+            config.auth_account_id = auth.account_id.clone().and_then(non_empty);
+        }
     }
 
     pub fn upsert_auth_state(&self, auth: ProviderAuthState) -> Result<(), String> {
@@ -221,22 +259,80 @@ impl ProviderService {
         self.oauth.start(provider_name).await
     }
 
-    pub async fn complete_oauth(&self, provider_name: &str) -> Result<ProviderAuthState, String> {
+    pub async fn complete_oauth(
+        &self,
+        provider_name: &str,
+        profile_label: Option<String>,
+    ) -> Result<ProviderOAuthProfile, String> {
         let tokens = self.oauth.complete(provider_name).await?;
+        let label = profile_label
+            .and_then(non_empty)
+            .unwrap_or_else(|| "Default".to_string());
+        let profile = ProviderOAuthProfile::new(
+            provider_name.to_string(),
+            label,
+            tokens.access_token,
+            tokens.refresh_token,
+            tokens.account_id,
+            true,
+        );
+        let db = self.db()?;
+        ProviderOAuthProfileRepository::upsert(&db, &profile)?;
+
         let mut auth = self.get_auth_state(provider_name)?;
         auth.field_type = ProviderAuthFieldType::OAuth;
-        auth.access_token = Some(tokens.access_token);
-        auth.refresh_token = tokens.refresh_token;
-        auth.account_id = tokens.account_id;
+        auth.access_token = Some(profile.access_token.clone());
+        auth.refresh_token = profile.refresh_token.clone();
+        auth.account_id = profile.account_id.clone();
         tracing::debug!(
             provider = %provider_name,
+            profile_id = %profile.id,
+            profile_label = %profile.label,
             has_access_token = auth.access_token.is_some(),
             has_refresh_token = auth.refresh_token.is_some(),
             has_account_id = auth.account_id.is_some(),
-            "completed provider oauth and received token set"
+            "completed provider oauth and stored active profile"
         );
-        self.upsert_auth_state(auth.clone())?;
-        Ok(auth)
+        ProviderAuthStateRepository::upsert(&db, &auth)?;
+        self.refresh_runtime_auth(provider_name, &auth);
+        Ok(profile)
+    }
+
+    pub fn list_oauth_profiles(
+        &self,
+        provider_name: &str,
+    ) -> Result<Vec<ProviderOAuthProfile>, String> {
+        let db = self.db()?;
+        ProviderOAuthProfileRepository::list_by_provider(&db, provider_name)
+    }
+
+    pub fn set_active_oauth_profile(
+        &self,
+        provider_name: &str,
+        profile_id: &str,
+    ) -> Result<ProviderOAuthProfile, String> {
+        let db = self.db()?;
+        ProviderOAuthProfileRepository::set_active(&db, provider_name, profile_id)?;
+        let profile = ProviderOAuthProfileRepository::active_for_provider(&db, provider_name)?
+            .ok_or_else(|| format!("No active OAuth profile for provider {provider_name}"))?;
+        let mut auth = self.get_auth_state(provider_name)?;
+        auth.field_type = ProviderAuthFieldType::OAuth;
+        auth.access_token = Some(profile.access_token.clone());
+        auth.refresh_token = profile.refresh_token.clone();
+        auth.account_id = profile.account_id.clone();
+        ProviderAuthStateRepository::upsert(&db, &auth)?;
+        self.refresh_runtime_auth(provider_name, &auth);
+        Ok(profile)
+    }
+
+    pub fn rename_oauth_profile(&self, profile_id: &str, label: &str) -> Result<(), String> {
+        let db = self.db()?;
+        ProviderOAuthProfileRepository::rename(&db, profile_id, label)
+    }
+
+    pub fn delete_oauth_profile(&self, profile_id: &str) -> Result<(), String> {
+        let db = self.db()?;
+        ProviderOAuthProfileRepository::delete(&db, profile_id)
     }
 
     pub fn pending_oauth(&self, provider_name: &str) -> Option<ProviderOAuthAuthorization> {
@@ -248,7 +344,9 @@ impl ProviderService {
         if !self.db_path.as_os_str().is_empty() {
             let db = self.db()?;
             if let Some(auth) = ProviderAuthStateRepository::find_by_provider(&db, &config.name)? {
-                let auth = normalize_auth_state(auth);
+                let auth = self
+                    .hydrate_auth_state_from_active_profile(&db, auth)
+                    .map(normalize_auth_state)?;
                 config.auth_field_type = auth.field_type.clone();
                 config.api_key = auth.selected_token().and_then(non_empty);
                 config.auth_account_id = auth.account_id.clone().and_then(non_empty);

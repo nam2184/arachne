@@ -34,7 +34,20 @@ export interface ProviderAuthState {
   field_type: "API_KEY" | "OAUTH";
   access_token?: string | null;
   refresh_token?: string | null;
+  account_id?: string | null;
   api_key?: string | null;
+}
+
+export interface ProviderOAuthProfile {
+  id: string;
+  provider_name: string;
+  label: string;
+  access_token: string;
+  refresh_token?: string | null;
+  account_id?: string | null;
+  created_at: string;
+  last_used_at?: string | null;
+  is_active: boolean;
 }
 
 export interface ProviderOAuthAuthorization {

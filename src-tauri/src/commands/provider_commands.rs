@@ -1,6 +1,6 @@
 use arachne_agents::{
     ProviderAuthFieldType, ProviderAuthState, ProviderConfig, ProviderOAuthAuthorization,
-    ProviderService,
+    ProviderOAuthProfile, ProviderService,
 };
 use std::sync::Arc;
 use tauri::State;
@@ -64,9 +64,46 @@ pub async fn start_provider_oauth(
 #[tauri::command]
 pub async fn complete_provider_oauth(
     provider_name: String,
+    profile_label: Option<String>,
     provider_service: State<'_, Arc<ProviderService>>,
-) -> Result<ProviderAuthState, String> {
-    provider_service.complete_oauth(&provider_name).await
+) -> Result<ProviderOAuthProfile, String> {
+    provider_service
+        .complete_oauth(&provider_name, profile_label)
+        .await
+}
+
+#[tauri::command]
+pub async fn list_provider_oauth_profiles(
+    provider_name: String,
+    provider_service: State<'_, Arc<ProviderService>>,
+) -> Result<Vec<ProviderOAuthProfile>, String> {
+    provider_service.list_oauth_profiles(&provider_name)
+}
+
+#[tauri::command]
+pub async fn set_active_provider_oauth_profile(
+    provider_name: String,
+    profile_id: String,
+    provider_service: State<'_, Arc<ProviderService>>,
+) -> Result<ProviderOAuthProfile, String> {
+    provider_service.set_active_oauth_profile(&provider_name, &profile_id)
+}
+
+#[tauri::command]
+pub async fn rename_provider_oauth_profile(
+    profile_id: String,
+    label: String,
+    provider_service: State<'_, Arc<ProviderService>>,
+) -> Result<(), String> {
+    provider_service.rename_oauth_profile(&profile_id, &label)
+}
+
+#[tauri::command]
+pub async fn delete_provider_oauth_profile(
+    profile_id: String,
+    provider_service: State<'_, Arc<ProviderService>>,
+) -> Result<(), String> {
+    provider_service.delete_oauth_profile(&profile_id)
 }
 
 #[tauri::command]

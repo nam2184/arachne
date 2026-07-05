@@ -4,7 +4,7 @@ use rusqlite::params;
 use crate::database::connection::Database;
 use crate::{
     AgentSession, Message, MessageRole, Project, ProviderAuthFieldType, ProviderAuthState,
-    ProviderConfig, ProviderProtocol, SessionGroup,
+    ProviderConfig, ProviderOAuthProfile, ProviderProtocol, SessionGroup,
 };
 
 pub struct ProjectRepository;
@@ -1163,6 +1163,109 @@ mod tests {
         assert_eq!(found.account_id.as_deref(), Some("acc-test"));
     }
 
+    #[test]
+    fn oauth_profiles_can_switch_active_profile_per_provider() {
+        let (db, _guard) = test_db();
+        let work = ProviderOAuthProfile::new(
+            "openai".to_string(),
+            "Work".to_string(),
+            "work-access".to_string(),
+            Some("work-refresh".to_string()),
+            Some("acc-work".to_string()),
+            true,
+        );
+        let personal = ProviderOAuthProfile::new(
+            "openai".to_string(),
+            "Personal".to_string(),
+            "personal-access".to_string(),
+            Some("personal-refresh".to_string()),
+            Some("acc-personal".to_string()),
+            false,
+        );
+
+        ProviderOAuthProfileRepository::upsert(&db, &work).unwrap();
+        ProviderOAuthProfileRepository::upsert(&db, &personal).unwrap();
+        ProviderOAuthProfileRepository::set_active(&db, "openai", &personal.id).unwrap();
+
+        let active = ProviderOAuthProfileRepository::active_for_provider(&db, "openai")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.id, personal.id);
+        assert_eq!(active.label, "Personal");
+        assert_eq!(active.access_token, "personal-access");
+
+        let profiles = ProviderOAuthProfileRepository::list_by_provider(&db, "openai").unwrap();
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(
+            profiles.iter().filter(|profile| profile.is_active).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn oauth_profiles_backfill_legacy_oauth_state_as_default_profile() {
+        let (db, _guard) = test_db();
+        let mut auth = ProviderAuthState::new("openai".to_string());
+        auth.field_type = ProviderAuthFieldType::OAuth;
+        auth.access_token = Some("legacy-access".to_string());
+        auth.refresh_token = Some("legacy-refresh".to_string());
+        auth.account_id = Some("acc-legacy".to_string());
+        ProviderAuthStateRepository::upsert(&db, &auth).unwrap();
+
+        ProviderOAuthProfileRepository::backfill_from_auth_states(&db).unwrap();
+
+        let profiles = ProviderOAuthProfileRepository::list_by_provider(&db, "openai").unwrap();
+        assert_eq!(profiles.len(), 1);
+        let profile = &profiles[0];
+        assert_eq!(profile.label, "Default");
+        assert_eq!(profile.access_token, "legacy-access");
+        assert_eq!(profile.refresh_token.as_deref(), Some("legacy-refresh"));
+        assert_eq!(profile.account_id.as_deref(), Some("acc-legacy"));
+        assert!(profile.is_active);
+    }
+
+    #[test]
+    fn oauth_profiles_reject_duplicate_labels_per_provider() {
+        let (db, _guard) = test_db();
+        let first = ProviderOAuthProfile::new(
+            "openai".to_string(),
+            "Work".to_string(),
+            "first-access".to_string(),
+            None,
+            None,
+            true,
+        );
+        let second = ProviderOAuthProfile::new(
+            "openai".to_string(),
+            "Work".to_string(),
+            "second-access".to_string(),
+            None,
+            None,
+            false,
+        );
+
+        ProviderOAuthProfileRepository::upsert(&db, &first).unwrap();
+        let error = ProviderOAuthProfileRepository::upsert(&db, &second).unwrap_err();
+        assert!(error.contains("UNIQUE"));
+    }
+
+    #[test]
+    fn oauth_profiles_refuse_to_delete_active_profile() {
+        let (db, _guard) = test_db();
+        let profile = ProviderOAuthProfile::new(
+            "openai".to_string(),
+            "Work".to_string(),
+            "access".to_string(),
+            None,
+            None,
+            true,
+        );
+        ProviderOAuthProfileRepository::upsert(&db, &profile).unwrap();
+
+        let error = ProviderOAuthProfileRepository::delete(&db, &profile.id).unwrap_err();
+        assert!(error.contains("active OAuth profile"));
+    }
+
     // ---------------------------------------------------------------------
     // Multi-connection sanity check (proves temp-file approach works)
     // ---------------------------------------------------------------------
@@ -1428,6 +1531,218 @@ impl ProviderAuthStateRepository {
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+}
+
+pub struct ProviderOAuthProfileRepository;
+
+impl ProviderOAuthProfileRepository {
+    pub fn upsert(db: &Database, profile: &ProviderOAuthProfile) -> Result<(), String> {
+        if profile.label.trim().is_empty() {
+            return Err("OAuth profile label is required".to_string());
+        }
+        if profile.access_token.trim().is_empty() {
+            return Err("OAuth profile access token is required".to_string());
+        }
+
+        db.connection()
+            .execute(
+                "INSERT INTO provider_oauth_profiles (id, provider_name, label, access_token, refresh_token, account_id, created_at, last_used_at, is_active) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id) DO UPDATE SET provider_name = excluded.provider_name, label = excluded.label, access_token = excluded.access_token, refresh_token = excluded.refresh_token, account_id = excluded.account_id, created_at = excluded.created_at, last_used_at = excluded.last_used_at, is_active = excluded.is_active",
+                params![
+                    profile.id,
+                    profile.provider_name,
+                    profile.label.trim(),
+                    profile.access_token,
+                    profile.refresh_token,
+                    profile.account_id,
+                    profile.created_at.to_rfc3339(),
+                    profile.last_used_at.map(|timestamp| timestamp.to_rfc3339()),
+                    profile.is_active as i32,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+
+        if profile.is_active {
+            Self::set_active(db, &profile.provider_name, &profile.id)?;
+        }
+        Ok(())
+    }
+
+    pub fn list_by_provider(
+        db: &Database,
+        provider_name: &str,
+    ) -> Result<Vec<ProviderOAuthProfile>, String> {
+        let mut stmt = db
+            .connection()
+            .prepare(
+                "SELECT id, provider_name, label, access_token, refresh_token, account_id, created_at, last_used_at, is_active FROM provider_oauth_profiles WHERE provider_name = ?1 ORDER BY is_active DESC, COALESCE(last_used_at, created_at) DESC, label ASC",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let profiles = stmt
+            .query_map(params![provider_name], |row| oauth_profile_from_row(row))
+            .map_err(|e| e.to_string())?
+            .filter_map(|row| row.ok())
+            .collect();
+
+        Ok(profiles)
+    }
+
+    pub fn active_for_provider(
+        db: &Database,
+        provider_name: &str,
+    ) -> Result<Option<ProviderOAuthProfile>, String> {
+        let mut stmt = db
+            .connection()
+            .prepare(
+                "SELECT id, provider_name, label, access_token, refresh_token, account_id, created_at, last_used_at, is_active FROM provider_oauth_profiles WHERE provider_name = ?1 AND is_active = 1 LIMIT 1",
+            )
+            .map_err(|e| e.to_string())?;
+
+        Ok(stmt
+            .query_row(params![provider_name], |row| oauth_profile_from_row(row))
+            .ok())
+    }
+
+    pub fn find_by_id(db: &Database, id: &str) -> Result<Option<ProviderOAuthProfile>, String> {
+        let mut stmt = db
+            .connection()
+            .prepare(
+                "SELECT id, provider_name, label, access_token, refresh_token, account_id, created_at, last_used_at, is_active FROM provider_oauth_profiles WHERE id = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+
+        Ok(stmt
+            .query_row(params![id], |row| oauth_profile_from_row(row))
+            .ok())
+    }
+
+    pub fn set_active(db: &Database, provider_name: &str, id: &str) -> Result<(), String> {
+        let Some(profile) = Self::find_by_id(db, id)? else {
+            return Err(format!("OAuth profile {id} not found"));
+        };
+        if profile.provider_name != provider_name {
+            return Err(format!(
+                "OAuth profile {id} belongs to provider {}, not {provider_name}",
+                profile.provider_name
+            ));
+        }
+
+        let now = Utc::now().to_rfc3339();
+        db.connection()
+            .execute_batch("BEGIN IMMEDIATE TRANSACTION")
+            .map_err(|e| e.to_string())?;
+        let result = (|| {
+            db.connection()
+                .execute(
+                    "UPDATE provider_oauth_profiles SET is_active = 0 WHERE provider_name = ?1",
+                    params![provider_name],
+                )
+                .map_err(|e| e.to_string())?;
+            db.connection()
+                .execute(
+                    "UPDATE provider_oauth_profiles SET is_active = 1, last_used_at = ?1 WHERE id = ?2",
+                    params![now, id],
+                )
+                .map_err(|e| e.to_string())?;
+            Ok::<(), String>(())
+        })();
+
+        if let Err(error) = result {
+            let _ = db.connection().execute_batch("ROLLBACK");
+            return Err(error);
+        }
+        db.connection()
+            .execute_batch("COMMIT")
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn rename(db: &Database, id: &str, label: &str) -> Result<(), String> {
+        let label = label.trim();
+        if label.is_empty() {
+            return Err("OAuth profile label is required".to_string());
+        }
+        db.connection()
+            .execute(
+                "UPDATE provider_oauth_profiles SET label = ?1 WHERE id = ?2",
+                params![label, id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete(db: &Database, id: &str) -> Result<(), String> {
+        if let Some(profile) = Self::find_by_id(db, id)? {
+            if profile.is_active {
+                return Err(
+                    "Cannot delete the active OAuth profile. Switch accounts first.".to_string(),
+                );
+            }
+        }
+        db.connection()
+            .execute(
+                "DELETE FROM provider_oauth_profiles WHERE id = ?1",
+                params![id],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn backfill_from_auth_states(db: &Database) -> Result<(), String> {
+        let auth_states = ProviderAuthStateRepository::list(db)?;
+        for auth in auth_states {
+            if auth.field_type != ProviderAuthFieldType::OAuth {
+                continue;
+            }
+            let Some(access_token) = auth.access_token.clone().and_then(non_empty) else {
+                continue;
+            };
+            if Self::active_for_provider(db, &auth.provider_name)?.is_some() {
+                continue;
+            }
+            let profile = ProviderOAuthProfile::new(
+                auth.provider_name.clone(),
+                "Default".to_string(),
+                access_token,
+                auth.refresh_token.clone().and_then(non_empty),
+                auth.account_id.clone().and_then(non_empty),
+                true,
+            );
+            Self::upsert(db, &profile)?;
+        }
+        Ok(())
+    }
+}
+
+fn oauth_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderOAuthProfile> {
+    let created_at: String = row.get(6)?;
+    let last_used_at: Option<String> = row.get(7)?;
+    Ok(ProviderOAuthProfile {
+        id: row.get(0)?,
+        provider_name: row.get(1)?,
+        label: row.get(2)?,
+        access_token: row.get(3)?,
+        refresh_token: row.get(4)?,
+        account_id: row.get(5)?,
+        created_at: DateTime::parse_from_rfc3339(&created_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        last_used_at: last_used_at.and_then(|timestamp| {
+            DateTime::parse_from_rfc3339(&timestamp)
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok()
+        }),
+        is_active: row.get::<_, i32>(8)? != 0,
+    })
+}
+
+fn non_empty(value: String) -> Option<String> {
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 

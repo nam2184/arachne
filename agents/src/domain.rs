@@ -323,6 +323,43 @@ impl ProviderAuthState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderOAuthProfile {
+    pub id: String,
+    pub provider_name: String,
+    pub label: String,
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub account_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub is_active: bool,
+}
+
+impl ProviderOAuthProfile {
+    pub fn new(
+        provider_name: String,
+        label: String,
+        access_token: String,
+        refresh_token: Option<String>,
+        account_id: Option<String>,
+        is_active: bool,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4().to_string(),
+            provider_name,
+            label,
+            access_token,
+            refresh_token,
+            account_id,
+            created_at: now,
+            last_used_at: if is_active { Some(now) } else { None },
+            is_active,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderProtocol {
     OpenAI,

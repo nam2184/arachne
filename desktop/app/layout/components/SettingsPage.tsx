@@ -8,7 +8,7 @@ import {
   getModelOptions,
   getModelSpec,
 } from "@/features/sessions/providerModels";
-import type { ProviderAuthState, ProviderConfig, ProviderOAuthAuthorization } from "@/features/sessions/sessionStore";
+import type { ProviderAuthState, ProviderConfig, ProviderOAuthAuthorization, ProviderOAuthProfile } from "@/features/sessions/sessionStore";
 import { cn } from "@/lib/utils";
 import { CODE_BLOCK_THEMES, CURSOR_THEMES, useAppStore, type CodeBlockTheme, type CursorTheme, type McpServerConfig, type McpTransport, type NodeSkin, type WorkspaceMode } from "@/features/app/appStore";
 import { Button } from "@/components/ui/button";
@@ -87,6 +87,7 @@ export function SettingsPage({ open, onClose }: SettingsPageProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>("appearance");
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [providerAuthStates, setProviderAuthStates] = useState<Map<string, ProviderAuthState>>(() => new Map());
+  const [providerOAuthProfiles, setProviderOAuthProfiles] = useState<Map<string, ProviderOAuthProfile[]>>(() => new Map());
   const [selectedProviderName, setSelectedProviderName] = useState("");
   const [providerDraft, setProviderDraft] = useState<ProviderDraft>(emptyProviderDraft);
   const [selectedMcpServerName, setSelectedMcpServerName] = useState("");
@@ -135,8 +136,15 @@ export function SettingsPage({ open, onClose }: SettingsPageProps) {
       invoke<ProviderAuthState[]>("get_provider_auth_states"),
     ]);
     const authByProvider = new Map(authStates.map((auth) => [auth.provider_name, auth]));
+    const oauthProfiles = await Promise.all(
+      configs.map(async (config) => [
+        config.name,
+        await invoke<ProviderOAuthProfile[]>("list_provider_oauth_profiles", { providerName: config.name }),
+      ] as const),
+    );
     setProviders(configs);
     setProviderAuthStates(authByProvider);
+    setProviderOAuthProfiles(new Map(oauthProfiles));
 
     const selected = configs.find((config) => config.name === selectedProviderName) ?? configs[0];
     if (selected) {
@@ -203,16 +211,17 @@ export function SettingsPage({ open, onClose }: SettingsPageProps) {
     setOauthAuthorizationUrl(null);
 
     try {
+      const profileLabel = window.prompt("Name this Codex/OpenAI account", "Default")?.trim() || "Default";
       const authorization = await invoke<ProviderOAuthAuthorization>("start_provider_oauth", { providerName });
       setOauthAuthorizationUrl(authorization.authorization_url);
       setStatus("Open the OAuth URL in your external browser. Waiting for the browser callback...");
-      await invoke<ProviderAuthState>("complete_provider_oauth", { providerName });
+      const profile = await invoke<ProviderOAuthProfile>("complete_provider_oauth", { providerName, profileLabel });
       setProviderDraft((draft) => ({
         ...draft,
         field_type: "OAUTH",
       }));
       setOauthAuthorizationUrl(null);
-      setStatus("OpenAI OAuth connected.");
+      setStatus(`OpenAI OAuth connected as ${profile.label}.`);
       await loadProviders();
     } catch (oauthError) {
       setError(formatError(oauthError));
@@ -225,6 +234,50 @@ export function SettingsPage({ open, onClose }: SettingsPageProps) {
     if (!oauthAuthorizationUrl) return;
     await navigator.clipboard.writeText(oauthAuthorizationUrl);
     setStatus("OAuth URL copied. Paste it into your external browser.");
+  }
+
+  async function activateOAuthProfile(profileId: string) {
+    const providerName = providerDraft.name.trim();
+    setError(null);
+    setStatus(null);
+    try {
+      const profile = await invoke<ProviderOAuthProfile>("set_active_provider_oauth_profile", { providerName, profileId });
+      setStatus(`Switched OpenAI OAuth account to ${profile.label}.`);
+      await loadProviders();
+    } catch (switchError) {
+      setError(formatError(switchError));
+    }
+  }
+
+  async function renameOAuthProfile(profile: ProviderOAuthProfile) {
+    const label = window.prompt("Rename this Codex/OpenAI account", profile.label)?.trim();
+    if (!label || label === profile.label) return;
+    setError(null);
+    setStatus(null);
+    try {
+      await invoke("rename_provider_oauth_profile", { profileId: profile.id, label });
+      setStatus(`Renamed OAuth account to ${label}.`);
+      await loadProviders();
+    } catch (renameError) {
+      setError(formatError(renameError));
+    }
+  }
+
+  async function deleteOAuthProfile(profile: ProviderOAuthProfile) {
+    if (profile.is_active) {
+      setError("Switch to a different OAuth account before deleting the active one.");
+      return;
+    }
+    if (!window.confirm(`Delete OAuth account ${profile.label}?`)) return;
+    setError(null);
+    setStatus(null);
+    try {
+      await invoke("delete_provider_oauth_profile", { profileId: profile.id });
+      setStatus(`Deleted OAuth account ${profile.label}.`);
+      await loadProviders();
+    } catch (deleteError) {
+      setError(formatError(deleteError));
+    }
   }
 
   async function handleThemeToggle() {
@@ -323,6 +376,8 @@ export function SettingsPage({ open, onClose }: SettingsPageProps) {
   const modelContextWindow = selectedSpec?.context_window ?? getContextWindow(providerDraft.model);
   const modelMaxOutput = selectedSpec?.max_output ?? getMaxOutput(providerDraft.model);
   const selectedAuthState = providerAuthStates.get(providerDraft.name.trim());
+  const selectedOAuthProfiles = providerOAuthProfiles.get(providerDraft.name.trim()) ?? [];
+  const activeOAuthProfile = selectedOAuthProfiles.find((profile) => profile.is_active);
   const hasOAuthAccessToken = Boolean(selectedAuthState?.access_token);
   const hasOAuthRefreshToken = Boolean(selectedAuthState?.refresh_token);
 
@@ -744,14 +799,52 @@ export function SettingsPage({ open, onClose }: SettingsPageProps) {
                     </div>
                   )}
                   <div className="rounded-none border border-[var(--border)] bg-[var(--surface)] p-3 text-xs text-[var(--text-secondary)]">
-                    <p className="text-[10px] uppercase tracking-wider text-[var(--text-muted)]">OAuth tokens</p>
-                    <p className="mt-1">
-                      Access token: <span className="text-[var(--foreground)]">{hasOAuthAccessToken ? "Connected" : "Not connected"}</span>
-                    </p>
-                    <p>
-                      Refresh token: <span className="text-[var(--foreground)]">{hasOAuthRefreshToken ? "Stored" : "Not stored"}</span>
-                    </p>
-                    <p className="mt-2">Tokens are managed by Connect OpenAI OAuth and cannot be edited here.</p>
+                    <p className="text-[10px] uppercase tracking-wider text-[var(--text-muted)]">OAuth accounts</p>
+                    {selectedOAuthProfiles.length === 0 ? (
+                      <p className="mt-2">No Codex/OpenAI OAuth accounts saved yet.</p>
+                    ) : (
+                      <div className="mt-2 space-y-2">
+                        {selectedOAuthProfiles.map((profile) => (
+                          <div key={profile.id} className="rounded-none border border-[var(--border)] bg-[var(--input-bg)] p-2">
+                            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                              <div className="min-w-0">
+                                <p className="truncate text-sm font-medium text-[var(--foreground)]">
+                                  {profile.label} {profile.is_active ? "(active)" : ""}
+                                </p>
+                                <p className="truncate text-[10px] text-[var(--text-subtle)]">
+                                  Account: {profile.account_id || "unknown"}
+                                </p>
+                              </div>
+                              <div className="flex shrink-0 gap-2">
+                                {!profile.is_active && (
+                                  <Button size="sm" variant="secondary" onClick={() => activateOAuthProfile(profile.id)}>
+                                    Use
+                                  </Button>
+                                )}
+                                <Button size="sm" variant="secondary" onClick={() => renameOAuthProfile(profile)}>
+                                  Rename
+                                </Button>
+                                <Button size="sm" variant="secondary" onClick={() => deleteOAuthProfile(profile)} disabled={profile.is_active}>
+                                  Delete
+                                </Button>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <div className="mt-3 border-t border-[var(--border)] pt-3">
+                      <p>
+                        Active profile: <span className="text-[var(--foreground)]">{activeOAuthProfile?.label ?? "None"}</span>
+                      </p>
+                      <p>
+                        Access token: <span className="text-[var(--foreground)]">{hasOAuthAccessToken ? "Connected" : "Not connected"}</span>
+                      </p>
+                      <p>
+                        Refresh token: <span className="text-[var(--foreground)]">{hasOAuthRefreshToken ? "Stored" : "Not stored"}</span>
+                      </p>
+                      <p className="mt-2">Tokens are stored per named account and cannot be edited here.</p>
+                    </div>
                   </div>
                 </div>
               )}

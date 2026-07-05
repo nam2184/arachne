@@ -85,6 +85,18 @@ impl Database {
                 api_key TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS provider_oauth_profiles (
+                id TEXT PRIMARY KEY,
+                provider_name TEXT NOT NULL,
+                label TEXT NOT NULL,
+                access_token TEXT NOT NULL,
+                refresh_token TEXT,
+                account_id TEXT,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT,
+                is_active INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 id TEXT PRIMARY KEY,
                 applied_at TEXT NOT NULL
@@ -167,6 +179,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_session_groups_session ON session_group_sessions(session_id);
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
             CREATE INDEX IF NOT EXISTS idx_memory_project ON memory(project_id);
+            CREATE INDEX IF NOT EXISTS idx_provider_oauth_profiles_provider_active ON provider_oauth_profiles(provider_name, is_active);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_oauth_profiles_provider_label ON provider_oauth_profiles(provider_name, label);
             "
         ).map_err(|e| e.to_string())?;
 
