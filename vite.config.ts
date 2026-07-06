@@ -7,11 +7,20 @@ const host = process.env.TAURI_DEV_HOST;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export default defineConfig({
+export default defineConfig(({ mode }) => {
+  const stub = process.env.VITE_TAURI_STUB === "1";
+  return {
   plugins: [react()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "desktop"),
+      ...(stub
+              ? {
+                  "@tauri-apps/api/core": path.resolve(__dirname, "desktop/dev/tauri-stub.ts"),
+                  "@tauri-apps/api/window": path.resolve(__dirname, "desktop/dev/tauri-window-stub.ts"),
+                  "@tauri-apps/api/event": path.resolve(__dirname, "desktop/dev/tauri-event-stub.ts"),
+                }
+              : {}),
     },
   },
   clearScreen: false,
@@ -36,4 +45,5 @@ export default defineConfig({
     minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
   },
+  };
 });
