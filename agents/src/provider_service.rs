@@ -112,6 +112,7 @@ impl ProviderService {
         }
         self.seed_auth_states_from_legacy_api_keys(&db, &configs)?;
         ProviderOAuthProfileRepository::backfill_from_auth_states(&db)?;
+        ProviderAuthStateRepository::clear_oauth_credentials(&db)?;
         let auth_states = ProviderAuthStateRepository::list(&db)?
             .into_iter()
             .map(|auth| self.hydrate_auth_state_from_active_profile(&db, auth))
@@ -164,6 +165,9 @@ impl ProviderService {
     pub fn get_auth_states(&self) -> Result<Vec<ProviderAuthState>, String> {
         let db = self.db()?;
         Ok(ProviderAuthStateRepository::list(&db)?
+            .into_iter()
+            .map(|auth| self.hydrate_auth_state_from_active_profile(&db, auth))
+            .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .map(normalize_auth_state)
             .collect())

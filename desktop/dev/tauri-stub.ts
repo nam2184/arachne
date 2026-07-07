@@ -5,11 +5,35 @@
 // without a real Tauri shell. Edit the seeded profiles/credentials here to
 // preview UI states.
 
-type Canned<T> = T | Error;
+type StubOAuthProfile = {
+  id: string;
+  provider_name: string;
+  label: string;
+  access_token: string;
+  refresh_token?: string | null;
+  account_id?: string | null;
+  created_at: string;
+  last_used_at?: string | null;
+  is_active: boolean;
+};
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-const profilesByProvider: Record<string, any[]> = {
+function publicProfile(profile: StubOAuthProfile) {
+  const { access_token: _accessToken, refresh_token: _refreshToken, ...rest } = profile;
+  return rest;
+}
+
+function setActiveAuthState(providerName: string, profile: StubOAuthProfile) {
+  const auth = providerAuthStates.find((state) => state.provider_name === providerName);
+  if (!auth) return;
+  auth.field_type = "OAUTH";
+  auth.access_token = profile.access_token;
+  auth.refresh_token = profile.refresh_token ?? null;
+  auth.account_id = profile.account_id ?? null;
+}
+
+const profilesByProvider: Record<string, StubOAuthProfile[]> = {
   openai: [
     {
       id: "prof_default",
@@ -110,7 +134,7 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
     case "list_provider_oauth_profiles": {
       const providerName = args?.providerName as string | undefined;
       if (!providerName) return [] as unknown as T;
-      return (profilesByProvider[providerName] ?? []) as unknown as T;
+      return (profilesByProvider[providerName] ?? []).map(publicProfile) as unknown as T;
     }
 
     case "set_active_provider_oauth_profile": {
@@ -120,7 +144,9 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
       const target = list.find((p) => p.id === profileId);
       if (!target) throw new Error(`profile ${profileId} not found for ${providerName}`);
       activeProfileIdByProvider[providerName] = profileId;
-      return list.map((p) => ({ ...p, is_active: p.id === profileId })) as unknown as T;
+      for (const p of list) p.is_active = p.id === profileId;
+      setActiveAuthState(providerName, target);
+      return publicProfile(target) as unknown as T;
     }
 
     case "rename_provider_oauth_profile": {
@@ -134,7 +160,7 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
               throw new Error(`label "${label}" already exists`);
             }
             p.label = label;
-            return p as unknown as T;
+            return publicProfile(p) as unknown as T;
           }
         }
       }
@@ -143,13 +169,13 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
 
     case "delete_provider_oauth_profile": {
       const profileId = args?.profileId as string;
-      for (const [providerName, list] of Object.entries(profilesByProvider)) {
+      for (const list of Object.values(profilesByProvider)) {
         const idx = list.findIndex((p) => p.id === profileId);
         if (idx >= 0) {
           const target = list[idx];
           if (target.is_active) throw new Error("cannot delete the active profile");
           list.splice(idx, 1);
-          return target as unknown as T;
+          return publicProfile(target) as unknown as T;
         }
       }
       throw new Error(`profile ${profileId} not found`);
@@ -187,7 +213,8 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
       for (const p of list) p.is_active = false;
       list.unshift(profile);
       activeProfileIdByProvider[providerName] = id;
-      return profile as unknown as T;
+      setActiveAuthState(providerName, profile);
+      return publicProfile(profile) as unknown as T;
     }
 
     case "upsert_provider_config":
@@ -203,7 +230,8 @@ export async function invoke<T = unknown>(cmd: string, args?: Record<string, unk
 
     default:
       // default no-op for unknown commands in browser preview
-      if (typeof process !== "undefined" && process?.env?.VITE_TAURI_STUB_DEBUG === "1") {
+      const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+      if (env?.VITE_TAURI_STUB_DEBUG === "1") {
         // eslint-disable-next-line no-console
         console.warn("[tauri-stub] unhandled invoke:", cmd, args);
       }

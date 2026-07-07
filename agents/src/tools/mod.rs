@@ -437,7 +437,7 @@ pub fn run_tool_with_context(call: &ToolCall, context: &ToolContext) -> ToolResu
         "question" => question::run(call),
         "webfetch" => webfetch::run(call),
         "websearch" => websearch::run(call),
-        "lsp" => lsp::run(call),
+        "lsp" => lsp::run_with_context(call, context),
         "plan" => plan::run(call),
         "external_directory" => external_directory::run(call),
         "invalid" => invalid::run(call),
@@ -796,7 +796,10 @@ pub async fn run_tool_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> Tool
         "skill" => skill::run(call),
         "todo" | "todowrite" => todo::run(call),
         "question" => question::run(call),
-        "lsp" => lsp::run(call),
+        "lsp" => {
+            let tool_context = ToolContext::new(PermissionMode::Build).with_project_root(ctx.project_root());
+            lsp::run_with_context(call, &tool_context)
+        }
         "plan" => plan::run(call),
         "external_directory" => external_directory::run(call),
         "invalid" => invalid::run(call),
@@ -807,7 +810,7 @@ pub async fn run_tool_sandboxed(call: &ToolCall, ctx: &SandboxedContext) -> Tool
 fn pattern_for(tool: &str, call: &ToolCall) -> String {
     let key = match tool {
         "read" | "read_file" | "write" | "write_file" | "edit" | "apply_patch" | "glob"
-        | "grep" | "search_files" => "path",
+        | "grep" | "search_files" | "lsp" => "path",
         "shell" | "bash" => "command",
         "webfetch" => "url",
         "websearch" => "query",

@@ -327,7 +327,9 @@ pub struct ProviderOAuthProfile {
     pub id: String,
     pub provider_name: String,
     pub label: String,
+    #[serde(skip_serializing, skip_deserializing)]
     pub access_token: String,
+    #[serde(skip_serializing, skip_deserializing)]
     pub refresh_token: Option<String>,
     pub account_id: Option<String>,
     pub created_at: DateTime<Utc>,

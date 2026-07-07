@@ -1136,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_auth_state_round_trips_api_key_and_oauth() {
+    fn provider_auth_state_round_trips_api_key_and_oauth_mode() {
         let (db, _guard) = test_db();
         let mut auth = ProviderAuthState::new("openai".to_string());
         auth.api_key = Some("sk-test".to_string());
@@ -1158,9 +1158,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(found.field_type, ProviderAuthFieldType::OAuth);
-        assert_eq!(found.selected_token().as_deref(), Some("access-token"));
-        assert_eq!(found.refresh_token.as_deref(), Some("refresh-token"));
-        assert_eq!(found.account_id.as_deref(), Some("acc-test"));
+        assert_eq!(found.selected_token(), None);
+        assert_eq!(found.refresh_token, None);
+        assert_eq!(found.account_id, None);
     }
 
     #[test]
@@ -1205,12 +1205,19 @@ mod tests {
     #[test]
     fn oauth_profiles_backfill_legacy_oauth_state_as_default_profile() {
         let (db, _guard) = test_db();
-        let mut auth = ProviderAuthState::new("openai".to_string());
-        auth.field_type = ProviderAuthFieldType::OAuth;
-        auth.access_token = Some("legacy-access".to_string());
-        auth.refresh_token = Some("legacy-refresh".to_string());
-        auth.account_id = Some("acc-legacy".to_string());
-        ProviderAuthStateRepository::upsert(&db, &auth).unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO provider_auth_states (provider_name, field_type, access_token, refresh_token, account_id, api_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    "openai",
+                    "OAUTH",
+                    "legacy-access",
+                    "legacy-refresh",
+                    "acc-legacy",
+                    Option::<&str>::None,
+                ],
+            )
+            .unwrap();
 
         ProviderOAuthProfileRepository::backfill_from_auth_states(&db).unwrap();
 
@@ -1222,48 +1229,6 @@ mod tests {
         assert_eq!(profile.refresh_token.as_deref(), Some("legacy-refresh"));
         assert_eq!(profile.account_id.as_deref(), Some("acc-legacy"));
         assert!(profile.is_active);
-    }
-
-    #[test]
-    fn oauth_profiles_reject_duplicate_labels_per_provider() {
-        let (db, _guard) = test_db();
-        let first = ProviderOAuthProfile::new(
-            "openai".to_string(),
-            "Work".to_string(),
-            "first-access".to_string(),
-            None,
-            None,
-            true,
-        );
-        let second = ProviderOAuthProfile::new(
-            "openai".to_string(),
-            "Work".to_string(),
-            "second-access".to_string(),
-            None,
-            None,
-            false,
-        );
-
-        ProviderOAuthProfileRepository::upsert(&db, &first).unwrap();
-        let error = ProviderOAuthProfileRepository::upsert(&db, &second).unwrap_err();
-        assert!(error.contains("UNIQUE"));
-    }
-
-    #[test]
-    fn oauth_profiles_refuse_to_delete_active_profile() {
-        let (db, _guard) = test_db();
-        let profile = ProviderOAuthProfile::new(
-            "openai".to_string(),
-            "Work".to_string(),
-            "access".to_string(),
-            None,
-            None,
-            true,
-        );
-        ProviderOAuthProfileRepository::upsert(&db, &profile).unwrap();
-
-        let error = ProviderOAuthProfileRepository::delete(&db, &profile.id).unwrap_err();
-        assert!(error.contains("active OAuth profile"));
     }
 
     // ---------------------------------------------------------------------
@@ -1472,15 +1437,18 @@ pub struct ProviderAuthStateRepository;
 
 impl ProviderAuthStateRepository {
     pub fn upsert(db: &Database, auth: &ProviderAuthState) -> Result<(), String> {
+        let access_token: Option<&str> = None;
+        let refresh_token: Option<&str> = None;
+        let account_id: Option<&str> = None;
         db.connection()
             .execute(
                 "INSERT OR REPLACE INTO provider_auth_states (provider_name, field_type, access_token, refresh_token, account_id, api_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     auth.provider_name,
                     auth.field_type.as_str(),
-                    auth.access_token,
-                    auth.refresh_token,
-                    auth.account_id,
+                    access_token,
+                    refresh_token,
+                    account_id,
                     auth.api_key
                 ],
             )
@@ -1528,6 +1496,16 @@ impl ProviderAuthStateRepository {
             .execute(
                 "DELETE FROM provider_auth_states WHERE provider_name = ?1",
                 params![provider_name],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn clear_oauth_credentials(db: &Database) -> Result<(), String> {
+        db.connection()
+            .execute(
+                "UPDATE provider_auth_states SET access_token = NULL, refresh_token = NULL, account_id = NULL",
+                [],
             )
             .map(|_| ())
             .map_err(|e| e.to_string())

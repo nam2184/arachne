@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Moon, Sun, Plus, Save, Settings, X } from "lucide-react";
-import { useEffect, useMemo, useState, type ChangeEvent } from "react";
+import { useEffect, useMemo, useState, type ChangeEvent, type FormEvent } from "react";
 import {
   getContextWindow,
   getDefaultModel,
@@ -13,6 +13,7 @@ import { cn } from "@/lib/utils";
 import { CODE_BLOCK_THEMES, CURSOR_THEMES, useAppStore, type CodeBlockTheme, type CursorTheme, type McpServerConfig, type McpTransport, type NodeSkin, type WorkspaceMode } from "@/features/app/appStore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PromptCard, PromptStack } from "@/components/ui/prompt-card";
 
 interface ProviderDraft {
   name: string;
@@ -36,6 +37,10 @@ interface McpServerDraft {
   url: string;
   headersText: string;
 }
+
+type OAuthProfileNamePrompt =
+  | { kind: "connect"; value: string }
+  | { kind: "rename"; profile: ProviderOAuthProfile; value: string };
 
 const emptyProviderDraft: ProviderDraft = {
   name: "",
@@ -100,6 +105,7 @@ export function SettingsPage({ open, onClose }: SettingsPageProps) {
   const [isSaving, setIsSaving] = useState(false);
   const [isConnectingOAuth, setIsConnectingOAuth] = useState(false);
   const [oauthAuthorizationUrl, setOauthAuthorizationUrl] = useState<string | null>(null);
+  const [oauthProfileNamePrompt, setOauthProfileNamePrompt] = useState<OAuthProfileNamePrompt | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -205,13 +211,18 @@ export function SettingsPage({ open, onClose }: SettingsPageProps) {
       return;
     }
 
+    setOauthProfileNamePrompt({ kind: "connect", value: "Default" });
+  }
+
+  async function completeOpenAiOAuth(profileLabel: string) {
+    const providerName = providerDraft.name.trim();
+
     setIsConnectingOAuth(true);
     setError(null);
     setStatus(null);
     setOauthAuthorizationUrl(null);
 
     try {
-      const profileLabel = window.prompt("Name this Codex/OpenAI account", "Default")?.trim() || "Default";
       const authorization = await invoke<ProviderOAuthAuthorization>("start_provider_oauth", { providerName });
       setOauthAuthorizationUrl(authorization.authorization_url);
       setStatus("Open the OAuth URL in your external browser. Waiting for the browser callback...");
@@ -250,7 +261,10 @@ export function SettingsPage({ open, onClose }: SettingsPageProps) {
   }
 
   async function renameOAuthProfile(profile: ProviderOAuthProfile) {
-    const label = window.prompt("Rename this Codex/OpenAI account", profile.label)?.trim();
+    setOauthProfileNamePrompt({ kind: "rename", profile, value: profile.label });
+  }
+
+  async function renameOAuthProfileTo(profile: ProviderOAuthProfile, label: string) {
     if (!label || label === profile.label) return;
     setError(null);
     setStatus(null);
@@ -260,6 +274,19 @@ export function SettingsPage({ open, onClose }: SettingsPageProps) {
       await loadProviders();
     } catch (renameError) {
       setError(formatError(renameError));
+    }
+  }
+
+  async function submitOAuthProfileName(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!oauthProfileNamePrompt) return;
+    const label = oauthProfileNamePrompt.value.trim() || "Default";
+    const prompt = oauthProfileNamePrompt;
+    setOauthProfileNamePrompt(null);
+    if (prompt.kind === "connect") {
+      await completeOpenAiOAuth(label);
+    } else {
+      await renameOAuthProfileTo(prompt.profile, label);
     }
   }
 
@@ -384,6 +411,7 @@ export function SettingsPage({ open, onClose }: SettingsPageProps) {
   if (!open) return null;
 
   return (
+    <>
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/55 p-3 text-[var(--foreground)] sm:p-5" role="dialog" aria-modal="true" aria-label="Settings">
       <div className="flex h-[min(760px,calc(100vh-1.5rem))] w-[min(1040px,calc(100vw-1.5rem))] flex-col overflow-hidden border border-[var(--border)] bg-[var(--background)] shadow-2xl sm:h-[min(760px,calc(100vh-2.5rem))] sm:w-[min(1040px,calc(100vw-2.5rem))]">
         <header className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3 sm:px-5">
@@ -895,6 +923,39 @@ export function SettingsPage({ open, onClose }: SettingsPageProps) {
       </div>
     </div>
     </div>
+      {oauthProfileNamePrompt && (
+        <PromptStack className="z-[120]">
+          <form className="w-full max-w-xl" onSubmit={submitOAuthProfileName}>
+            <PromptCard
+              className="max-w-none items-end"
+              title={oauthProfileNamePrompt.kind === "connect" ? "Name this Codex/OpenAI account" : "Rename this Codex/OpenAI account"}
+              detail={oauthProfileNamePrompt.kind === "connect" ? "openai: OAuth profile" : `openai: ${oauthProfileNamePrompt.profile.label}`}
+              actions={
+                <>
+                  <Button size="sm" type="submit">
+                    {oauthProfileNamePrompt.kind === "connect" ? "Continue" : "Rename"}
+                  </Button>
+                  <Button size="sm" type="button" variant="ghost" onClick={() => setOauthProfileNamePrompt(null)}>
+                    Cancel
+                  </Button>
+                </>
+              }
+            >
+              <Input
+                autoFocus
+                className="mt-2 border-[#2a2a2a] bg-[#0b0b0b] text-white focus-visible:ring-white"
+                value={oauthProfileNamePrompt.value}
+                onChange={(event) =>
+                  setOauthProfileNamePrompt((prompt) =>
+                    prompt ? { ...prompt, value: event.target.value } : prompt,
+                  )
+                }
+              />
+            </PromptCard>
+          </form>
+        </PromptStack>
+      )}
+    </>
   );
 }
 

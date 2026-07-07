@@ -124,6 +124,25 @@ pub struct GrepInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(description = "Static code intelligence for one file or a bounded workspace")]
+pub struct LspInput {
+    /// Action: document, diagnostics, symbols, or workspace.
+    pub action: String,
+    /// File path for file actions; workspace root for workspace.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Optional parser language override, such as rust or python.
+    #[serde(default)]
+    pub language_id: Option<String>,
+    /// Workspace file limit; capped by the tool.
+    #[serde(default)]
+    pub limit: Option<u64>,
+    /// Workspace traversal depth; capped by the tool.
+    #[serde(default)]
+    pub max_depth: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(description = "Fetch a web URL")]
 pub struct WebFetchInput {
     /// URL to fetch.
@@ -238,6 +257,13 @@ pub fn build_sdk_tool(name: &str, dispatcher: Arc<ToolDispatcherFn>) -> Result<T
             .name("read")
             .description("Read a file from disk.")
             .input_schema(schemars::schema_for!(ReadInput))
+            .execute(executor)
+            .build()
+            .map_err(|error| LlmError::new("sdk_tool", &error.to_string()))?,
+        "lsp" => Tool::builder()
+            .name("lsp")
+            .description("Static code intelligence for one file or a bounded workspace using tree-sitter. Use sparingly for structured symbols or parse-level syntax diagnostics; diagnostics are not compiler or real language-server diagnostics.")
+            .input_schema(schemars::schema_for!(LspInput))
             .execute(executor)
             .build()
             .map_err(|error| LlmError::new("sdk_tool", &error.to_string()))?,

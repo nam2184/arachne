@@ -3139,6 +3139,26 @@ fn default_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
             ),
         ),
         crate::llm::events::ToolDefinition::new(
+            "lsp",
+            "Static code intelligence for a file or bounded workspace using tree-sitter. Prefer read/grep/glob for ordinary inspection; use this when structured symbols or parse-level syntax diagnostics help. Diagnostics are not compiler or real language-server diagnostics.",
+            object_schema(
+                serde_json::json!({
+
+                    "action": { "type": "string", "enum": ["document", "diagnostics", "symbols", "workspace"], "description": "document/symbols/diagnostics analyze one file; workspace gives a bounded project overview" },
+
+                    "path": { "type": "string", "description": "File path for document, symbols, or diagnostics; workspace root for workspace" },
+
+                    "language_id": { "type": "string", "description": "Optional parser language override, such as rust, python, typescript, or lua" },
+
+                    "limit": { "type": "integer", "description": "Workspace file limit; capped by the tool", "minimum": 1, "maximum": 100 },
+
+                    "max_depth": { "type": "integer", "description": "Workspace traversal depth; capped by the tool", "minimum": 1, "maximum": 12 }
+
+                }),
+                &["action"],
+            ),
+        ),
+        crate::llm::events::ToolDefinition::new(
             "read",
             "Read a file from disk",
             object_schema(
@@ -3241,6 +3261,26 @@ pub fn readonly_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
 
                 }),
                 &["path", "pattern"],
+            ),
+        ),
+        crate::llm::events::ToolDefinition::new(
+            "lsp",
+            "Static code intelligence for one file or a bounded workspace. Use sparingly for structured symbols or parse-level syntax diagnostics; diagnostics are not compiler or real language-server diagnostics.",
+            object_schema(
+                serde_json::json!({
+
+                    "action": { "type": "string", "enum": ["document", "diagnostics", "symbols", "workspace"] },
+
+                    "path": { "type": "string", "description": "File path or workspace root" },
+
+                    "language_id": { "type": "string", "description": "Optional parser language override" },
+
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+
+                    "max_depth": { "type": "integer", "minimum": 1, "maximum": 12 }
+
+                }),
+                &["action"],
             ),
         ),
         crate::llm::events::ToolDefinition::new(
