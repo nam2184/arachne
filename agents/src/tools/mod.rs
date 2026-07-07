@@ -1,6 +1,7 @@
 pub mod apply_patch;
 pub mod edit;
 pub mod external_directory;
+pub mod ghidra;
 pub mod glob;
 pub mod grep;
 pub mod invalid;
@@ -438,7 +439,8 @@ pub fn run_tool_with_context(call: &ToolCall, context: &ToolContext) -> ToolResu
         "webfetch" => webfetch::run(call),
         "websearch" => websearch::run(call),
         "lsp" => lsp::run_with_context(call, context),
-        "plan" => plan::run(call),
+                "ghidra" => ghidra::run_with_context(call, context),
+                "plan" => plan::run(call),
         "external_directory" => external_directory::run(call),
         "invalid" => invalid::run(call),
         _ => invalid::unknown(call),
@@ -473,14 +475,27 @@ pub async fn run_tool_async(call: &ToolCall, runtime: &ToolRuntime) -> ToolResul
     }
 
     match call.name.as_str() {
-        "task" => task::run_async(call, runtime.clone()).await,
-        // Network tools perform real HTTP requests. Doing them on the
-        // async path keeps the executor unblocked. It doesn't need
-        // the `ToolRuntime` (no sub-sessions, no message bus).
-        "webfetch" => webfetch::run_async(call).await,
-        "websearch" => {
-            websearch::run_async_with_runtime_config(call, &runtime.runtime_config).await
-        }
+            "task" => task::run_async(call, runtime.clone()).await,
+            // Reverse-engineering tool: delegates to a user-configured
+            // Ghidra MCP server. Needs the MCP manager + runtime_config
+            // (and the project's `ToolContext` for path resolution).
+            "ghidra" => {
+                let ctx = ToolContext::new(PermissionMode::Build)
+                    .with_project_root(runtime.project_root.clone());
+                let runtime_ref = ghidra::ToolRuntimeRef {
+                    runtime_config: &runtime.runtime_config,
+                    mcp_manager: &runtime.mcp_manager,
+                    tool_context: &ctx,
+                };
+                ghidra::run_async(call, &runtime_ref).await
+            }
+            // Network tools perform real HTTP requests. Doing them on the
+            // async path keeps the executor unblocked. It doesn't need
+            // the `ToolRuntime` (no sub-sessions, no message bus).
+            "webfetch" => webfetch::run_async(call).await,
+            "websearch" => {
+                websearch::run_async_with_runtime_config(call, &runtime.runtime_config).await
+            }
         // Everything else: defer to the sync path. The caller is already
         // running in an async context, but the underlying tool is sync.
         // Thread the caller's project_root through so file-system

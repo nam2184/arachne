@@ -3159,6 +3159,30 @@ fn default_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
             ),
         ),
         crate::llm::events::ToolDefinition::new(
+            "ghidra",
+            "Reverse-engineering tool backed by a configured Ghidra MCP server. Wraps a small set of high-signal operations (decompile, disasm, functions, xrefs) so the model sees one tool instead of 200+ raw MCP tool names. Requires a `ghidra` server entry under mcp.servers in the runtime config.",
+            object_schema(
+                serde_json::json!({
+
+                    "action": { "type": "string", "enum": ["status", "functions", "function", "decompile", "disasm", "xrefs_to", "xrefs_from", "custom"], "description": "status = sidecar health; functions = enumerate; decompile/disasm/xrefs_* target one function; custom = passthrough to any MCP tool via mcp_tool" },
+
+                    "path": { "type": "string", "description": "Path to the binary being analyzed. Required for all actions except status and custom." },
+
+                    "name": { "type": "string", "description": "Function name to target (exactly one of name or address required for function/decompile/disasm/xrefs_*)" },
+
+                    "address": { "type": "string", "description": "Hex address like 0x401000 (exactly one of name or address required for function/decompile/disasm/xrefs_*)" },
+
+                    "limit": { "type": "integer", "description": "Item limit for functions / disasm / xrefs_*", "minimum": 1, "maximum": 1000 },
+
+                    "offset": { "type": "integer", "description": "Offset for functions pagination", "minimum": 0 },
+
+                    "mcp_tool": { "type": "string", "description": "MCP tool name override; with action=custom, names the tool to invoke" }
+
+                }),
+                &["action"],
+            ),
+        ),
+        crate::llm::events::ToolDefinition::new(
             "read",
             "Read a file from disk",
             object_schema(
@@ -3264,24 +3288,24 @@ pub fn readonly_tool_definitions() -> Vec<crate::llm::events::ToolDefinition> {
             ),
         ),
         crate::llm::events::ToolDefinition::new(
-            "lsp",
-            "Static code intelligence for one file or a bounded workspace. Use sparingly for structured symbols or parse-level syntax diagnostics; diagnostics are not compiler or real language-server diagnostics.",
-            object_schema(
-                serde_json::json!({
+    "lsp",
+    "Static code intelligence for one file or a bounded workspace. Use sparingly for structured symbols or parse-level syntax diagnostics; diagnostics are not compiler or real language-server diagnostics.",
+    object_schema(
+        serde_json::json!({
 
-                    "action": { "type": "string", "enum": ["document", "diagnostics", "symbols", "workspace"] },
+            "action": { "type": "string", "enum": ["document", "diagnostics", "symbols", "workspace"] },
 
-                    "path": { "type": "string", "description": "File path or workspace root" },
+            "path": { "type": "string", "description": "File path or workspace root" },
 
-                    "language_id": { "type": "string", "description": "Optional parser language override" },
+            "language_id": { "type": "string", "description": "Optional parser language override" },
 
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
 
-                    "max_depth": { "type": "integer", "minimum": 1, "maximum": 12 }
+            "max_depth": { "type": "integer", "minimum": 1, "maximum": 12 }
 
-                }),
-                &["action"],
-            ),
+        }),
+        &["action"],
+    ),
         ),
         crate::llm::events::ToolDefinition::new(
             "read",

@@ -189,6 +189,8 @@ pub fn action_for_tool(tool: &str) -> PermissionAction {
         "read" | "read_file" => PermissionAction::Read,
         "glob" | "grep" | "search_files" => PermissionAction::Search,
         "lsp" => PermissionAction::Context,
+        "tree_sitter" => PermissionAction::Context,
+        "ghidra" => PermissionAction::Context,
         "write" | "write_file" | "edit" | "apply_patch" => PermissionAction::Edit,
         "shell" | "bash" => PermissionAction::Execute,
         "task" | "skill" | "todo" | "todowrite" => PermissionAction::Session,
