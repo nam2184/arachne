@@ -19,7 +19,7 @@ Arachne is built for technical users who want a coding agent that adapts to thei
 - Streaming assistant output, reasoning, and tool results.
 - Runtime-configured MCP tool servers with explicit transport selection.
 - Real LSP-style static analysis via tree-sitter (`lsp` tool) — symbols, imports, exports, parse-level diagnostics for 306 languages.
-- Plugin ecosystem for additional analysis tools: bring your own binary, MCP server, or Rust crate and expose it as a first-class agent tool (`ghidra` ships as the reference example — wraps any MCP-compliant Ghidra server behind a curated action API).
+- Plugin ecosystem for additional analysis tools via MCP servers — configure any MCP-compliant tool server and the agent picks it up at runtime (`ghidra` ships built-in and wraps a configurable MCP server behind a curated action API).
 - Configurable OpenAI-compatible, Anthropic, and MiniMax-style providers.
 - Project switching, provider settings, and light/dark theme support.
 
@@ -68,7 +68,7 @@ npm run tauri:prod
 
 ## Tools & Plugins
 
-Tools are the agent's hands. Arachne ships with a curated set of built-ins and supports three ways to add more — pick whichever fits your source.
+Tools are the agent's hands. Arachne ships with a curated set of built-ins and supports MCP servers as the plugin path.
 
 **Built-in tools.** `read`, `grep`, `glob`, `edit`, `apply_patch`, `write`, `shell`, `task`, `skill`, `todo`, `question`, `webfetch`, `websearch`, `lsp`, `plan`. Each one:
 
@@ -79,15 +79,11 @@ Tools are the agent's hands. Arachne ships with a curated set of built-ins and s
 
 **Static analysis: the `lsp` tool.** LSP-style code intelligence without a real language server. Powered by `tree-sitter-language-pack` (306 grammars, dynamic-loaded shared libraries). Actions: `document` (full s-expr or JSON tree), `symbols`, `diagnostics`, `workspace` (bounded project overview). Diagnostics are parse-level syntax signals, not compiler or real LSP diagnostics — use it for cheap pre-checks before reaching for a heavier tool.
 
-**Reverse engineering: the `ghidra` tool.** Wraps any MCP-compliant Ghidra server behind a curated action API. The user configures a Ghidra server in `[mcp.servers.ghidra]`; the agent calls `ghidra` with high-level actions like `decompile`, `disasm`, `functions`, `xrefs_to`. `ghidra` is the reference example for the third-party tool pattern: pick a JSON-RPC-over-stdio MCP server, write a 600-line Rust file with an action enum and a name → MCP-tool mapping, wire it into the dispatch table. That's it.
+**Reverse engineering: the `ghidra` tool.** Wraps any MCP-compliant Ghidra server behind a curated action API. The user configures a Ghidra server in `[mcp.servers.ghidra]`; the agent calls `ghidra` with high-level actions like `decompile`, `disasm`, `functions`, `xrefs_to`. Ships built-in so the action layer is opinionated and stable even if you swap the underlying Ghidra server.
 
-**Three ways to add a new tool:**
+**MCP servers** (the only plugin path). Write a server that speaks MCP 2024-11-05 over stdio, HTTP, or SSE. Add an entry to `[mcp.servers]` in your config. Every tool the server exposes becomes available as `mcp__<server>__<tool>`. The agent runtime handles connection lifecycle, timeouts, retries, and tool discovery.
 
-1. **MCP server** (recommended for external services). Write a server that speaks MCP 2024-11-05 over stdio, HTTP, or SSE. Add an entry to `[mcp.servers]` in your config. Every tool the server exposes becomes available as `mcp__<server>__<tool>`. The agent runtime handles connection lifecycle, timeouts, retries, and tool discovery.
-2. **Rust crate in this workspace.** Drop a module under `agents/src/tools/`, implement `run(call, ctx) -> ToolResult` (or `run_with_context` / `run_async` variants), register in the dispatch table, add a `ToolDefinition` to `default_tool_definitions`. The whole round trip — schema, dispatch, tests, permission action — fits in one file. See `agents/src/tools/ghidra.rs` for the full template.
-3. **Wrapping an existing CLI.** For ad-hoc local tools, the `shell` tool already exists. For something you want as a first-class agent tool with structured arguments and metadata, write a thin Rust wrapper (like `ghidra`) that calls out to the CLI and translates its text output into structured `metadata`.
-
-The plugin pattern is deliberate: every tool is a regular Rust file, every argument is a JSON Schema, every call goes through the same dispatcher. No magic, no DSL, no required runtime registry update — just `pub mod foo;` and a match arm.
+The plugin pattern is deliberate: no magic, no DSL, no required runtime registry update — just a working MCP server and one config line.
 
 ## Providers
 
