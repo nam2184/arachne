@@ -41,6 +41,11 @@ pub struct ConversationMessage {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionTurnDiff {
     pub message_id: String,
+    /// Post-turn git tree-hash of the worktree. Pairs with the previous turn's
+    /// `snapshot_hash` to compute the per-turn diff. Present only when the
+    /// snapshot service is enabled for this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_hash: Option<String>,
     pub diff: Vec<SessionFileDiff>,
 }
 
@@ -203,6 +208,19 @@ impl ConversationService {
         message_id: &str,
         diff: Vec<SessionFileDiff>,
     ) -> Result<(), String> {
+        self.write_session_diff_with_snapshot(session_id, message_id, diff, None)
+    }
+
+    /// Record the per-turn file diff plus the post-turn snapshot hash. The
+    /// hash is the bridge that lets the session runner compute the next
+    /// turn's diff without re-snapshotting the entire worktree.
+    pub fn write_session_diff_with_snapshot(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        diff: Vec<SessionFileDiff>,
+        snapshot_hash: Option<String>,
+    ) -> Result<(), String> {
         let session_lock = self.get_lock(session_id);
         let _session_guard = session_lock.lock();
         let lock_path = self.lock_file_path(session_id);
@@ -212,9 +230,17 @@ impl ConversationService {
         file.turns.retain(|turn| turn.message_id != message_id);
         file.turns.push(SessionTurnDiff {
             message_id: message_id.to_string(),
+            snapshot_hash,
             diff,
         });
         self.write_session_diff_file(session_id, &file)
+    }
+
+    /// Return the post-turn snapshot hash recorded for the most recent
+    /// turn. Used to compute the next turn's diff.
+    pub fn latest_snapshot_hash(&self, session_id: &str) -> Result<Option<String>, String> {
+        let file = self.read_session_diff_file(session_id)?;
+        Ok(file.turns.last().and_then(|t| t.snapshot_hash.clone()))
     }
 
     pub fn get_session_diff(

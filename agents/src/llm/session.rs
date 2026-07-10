@@ -32,6 +32,7 @@ use crate::permission::PermissionService;
 use crate::sessions::conversation::{ConversationMessage, ConversationService};
 
 use crate::sessions::service::SessionService;
+use crate::domain::AgentSession;
 
 use crate::tools::{
     bound_tool_output, run_tool_async, run_tool_async_sandboxed, run_tool_sandboxed,
@@ -139,9 +140,15 @@ pub struct SessionRunner {
     /// truncation marker. Mirrors opencode's `Truncate.write`
 
     /// behavior. `None` (default) disables spillover — bounded
-
+    /// behavior. `None` (default) disables spillover — bounded
     /// outputs are just clipped and the marker says "suppressed".
     spill_dir: Option<std::path::PathBuf>,
+
+    /// Base directory for the per-session snapshot (git-backed checkpoint)
+    /// store. `None` (default) disables snapshot recording — turns still
+    /// run, but `track()` and the per-turn file diff are skipped. Set via
+    /// `with_snapshot_base_dir`.
+    snapshot_base_dir: Option<std::path::PathBuf>,
 
     /// Permission mode for this turn. The runner injects it into the
 
@@ -273,6 +280,8 @@ impl SessionRunner {
 
             spill_dir: None,
 
+            snapshot_base_dir: None,
+
             mode: crate::permission::PermissionMode::default(),
 
             event_sink: None,
@@ -395,6 +404,21 @@ impl SessionRunner {
         self
     }
 
+    /// Set the base directory for per-session snapshot (git-backed
+    /// checkpoint) storage. With this set, every agent turn records a
+    /// tree-hash via `SnapshotService::track`, and the per-turn file
+    /// diff is computed between consecutive hashes. `None` (the default)
+    /// disables snapshot recording entirely — the per-turn diff becomes
+    /// empty and no shadow git repo is created.
+    pub fn with_snapshot_base_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.snapshot_base_dir = Some(dir.into());
+        self
+    }
+
+    /// Record the post-turn snapshot for `session_id`, compute the
+    /// per-turn file diff against the previous turn's hash, and persist
+    /// the result. Failures are logged at `warn` level and otherwise
+    /// ignored — a broken snapshot must not abort the agent run.
     /// Inject a custom doom loop detector. Useful for tests and for
 
     /// agents that want a different threshold than the default of 3.
@@ -2786,6 +2810,19 @@ impl SessionRunner {
             }
         }
 
+        // Per-turn snapshot: record the post-turn filesystem state and
+        // compute the diff against the previous turn's snapshot hash.
+        // No-op when `snapshot_base_dir` is `None` (the default), so
+        // non-snapshot configurations pay nothing.
+        if let Some(base_dir) = self.snapshot_base_dir.clone() {
+            self.record_turn_snapshot(
+                session_id,
+                &assistant_message_id,
+                &session,
+                base_dir,
+            );
+        }
+
         // Continue after any tool call or tool-parse error so the next
 
         // LLM turn can see the persisted call/result transcript.
@@ -2793,6 +2830,62 @@ impl SessionRunner {
         let continue_loop = needs_continuation;
 
         Ok(continue_loop)
+    }
+
+    /// Record the post-turn snapshot for `session_id`, compute the
+    /// per-turn file diff against the previous turn's hash, and persist
+    /// the result. Failures are logged at `warn` level and otherwise
+    /// ignored — a broken snapshot must not abort the agent run.
+    fn record_turn_snapshot(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        session: &AgentSession,
+        base_dir: std::path::PathBuf,
+    ) {
+        let service = crate::snapshot::SnapshotService::new(base_dir);
+        let new_hash = service.track(session);
+        let Some(new_hash) = new_hash else {
+            // No files changed this turn; nothing to diff.
+            return;
+        };
+
+        let prev_hash = match self
+            .conversation_service
+            .latest_snapshot_hash(session_id)
+        {
+            Ok(h) => h,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session_id,
+                    error = %error,
+                    "snapshot: failed to load previous turn's hash; diff will be empty"
+                );
+                None
+            }
+        };
+
+        let diff = match prev_hash.as_deref() {
+            Some(prev) => service.diff_full(session, prev, &new_hash),
+            None => Vec::new(),
+        };
+
+        if let Err(error) = self
+            .conversation_service
+            .write_session_diff_with_snapshot(
+                session_id,
+                message_id,
+                diff,
+                Some(new_hash),
+            )
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                message_id = %message_id,
+                error = %error,
+                "snapshot: failed to record turn diff; agent run continues"
+            );
+        }
     }
 }
 
