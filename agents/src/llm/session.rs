@@ -31,8 +31,8 @@ use crate::permission::PermissionService;
 
 use crate::sessions::conversation::{ConversationMessage, ConversationService};
 
-use crate::sessions::service::SessionService;
 use crate::domain::AgentSession;
+use crate::sessions::service::SessionService;
 
 use crate::tools::{
     bound_tool_output, run_tool_async, run_tool_async_sandboxed, run_tool_sandboxed,
@@ -109,13 +109,19 @@ impl SessionCancelToken {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-
-pub struct SessionRunEvent {
-    pub session_id: String,
-
-    pub step: u32,
-
-    pub event: LlmEvent,
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum SessionRunEvent {
+    Llm {
+        session_id: String,
+        step: u32,
+        event: LlmEvent,
+    },
+    SessionDiff {
+        session_id: String,
+        step: u32,
+        message_id: String,
+        diff: Vec<crate::snapshot::SessionFileDiff>,
+    },
 }
 
 pub struct SessionRunner {
@@ -507,14 +513,45 @@ impl SessionRunner {
 
     fn emit_event(&self, session_id: &str, step: u32, event: &LlmEvent) {
         if let Some(sink) = &self.event_sink {
-            sink(SessionRunEvent {
+            sink(SessionRunEvent::Llm {
                 session_id: session_id.to_string(),
-
                 step,
-
                 event: event.clone(),
             });
         }
+    }
+
+    fn emit_session_diff(
+        &self,
+        session_id: &str,
+        step: u32,
+        message_id: &str,
+        diff: &[crate::snapshot::SessionFileDiff],
+    ) {
+        if let Some(sink) = &self.event_sink {
+            sink(SessionRunEvent::SessionDiff {
+                session_id: session_id.to_string(),
+                step,
+                message_id: message_id.to_string(),
+                diff: diff.to_vec(),
+            });
+        }
+    }
+
+    fn snapshot_baseline(&self, session_id: &str, session: &AgentSession) -> Option<String> {
+        let Some(base_dir) = self.snapshot_base_dir.clone() else {
+            return None;
+        };
+
+        let service = crate::snapshot::SnapshotService::new(base_dir);
+        let baseline = service.track(session);
+        if baseline.is_none() {
+            tracing::debug!(
+                session_id = %session_id,
+                "snapshot: failed to record pre-turn baseline"
+            );
+        }
+        baseline
     }
 
     fn is_cancelled(&self) -> bool {
@@ -1128,6 +1165,8 @@ impl SessionRunner {
             .get_session(session_id)
             .map_err(|e| SessionError::Conversation(e))?
             .ok_or_else(|| SessionError::SessionNotFound(session_id.to_string()))?;
+
+        let snapshot_baseline = self.snapshot_baseline(session_id, &session);
 
         // Drain completed sub-agent results into the conversation so the
 
@@ -2107,6 +2146,14 @@ impl SessionRunner {
             needs_continuation = false;
             if !assistant_parts.is_empty() {
                 let _ = flush_parts(&assistant_parts);
+
+                self.record_turn_snapshot(
+                    session_id,
+                    &assistant_message_id,
+                    &session,
+                    snapshot_baseline.as_deref(),
+                    step,
+                );
             }
         }
 
@@ -2704,6 +2751,14 @@ impl SessionRunner {
 
                 let _ = flush_parts(&assistant_parts);
 
+                self.record_turn_snapshot(
+                    session_id,
+                    &assistant_message_id,
+                    &session,
+                    snapshot_baseline.as_deref(),
+                    step,
+                );
+
                 if self.is_cancelled() {
                     tracing::info!(
                         session_id = %session_id,
@@ -2810,18 +2865,13 @@ impl SessionRunner {
             }
         }
 
-        // Per-turn snapshot: record the post-turn filesystem state and
-        // compute the diff against the previous turn's snapshot hash.
-        // No-op when `snapshot_base_dir` is `None` (the default), so
-        // non-snapshot configurations pay nothing.
-        if let Some(base_dir) = self.snapshot_base_dir.clone() {
-            self.record_turn_snapshot(
-                session_id,
-                &assistant_message_id,
-                &session,
-                base_dir,
-            );
-        }
+        self.record_turn_snapshot(
+            session_id,
+            &assistant_message_id,
+            &session,
+            snapshot_baseline.as_deref(),
+            step,
+        );
 
         // Continue after any tool call or tool-parse error so the next
 
@@ -2832,60 +2882,50 @@ impl SessionRunner {
         Ok(continue_loop)
     }
 
-    /// Record the post-turn snapshot for `session_id`, compute the
-    /// per-turn file diff against the previous turn's hash, and persist
-    /// the result. Failures are logged at `warn` level and otherwise
-    /// ignored — a broken snapshot must not abort the agent run.
+    /// Record the current filesystem snapshot for this turn, compute the
+    /// cumulative diff against the pre-turn baseline, and persist it. Failures
+    /// are logged and otherwise ignored: a broken snapshot must not abort the
+    /// agent run.
     fn record_turn_snapshot(
         &self,
         session_id: &str,
         message_id: &str,
         session: &AgentSession,
-        base_dir: std::path::PathBuf,
+        baseline_hash: Option<&str>,
+        step: u32,
     ) {
-        let service = crate::snapshot::SnapshotService::new(base_dir);
-        let new_hash = service.track(session);
-        let Some(new_hash) = new_hash else {
-            // No files changed this turn; nothing to diff.
+        let Some(base_dir) = self.snapshot_base_dir.clone() else {
             return;
         };
 
-        let prev_hash = match self
-            .conversation_service
-            .latest_snapshot_hash(session_id)
-        {
-            Ok(h) => h,
-            Err(error) => {
-                tracing::warn!(
-                    session_id = %session_id,
-                    error = %error,
-                    "snapshot: failed to load previous turn's hash; diff will be empty"
-                );
-                None
-            }
+        let service = crate::snapshot::SnapshotService::new(base_dir);
+        let new_hash = service.track(session);
+        let Some(new_hash) = new_hash else {
+            return;
         };
 
-        let diff = match prev_hash.as_deref() {
+        let diff = match baseline_hash {
             Some(prev) => service.diff_full(session, prev, &new_hash),
             None => Vec::new(),
         };
+        let emitted_diff = diff.clone();
 
-        if let Err(error) = self
-            .conversation_service
-            .write_session_diff_with_snapshot(
-                session_id,
-                message_id,
-                diff,
-                Some(new_hash),
-            )
-        {
+        if let Err(error) = self.conversation_service.write_session_diff_with_snapshot(
+            session_id,
+            message_id,
+            diff,
+            Some(new_hash),
+        ) {
             tracing::warn!(
                 session_id = %session_id,
                 message_id = %message_id,
                 error = %error,
                 "snapshot: failed to record turn diff; agent run continues"
             );
+            return;
         }
+
+        self.emit_session_diff(session_id, step, message_id, &emitted_diff);
     }
 }
 
@@ -5603,7 +5643,9 @@ mod tests {
         let captured_for_sink = Arc::clone(&captured);
 
         let runner = runner.with_event_sink(Arc::new(move |ev: SessionRunEvent| {
-            captured_for_sink.lock().unwrap().push(ev.event);
+            if let SessionRunEvent::Llm { event, .. } = ev {
+                captured_for_sink.lock().unwrap().push(event);
+            }
         }));
 
         let result = runner.run(&session_id).await;

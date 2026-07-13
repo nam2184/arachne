@@ -150,11 +150,7 @@ pub async fn run_async(call: &ToolCall, runtime: &ToolRuntimeRef<'_>) -> ToolRes
     // schema, not our action-layer shape.
     forwarded.arguments = mcp_args
         .as_object()
-        .map(|m| {
-            m.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        })
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
         .unwrap_or_default();
 
     let mgr = runtime.mcp_manager;
@@ -216,9 +212,7 @@ impl GhidraArgs {
         match (&self.name, &self.address) {
             (Some(name), None) => Ok(Target::Name(name.clone())),
             (None, Some(addr)) => Ok(Target::Address(addr.clone())),
-            (Some(_), Some(_)) => {
-                Err("supply exactly one of `name` or `address`, not both".into())
-            }
+            (Some(_), Some(_)) => Err("supply exactly one of `name` or `address`, not both".into()),
             (None, None) => Err("supply exactly one of `name` or `address`".into()),
         }
     }
@@ -277,13 +271,13 @@ fn find_ghidra_server(config: &RuntimeConfig) -> Option<(String, crate::config::
     const ALIASES: &[&str] = &["ghidra", "ghidra-headless", "ghidra_mcp", "ghidra-mcp"];
 
     config
-            .mcp
-            .servers
-            .iter()
-            .find(|(name, server)| {
-                server.enabled && ALIASES.iter().any(|alias| name.eq_ignore_ascii_case(alias))
-            })
-            .map(|(name, server)| (name.clone(), server.clone()))
+        .mcp
+        .servers
+        .iter()
+        .find(|(name, server)| {
+            server.enabled && ALIASES.iter().any(|alias| name.eq_ignore_ascii_case(alias))
+        })
+        .map(|(name, server)| (name.clone(), server.clone()))
 }
 
 /// MCP tool names use `[a-z0-9_]` per the spec. Preserve ASCII
@@ -342,14 +336,18 @@ fn build_mcp_call(
             // binary loaded. Just call `get_project_info` (or whatever
             // the override is) with no args.
             return Ok((
-                args.mcp_tool.clone().unwrap_or_else(|| "get_project_info".into()),
+                args.mcp_tool
+                    .clone()
+                    .unwrap_or_else(|| "get_project_info".into()),
                 json!({}),
             ));
         }
         "functions" => {
             m.insert("limit".into(), json!(args.limit));
             m.insert("offset".into(), json!(args.offset));
-            args.mcp_tool.clone().unwrap_or_else(|| "list_functions".into())
+            args.mcp_tool
+                .clone()
+                .unwrap_or_else(|| "list_functions".into())
         }
         "function" => {
             let target = args.resolve_target()?;
@@ -457,7 +455,10 @@ mod tests {
 
     #[test]
     fn sanitize_for_mcp_prefix_lowercases_and_replaces_separators() {
-        assert_eq!(sanitize_for_mcp_prefix("Ghidra-Headless"), "ghidra_headless");
+        assert_eq!(
+            sanitize_for_mcp_prefix("Ghidra-Headless"),
+            "ghidra_headless"
+        );
         assert_eq!(sanitize_for_mcp_prefix("ghidra_mcp"), "ghidra_mcp");
         assert_eq!(sanitize_for_mcp_prefix("weird name!"), "weird_name");
     }
@@ -712,9 +713,7 @@ mod tests {
                     .ok()
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(|| std::path::PathBuf::from("."));
-                let target_subdir = manifest_dir
-                    .join("target")
-                    .join("ghidra-test-fixtures");
+                let target_subdir = manifest_dir.join("target").join("ghidra-test-fixtures");
                 std::fs::create_dir_all(&target_subdir).ok()?;
                 let out = target_subdir.join(if cfg!(windows) {
                     "sample_target.exe"
@@ -813,8 +812,8 @@ mod tests {
         let mut cfg = RuntimeConfig::default();
         cfg.mcp.servers = servers;
 
-        let (name, server_cfg) = find_ghidra_server(&cfg)
-            .expect("ghidra server should be discoverable");
+        let (name, server_cfg) =
+            find_ghidra_server(&cfg).expect("ghidra server should be discoverable");
         assert_eq!(name, "ghidra");
         // The args we stashed should round-trip through config.
         assert_eq!(server_cfg.args[1], bin.display().to_string());

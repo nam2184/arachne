@@ -1,9 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::Mutex;
 
 use crate::AgentSession;
 
@@ -30,11 +32,23 @@ pub enum DiffStatus {
 
 pub struct SnapshotService {
     base_dir: PathBuf,
+    locks: Arc<SnapshotLocks>,
 }
 
 impl SnapshotService {
     pub fn new(base_dir: PathBuf) -> Arc<Self> {
-        Arc::new(Self { base_dir })
+        static LOCKS: OnceLock<Arc<SnapshotLocks>> = OnceLock::new();
+
+        Arc::new(Self {
+            base_dir,
+            locks: LOCKS
+                .get_or_init(|| Arc::new(SnapshotLocks::default()))
+                .clone(),
+        })
+    }
+
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
     }
 
     pub fn track(&self, session: &AgentSession) -> Option<String> {
@@ -42,6 +56,8 @@ impl SnapshotService {
         if !state.worktree.join(".git").exists() {
             return None;
         }
+        let lock = self.locks.lock_for(&state.worktree);
+        let _guard = lock.lock();
         match state
             .ensure_repo()
             .and_then(|_| state.stage())
@@ -67,6 +83,19 @@ impl SnapshotService {
                 Vec::new()
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct SnapshotLocks {
+    locks: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
+}
+
+impl SnapshotLocks {
+    fn lock_for(&self, worktree: &Path) -> Arc<Mutex<()>> {
+        let key = snapshot_lock_key(worktree);
+        let mut locks = self.locks.lock();
+        locks.entry(key).or_default().clone()
     }
 }
 
@@ -299,6 +328,10 @@ fn hash_path(path: &str) -> String {
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
     format!("{:x}", hasher.finish())
+}
+
+fn snapshot_lock_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn nul_list(files: &[String]) -> String {

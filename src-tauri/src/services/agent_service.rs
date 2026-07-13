@@ -208,6 +208,7 @@ impl AgentService {
             .with_runtime_config(runtime_config)
             .with_permissions(permissions)
             .with_sandboxed_context(sandboxed_ctx)
+            .with_snapshot_base_dir(self.snapshot_service.base_dir().to_path_buf())
     }
 
     fn runtime_config_for_session(
@@ -355,9 +356,8 @@ impl AgentService {
             },
         );
 
-        let user_message_id =
-            self.conversation_service
-                .append_message(session_id, MessageRole::User, message)?;
+        self.conversation_service
+            .append_message(session_id, MessageRole::User, message)?;
 
         let session = self
             .session_service
@@ -367,20 +367,36 @@ impl AgentService {
         let (cancellation, _active_run) = self.begin_active_run(session_id);
 
         self.refresh_provider(&session.provider).await;
-        let before_snapshot = self.snapshot_service.track(&session);
 
         let session_id_clone = session_id.to_string();
         let registry = Arc::clone(&self.subagent_registry);
         let app_for_events = app.clone();
-        let event_sink = Arc::new(move |event: SessionRunEvent| {
-            emit_agent_event(
+        let event_sink = Arc::new(move |event: SessionRunEvent| match event {
+            SessionRunEvent::Llm {
+                session_id,
+                step,
+                event,
+            } => emit_agent_event(
                 &app_for_events,
                 AgentUiEvent::LlmEvent {
-                    session_id: event.session_id,
-                    step: event.step,
-                    event: event.event,
+                    session_id,
+                    step,
+                    event,
                 },
-            );
+            ),
+            SessionRunEvent::SessionDiff {
+                session_id,
+                message_id,
+                diff,
+                ..
+            } => emit_agent_event(
+                &app_for_events,
+                AgentUiEvent::SessionDiff {
+                    session_id,
+                    message_id,
+                    diff,
+                },
+            ),
         });
 
         let runner = self
@@ -390,7 +406,6 @@ impl AgentService {
             .with_cancellation(cancellation)
             .with_mode(mode);
         let run_result = runner.run(&session_id_clone).await;
-        self.capture_session_diff(&app, &session, &user_message_id, before_snapshot.as_deref());
 
         let run_result = match run_result {
             Ok(result) => result,
@@ -439,39 +454,6 @@ impl AgentService {
         );
 
         Ok(response)
-    }
-
-    fn capture_session_diff(
-        &self,
-        app: &AppHandle,
-        session: &arachne_agents::AgentSession,
-        message_id: &str,
-        before_snapshot: Option<&str>,
-    ) {
-        let Some(before_snapshot) = before_snapshot else {
-            return;
-        };
-        let Some(after_snapshot) = self.snapshot_service.track(session) else {
-            return;
-        };
-        let diff = self
-            .snapshot_service
-            .diff_full(session, before_snapshot, &after_snapshot);
-        if let Err(error) =
-            self.conversation_service
-                .write_session_diff(&session.id, message_id, diff.clone())
-        {
-            tracing::warn!(session_id = %session.id, error = %error, "failed to persist session diff");
-            return;
-        }
-        emit_agent_event(
-            app,
-            AgentUiEvent::SessionDiff {
-                session_id: session.id.clone(),
-                message_id: message_id.to_string(),
-                diff,
-            },
-        );
     }
 }
 
