@@ -19,6 +19,7 @@ pub mod routing;
 pub mod sandbox;
 pub mod sessions;
 pub mod snapshot;
+pub mod ssrf;
 pub mod tools;
 
 pub use config::*;
