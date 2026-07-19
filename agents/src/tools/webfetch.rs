@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::{ToolCall, ToolResult};
+use crate::{ssrf, ToolCall, ToolResult};
 
 use super::{failure, string_arg, success};
 
@@ -73,7 +73,44 @@ pub fn run(call: &ToolCall) -> ToolResult {
 /// `tools::mod.rs::run_tool_async`; tests call it directly with
 /// a custom `reqwest::Client`.
 pub async fn run_async(call: &ToolCall) -> ToolResult {
-    run_with_async(call, &reqwest::Client::new()).await
+    let url = string_arg(call, "url");
+    if url.is_empty() {
+        return failure("webfetch", "url is required".to_string());
+    }
+
+    // SSRF check on the initial URL. The custom resolver and
+    // redirect policy on the client cover DNS lookups and
+    // redirect hops; this catches the case where the host is an
+    // IP literal (the resolver never sees it) and where the host
+    // is denied by an explicit host rule (pre-DNS).
+    if let Err(denied) = ssrf::check_url(&url) {
+        return failure("webfetch", format!("url denied by SSRF guard: {denied}"));
+    }
+
+    run_with_async(call, &ssrf_client()).await
+}
+
+/// Build the SSRF-guarded `reqwest::Client` used by `webfetch`.
+///
+/// Every request is bound by:
+/// - the [`crate::ssrf`] policy (denies the local network,
+///   cloud metadata endpoints, and any host explicitly denied by
+///   the project's per-session allowlist);
+/// - a custom DNS resolver that filters every resolved address
+///   through the same ACL — this is the fix for issue #11 (DNS
+///   rebinding) and #17 (multi-A-record bypass);
+/// - a redirect policy that re-evaluates the ACL on every redirect
+///   hop.
+///
+/// Tests can swap in a different `reqwest::Client` via
+/// `run_with_async`; the rest of the file uses the default.
+fn ssrf_client() -> reqwest::Client {
+    use crate::ssrf::SsrfPolicy;
+    SsrfPolicy::default_webfetch()
+        .attach_to(reqwest::Client::builder())
+        .timeout(DEFAULT_TIMEOUT)
+        .build()
+        .expect("webfetch client builder is infallible under default settings")
 }
 
 /// Public seam used by tests to inject a pre-built client. The
@@ -84,6 +121,10 @@ pub async fn run_with_async(call: &ToolCall, client: &reqwest::Client) -> ToolRe
     if url.is_empty() {
         return failure("webfetch", "url is required".to_string());
     }
+
+    // No SSRF check here — `run_with_async` is the test seam and
+    // the e2e tests deliberately hit 127.0.0.1. The production
+    // `run_async` runs the SSRF check above and dispatches here.
 
     // Cheap pre-check: parse Content-Length if the caller
     // already received the response headers. (The `headers`
@@ -212,6 +253,54 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("url is required"));
+    }
+
+    /// The async entry point must reject URLs the SSRF guard
+    /// blocks before any network I/O. Tests the integration of the
+    /// guard with the tool's URL parsing — the underlying
+    /// `ssrf::check_url` is exhaustively unit-tested in `agents::ssrf`.
+    #[tokio::test]
+    async fn ssrf_guard_rejects_loopback_literal() {
+        let call = ToolCall {
+            name: "webfetch".to_string(),
+            arguments: std::collections::HashMap::from([(
+                "url".to_string(),
+                serde_json::json!("http://127.0.0.1:8080/admin"),
+            )]),
+        };
+        let result = run_async(&call).await;
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("SSRF guard") || err.contains("denied"),
+            "expected SSRF denial, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_rejects_rfc1918_literal() {
+        let call = ToolCall {
+            name: "webfetch".to_string(),
+            arguments: std::collections::HashMap::from([(
+                "url".to_string(),
+                serde_json::json!("http://10.0.0.5/secret"),
+            )]),
+        };
+        let result = run_async(&call).await;
+        assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_rejects_aws_metadata() {
+        let call = ToolCall {
+            name: "webfetch".to_string(),
+            arguments: std::collections::HashMap::from([(
+                "url".to_string(),
+                serde_json::json!("http://169.254.169.254/latest/meta-data/"),
+            )]),
+        };
+        let result = run_async(&call).await;
+        assert!(!result.success);
     }
 
     /// End-to-end against a tiny in-memory HTTP server: GET a
