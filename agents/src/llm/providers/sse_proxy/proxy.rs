@@ -758,6 +758,10 @@ fn build_upstream_uri(
 }
 
 fn reqwest_client() -> Result<reqwest::Client, String> {
+    // The SSE proxy's outbound goes to a provider's hardcoded
+    // HTTPS endpoint (api.openai.com, api.anthropic.com, etc.)
+    // configured by the project, NOT to a model-chosen URL.
+    // SSRF guard doesn't apply here.
     static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
         std::sync::OnceLock::new();
     CLIENT

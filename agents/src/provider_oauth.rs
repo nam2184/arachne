@@ -262,7 +262,7 @@ async fn exchange_code_for_tokens(
     pkce: &PkceCodes,
     code: &str,
 ) -> Result<ProviderOAuthTokens, String> {
-    let response = reqwest::Client::new()
+    let response = crate::ssrf::provider_client().clone()
         .post(format!("{}/oauth/token", config.issuer))
         .header("Content-Type", "application/x-www-form-urlencoded")
         .form(&[

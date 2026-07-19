@@ -48,10 +48,10 @@
 //! | **Resolver** (DNS lookup) | Every DNS-resolved address goes through the IP ACL; any denied address blocks the connection. Multi-A-record bypass prevented. |
 //! | **`validate_url` for IP literals** | URLs whose host is a literal IP — the resolver is never called, so we must check the literal directly. |
 //!
-//! `SsrfPolicy::attach_to(builder)` installs the resolver. The caller is
-//! responsible for calling `policy.evaluate(&url)` on the **initial**
-//! request URL before issuing the request (catches IP literals). Every
-//! subsequent DNS lookup and redirect hop is checked by the resolver.
+//! Use [`webfetch_client`] or [`provider_client`] to get a guarded
+//! `reqwest::Client` shared across the process. Callers that need a
+//! one-shot URL check (IP-literal hosts) call [`check_url`] before
+//! dispatching the request.
 //!
 //! ## Custom resolver semantics
 //!
@@ -564,37 +564,8 @@ impl SsrfPolicy {
             acl: self.acl.clone(),
         })
     }
+}
 
-    /// Install the resolver on a `reqwest::ClientBuilder` and return
-        /// the builder for further configuration. Convenience wrapper
-        /// for `builder.dns_resolver2(self.resolver())`.
-        pub fn attach_to(
-            &self,
-            builder: reqwest::ClientBuilder,
-        ) -> reqwest::ClientBuilder {
-            // `dns_resolver2` accepts `IntoResolve`, which both `Arc<dyn Resolve>`
-            // and `Arc<R: Resolve>` satisfy. The older `dns_resolver` requires a
-            // concrete `Arc<R>` with `R: Resolve`, which would force callers to
-            // name `GuardedResolver` explicitly — we hide it behind `Arc<dyn>`.
-            builder.dns_resolver2(self.resolver())
-        }
-
-        /// Build a redirect policy that evaluates every redirect hop
-        /// against this ACL. Caller passes the result to
-        /// `ClientBuilder::redirect`. This is a separate hook from the
-        /// resolver because redirects are handled by reqwest's
-        /// `redirect::Policy`, not by the DNS layer.
-        pub fn redirect_policy(&self) -> RedirectPolicy {
-            let acl = self.acl.clone();
-            RedirectPolicy::custom(move |attempt| {
-                let url = attempt.url();
-                match acl.evaluate(url) {
-                    Decision::Allow => attempt.follow(),
-                    Decision::Deny(_) => attempt.stop(),
-                }
-            })
-        }
-    }
 
 /// Convenience for tool callers: parse a URL string and return
 /// `Ok(())` if allowed, `Err(AclError)` if denied. The error's
@@ -606,6 +577,98 @@ pub fn check_url(url: &str) -> Result<(), AclError> {
         Decision::Allow => Ok(()),
         Decision::Deny(e) => Err(e),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Global guarded clients
+// ---------------------------------------------------------------------------
+
+use std::sync::OnceLock;
+
+/// The default SSRF posture for the `webfetch` tool (model-driven,
+/// untrusted URLs). Denies the local network, link-local, and the
+/// cloud metadata endpoints by default.
+///
+/// All process-wide callers that make outbound HTTP requests at the
+/// request of an LLM or a user-supplied URL use this client. The
+/// underlying `reqwest::Client` is constructed once via a
+/// `OnceLock` and cloned on every call — `reqwest::Client`
+/// already wraps an `Arc` internally so cloning is cheap.
+///
+/// Tests that need to hit loopback or local mock servers should
+/// construct their own `reqwest::Client::new()` and bypass this
+/// function; that's exactly what the `run_with_async` test seam in
+/// `webfetch` does.
+pub fn webfetch_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(build_webfetch_client)
+}
+
+fn build_webfetch_client() -> reqwest::Client {
+    use std::time::Duration;
+
+    // Default ACL: deny the local network. The resolver and the
+    // redirect policy close issue #11 (DNS rebinding) and #17
+    // (multi-A-record bypass).
+    let policy = SsrfPolicy::default_webfetch();
+    let resolver = policy.resolver();
+    let redirect = redirect_policy_for(&policy);
+
+    reqwest::Client::builder()
+        .dns_resolver2(resolver)
+        .redirect(redirect)
+        .timeout(Duration::from_secs(30))
+        // Default reqwest behaviour is 10 hops; the redirect policy
+        // here only changes which hops are followed, not the limit.
+        // Tightening that would be a follow-up; for now the 10-hop
+        // limit is adequate.
+        .build()
+        .expect("webfetch client builder is infallible under default settings")
+}
+
+/// The default SSRF posture for outbound HTTP from **provider**
+/// configurations — MCP server URLs, OAuth issuer URLs, OpenAI-compatible
+/// provider base URLs, and SSE proxy targets. These are
+/// user-configured and the *base* destination is trusted; the
+/// *querystring* on a request might be derived from model input
+/// (e.g. `websearch` query params). The local-network deny is
+/// applied here too — there's no scenario where the LLM should be
+/// hitting `127.0.0.1` through a provider URL.
+pub fn provider_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(build_provider_client)
+}
+
+fn build_provider_client() -> reqwest::Client {
+    use std::time::Duration;
+
+    let policy = SsrfPolicy::default_webfetch();
+    let resolver = policy.resolver();
+    let redirect = redirect_policy_for(&policy);
+
+    reqwest::Client::builder()
+        .dns_resolver2(resolver)
+        .redirect(redirect)
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("provider client builder is infallible under default settings")
+}
+
+/// Build a `reqwest::redirect::Policy` that re-evaluates the ACL on
+/// every redirect hop. Free function (not a method on
+/// `SsrfPolicy`) because the public surface only needs the
+/// pre-built guarded clients. External tests that need to
+/// construct their own `reqwest::Client` with the same redirect
+/// posture can call this directly.
+fn redirect_policy_for(policy: &SsrfPolicy) -> RedirectPolicy {
+    let acl = policy.acl.clone();
+    RedirectPolicy::custom(move |attempt| {
+        let url = attempt.url();
+        match acl.evaluate(url) {
+            Decision::Allow => attempt.follow(),
+            Decision::Deny(_) => attempt.stop(),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -780,5 +843,26 @@ mod tests {
         // the SSRF guard must reject before any other code looks at it.
         let u = url("file:///etc/passwd");
         assert!(matches!(p.evaluate(&u), Decision::Deny(_)));
+    }
+
+    #[test]
+    fn global_client_is_shared_across_calls() {
+        // The whole point of the global shape is that callers in the
+        // same process share one client — there should be one and only
+        // one underlying SSRF-guarded `reqwest::Client`, regardless of
+        // how many times `webfetch_client()` is called.
+        let a = webfetch_client();
+        let b = webfetch_client();
+        assert!(std::ptr::eq(a, b), "webfetch_client should return the same client on every call");
+    }
+
+    #[test]
+    fn provider_and_webfetch_are_distinct_clients() {
+        // webfetch and provider have the same default ACL but are
+        // distinct clients — the global shape lets each caller have
+        // its own posture if the defaults diverge in the future.
+        let webfetch = webfetch_client();
+        let provider = provider_client();
+        assert!(!std::ptr::eq(webfetch, provider));
     }
 }

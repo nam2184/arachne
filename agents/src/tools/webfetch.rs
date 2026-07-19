@@ -87,31 +87,13 @@ pub async fn run_async(call: &ToolCall) -> ToolResult {
         return failure("webfetch", format!("url denied by SSRF guard: {denied}"));
     }
 
-    run_with_async(call, &ssrf_client()).await
+    run_with_async(call, crate::ssrf::webfetch_client()).await
 }
 
-/// Build the SSRF-guarded `reqwest::Client` used by `webfetch`.
-///
-/// Every request is bound by:
-/// - the [`crate::ssrf`] policy (denies the local network,
-///   cloud metadata endpoints, and any host explicitly denied by
-///   the project's per-session allowlist);
-/// - a custom DNS resolver that filters every resolved address
-///   through the same ACL — this is the fix for issue #11 (DNS
-///   rebinding) and #17 (multi-A-record bypass);
-/// - a redirect policy that re-evaluates the ACL on every redirect
-///   hop.
-///
-/// Tests can swap in a different `reqwest::Client` via
-/// `run_with_async`; the rest of the file uses the default.
-fn ssrf_client() -> reqwest::Client {
-    use crate::ssrf::SsrfPolicy;
-    SsrfPolicy::default_webfetch()
-        .attach_to(reqwest::Client::builder())
-        .timeout(DEFAULT_TIMEOUT)
-        .build()
-        .expect("webfetch client builder is infallible under default settings")
-}
+/// Production entry point uses the process-wide SSRF-guarded
+/// client from [`crate::ssrf::webfetch_client`]. Tests that need
+/// to hit loopback or a local mock server should use
+/// `run_with_async` with their own plain `reqwest::Client`.
 
 /// Public seam used by tests to inject a pre-built client. The
 /// runner calls `run_async(call)`; the test entry point is

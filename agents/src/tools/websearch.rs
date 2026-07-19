@@ -78,7 +78,7 @@ pub async fn run_async(call: &ToolCall) -> ToolResult {
         Ok(config) => config,
         Err(error) => return failure("websearch", error),
     };
-    run_with_async(call, &reqwest::Client::new(), &config).await
+    run_with_async(call, crate::ssrf::provider_client(), &config).await
 }
 
 pub async fn run_async_with_runtime_config(
@@ -89,7 +89,7 @@ pub async fn run_async_with_runtime_config(
         Ok(config) => config,
         Err(error) => return failure("websearch", error),
     };
-    run_with_async(call, &reqwest::Client::new(), &config).await
+    run_with_async(call, crate::ssrf::provider_client(), &config).await
 }
 
 pub async fn run_with_async(

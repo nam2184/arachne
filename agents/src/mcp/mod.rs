@@ -438,7 +438,7 @@ async fn http_rpc_request(
     params: Value,
     streamable: bool,
 ) -> Result<Value, String> {
-    let client = reqwest::Client::new();
+    let client = crate::ssrf::provider_client().clone();
     let url = mcp_url(server)?;
     let headers = header_map(server)?;
     let mut session_id = None;
@@ -491,7 +491,7 @@ async fn legacy_sse_request(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    let client = reqwest::Client::new();
+    let client = crate::ssrf::provider_client().clone();
     let url = mcp_url(server)?;
     let headers = header_map(server)?;
     let response = client

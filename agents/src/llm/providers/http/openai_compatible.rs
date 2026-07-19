@@ -74,7 +74,7 @@ impl OpenAiCompatibleHttpProvider {
                 .iter()
                 .map(|model| model.to_string())
                 .collect(),
-            http_client: reqwest::Client::new(),
+            http_client: crate::ssrf::provider_client().clone(),
         }
     }
 
