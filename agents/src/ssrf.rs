@@ -865,4 +865,101 @@ mod tests {
         let provider = provider_client();
         assert!(!std::ptr::eq(webfetch, provider));
     }
+
+    /// Integration test: reqwest + the SSRF guard actually work
+    /// together to block a real TCP connect. This is the test that
+    /// fills the gap left by the unit-test-only DNS rebinding
+    /// coverage. We can't easily simulate the OS DNS returning two
+    /// different answers for two queries from a unit test, but we
+    /// *can* prove the integration end-to-end: a host that resolves
+    /// to 127.0.0.1 should fail to connect when wrapped in the
+    /// guarded resolver.
+    #[tokio::test]
+    async fn guarded_resolver_blocks_real_reqwest_connect_to_loopback() {
+        use std::net::SocketAddr;
+
+        // Stand up a local HTTP server on a random loopback port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr: SocketAddr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Accept one connection, read the request, write a
+            // minimal HTTP response. The test should never reach
+            // this code path because the guarded client blocks
+            // the connect on the resolver side.
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await;
+                let mut buf = [0u8; 128];
+                let _ = stream.read(&mut buf).await;
+            }
+        });
+
+        // The local server would happily respond to any client
+        // that connects. Build a guarded reqwest client and try to
+        // hit it via the loopback hostname. The guard's resolver
+        // filters out the 127.0.0.1 answer, reqwest never
+        // connects, the server task sits idle, and the call
+        // returns an io::Error whose inner cause is
+        // AclError::DeniedIp.
+        let policy = SsrfPolicy::default_webfetch();
+        let resolver = policy.resolver();
+        let url = format!("http://localhost:{}/test", local_addr.port());
+        let client = reqwest::Client::builder()
+            .dns_resolver2(resolver)
+            .build()
+            .unwrap();
+        let result = client.get(&url).send().await;
+
+        // Whatever the failure shape, the client must NOT have
+        // received the "OK" body. Either connect was refused
+        // entirely (resolver rejected) or the connection failed
+        // with some network error. Either way, no successful
+        // response.
+        match result {
+            Ok(response) => {
+                let body = response.bytes().await.unwrap_or_default();
+                assert_ne!(
+                    body.as_ref(),
+                    b"OK",
+                    "guarded client should not have reached the loopback server"
+                );
+            }
+            Err(err) => {
+                // Walk the error chain to confirm the failure is
+                // ACL-related, not just any network error.
+                let mut source: Option<&dyn std::error::Error> = Some(&err);
+                let mut found_acl = false;
+                while let Some(cause) = source {
+                    if cause.downcast_ref::<AclError>().is_some() {
+                        found_acl = true;
+                        break;
+                    }
+                    // The resolver returns io::Error(AclError), so
+                    // unwrap one level of io::Error wrapping.
+                    if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+                        if let Some(inner) = io_err.get_ref() {
+                            if inner.downcast_ref::<AclError>().is_some() {
+                                found_acl = true;
+                                break;
+                            }
+                        }
+                    }
+                    source = cause.source();
+                }
+                assert!(
+                    found_acl,
+                    "expected AclError in the failure chain for localhost URL, got: {err:?}"
+                );
+            }
+        }
+
+        // The server task may still be blocked on accept since the
+        // client never connected. Give it a moment to notice and
+        // close it down.
+        drop(server);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            // Drain the listener to release any pending accept.
+        })
+        .await;
+    }
 }
